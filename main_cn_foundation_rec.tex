@@ -1,0 +1,158 @@
+%------------------------
+% Chinese Resume (Foundation / Generative Recommendation Focus)
+%------------------------
+
+\documentclass[fontset=none,a4paper,10pt]{ctexart}
+
+\usepackage{latexsym}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{verbatim}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{setspace}
+\setCJKmainfont[
+  UprightFont={Heiti SC Light},
+  BoldFont={Heiti SC Medium}
+]{Heiti SC}
+\setCJKsansfont[
+  UprightFont={Heiti SC Light},
+  BoldFont={Heiti SC Medium}
+]{Heiti SC}
+\setCJKmonofont[
+  UprightFont={Heiti SC Light},
+  BoldFont={Heiti SC Medium}
+]{Heiti SC}
+\setstretch{0.95}
+
+\usepackage{geometry}
+\geometry{
+    top=0.28in,
+    bottom=0.18in,
+    footskip=0.18in,
+    headheight=0pt,
+    headsep=0pt,
+    left=0.34in,
+    right=0.34in,
+    includehead=false,
+    includefoot=false
+}
+
+\pagestyle{empty}
+
+\urlstyle{rm}
+\hypersetup{
+  colorlinks=true,
+  urlcolor=black,
+  linkcolor=black
+}
+
+\raggedright
+\setlength{\tabcolsep}{0in}
+\setlist[itemize]{itemsep=0pt, parsep=0pt, topsep=0pt}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{2pt}\item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      {\fontsize{9.8pt}{10.2pt}\selectfont\textbf{#1}} & #2 \\
+      {#3} & {#4} \\
+    \end{tabular*}\vspace{-1pt}
+}
+
+\titleformat{\section}{
+  \vspace{-4pt}\raggedright\normalsize\bfseries
+}{}{0em}{}[\color{black}\titlerule \vspace{-1pt}]
+
+\newcommand{\resumeItem}[2]{
+  {
+    {\fontsize{9.8pt}{10.2pt}\selectfont\textbf{#1}}{ #2 \vspace{0pt}}
+  }
+}
+
+\newcommand{\resumeSubItem}[2]{\resumeItem{#1}{#2}\vspace{0pt}}
+\renewcommand{\labelitemii}{$\circ$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=*]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+
+\begin{document}
+\fontsize{9.35pt}{10.55pt}\selectfont
+
+%----------HEADING-----------------
+\begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r}
+  \textbf{{\LARGE 章嘉芮}} & 邮箱：\href{mailto:itszhangjr@163.com}{itszhangjr@163.com}\\
+& 手机：~~~+86-15105198218 \\
+\end{tabular*}
+
+%-----------SUMMARY-----------------
+\vspace{-8pt}
+\section{求职摘要}
+\vspace{-5pt}
+\begin{itemize}[leftmargin=*, itemsep=1.5pt, topsep=1pt]
+\item 推荐算法工程师，具备大众点评商户推荐召回/排序/目标建模/AB 实验经验，熟悉跨场景行为序列建模、LBS 推荐、多源特征建设与线上效果优化。
+\item 具备 LLM/RAG/Prompt 应用落地经验，负责过大模型生成个性化推荐理由链路，关注事实一致性、可解释性、推理成本与线上 serving 可用性。
+\item 科研方向覆盖大模型先验、多模态生成、向量量化、条件调制与跨域泛化；以第一作者发表 IEEE TIP（CCF-A），另有 ICASSP/ICME 论文成果。
+\end{itemize}
+
+%-----------EDUCATION-----------------
+\vspace{-1pt}
+\section{教育经历}
+\vspace{-6pt}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {中国科学技术大学}{}{信息与通信工程 硕士}{2022.09 -- 2025.06}
+      \vspace{-1pt}
+      {\newline{}\textbf{奖项：} 连续三次获一等学业奖学金；获优秀大学生夏令营志愿者。}
+      \vspace{3pt}
+      {\newline{}\textbf{主要成果：} 以第一作者在 IEEE TIP（CCF-A）发表论文；以第三作者在 IEEE ICASSP 2025、IEEE ICME 2025 发表论文。}
+      \resumeSubheading
+      {东北大学}{}
+      {电子信息工程 学士}{2018.09 -- 2022.06}
+      \vspace{-1pt}
+      {\newline{}\textbf{排名：} 2/60  \hspace{2.1cm} \textbf{GPA：} 4.11/5.0  \hspace{2.1cm}  \textbf{CET-4：} 564 \hspace{2.1cm}  \textbf{CET-6：} 568}
+      \vspace{0pt}
+      {\newline{}\textbf{主要荣誉：} 校优秀学生标兵（专业第一）、建龙奖学金（专业第一）、校一等奖学金、姚天顺奖学金、校优秀学生、校二等奖学金。}
+    \resumeSubHeadingListEnd
+
+%-----------WORK EXPERIENCE-----------------
+\vspace{-1pt}
+\section{工作经历}
+\resumeSubItem{美团 - 推荐算法工程师}\hfill{2025.07 -- 至今}
+\begin{itemize}[leftmargin=*, itemsep=3.6pt, topsep=4pt]
+\item \textbf{跨场景共享推荐建模与多源事件序列建设：} 面向大众点评商户推荐，针对单场景行为稀疏、用户潜在偏好与主动需求刻画不足的问题，建设跨推荐场景、搜索、美团侧交易、小程序/SaaS 到店等多源事件数据；将全站 POI 意向行为序列、实时搜索关键词序列、最近一次搜索词、跨端交易与延迟访购信号接入召回/排序建模，补全用户“长期兴趣 + 即时意图 + 交易/到店反馈”的统一表示，为跨场景共享模型和事件序列驱动推荐提供数据基础；累计带动美食推荐访购率 +0.172pp、意向率 +0.363pp、商户 UV\_CTR +0.879pp、总到店量 +1.39\%。
+\item \textbf{召回、排序与目标优化落地：} 利用全站 POI 行为路径支持跨场景 CF 相似商户召回扩充候选，并将多源序列特征接入精排模型提升偏好预估；通过样本扩充和后链路订单归因完善交易目标建模，引入 SaaS 线下到店信号增强到店目标优化；围绕“点击-意向-到店-交易”多目标链路进行特征、样本、目标与 AB 实验闭环优化，提升模型对稀疏用户、主动搜索用户和跨端行为用户的泛化能力。
+\item \textbf{LLM 生成式推荐理由与推荐可解释性：} 负责搭建用户画像标签生产与大模型推荐理由生成链路，将搜索、点击、交易、位置等低可读事件抽象为结构化用户标签，并通过行为序列叉乘形成“长期画像 + 近期意图 + 行为证据”的 Prompt 上下文；结合候选商户属性、评价/笔记挖掘亮点和内容片段，在 serving 阶段完成用户偏好与商户特征匹配，提炼可解释命中原因，引导 LLM 生成个性化推荐理由；通过 Prompt 约束、信号过滤和事实一致性校验控制长度、降低模板化表达与事实幻觉风险，探索 LLM 在推荐重混排/解释增强中的落地路径。
+\item \textbf{多场景自适应排序模型：} 针对不同推荐场景样本分布、用户行为模式与业务目标差异，优化场景个性化排序模型；引入场景动态权重网络，融合时间分桶、城市 ID、用户行为模式、FeedsBizMark、ModuleID 等场景域特征，与通用输入特征拼接后生成底层 Mask 权重，实现不同场景下网络参数的自适应调整，并通过梯度截断降低场景特征对原始 Embedding 的扰动；上线后首页主 Tab 信息流渗透率 +0.14pp、UV\_CTR +0.14pp、人均时长 +1.19\%、饭点/夜间 CTR +2.00\%。
+\item \textbf{LBS 分发与端到端体验优化：} 在找店推荐中围绕距离、质量、供给和体验约束优化召回与排序策略；构建距离分层与质量分层结合的多 matchlevel 分发策略，在扩全城/父城补供给时优先保障近距离高质量商户曝光；补充超近距离与品质商户召回，并在识别线下到店场景时保障对应商户首位展示，避免远场结果异常前置或广告挤占用户到店心智位；上线后低供给城市召回不足请求比例下降 12.66pp，距离优先供给不足 dpid/query 占比分别下降 15.00pp/4.43pp，低质曝光下降 0.088pp。
+\end{itemize}
+
+\resumeSubItem{国元证券股份有限公司 - 大模型算法工程师}\hfill{2023.08 -- 2023.10}
+\begin{itemize}[leftmargin=*, itemsep=1.3pt, topsep=4pt]
+\item \textbf{RAG 知识问答与大模型推理链路：} 参与搭建企业内部知识问答助手原型，整理员工通讯录、楼层分布、制度流程、报销标准等异构知识源，设计 Word/PDF/Excel/CSV 到 Markdown/Document 的清洗转换规则，保留标题层级、制度版本、联系人、金额标准等关键字段；基于 ChineseRecursiveTextSplitter、向量化、FAISS 入库、top\_k 检索、context 组装和 Prompt 问答生成搭建完整链路，并通过“仅基于上下文回答、无召回拒绝编造、返回来源文档”等约束提升回答可信度。
+\end{itemize}
+
+%-----------RESEARCH EXPERIENCE-----------------
+\vspace{-1pt}
+\section{科研经历}
+\resumeSubItem{基于光传输调制的被动非视域成像（IEEE TIP，一作）}\hfill{2022.09 -- 2023.05}
+\begin{itemize}[leftmargin=*, itemsep=0pt, topsep=-1pt]
+\item 针对被动非视域成像跨环境泛化能力不足、不同环境需分别训练模型的问题，负责设计统一跨环境重建框架；提出重建与投影联合学习策略，结合环境条件编码、向量量化对比约束和条件调制模块提升模型泛化能力；在 MNIST、Supermodel、AnimeFaces 上相较已有方法 PSNR 分别提升 10.2\%、4.4\%、5.2\%，SSIM 分别提升 1.5\%、16.7\%、29.3\%，论文以第一作者发表于 IEEE TIP。
+\end{itemize}
+\vspace{4pt}
+\resumeSubItem{融合大模型先验的渐进式被动非视域成像（ICASSP 2025）}\hfill{2022.09 -- 2024.02}
+\begin{itemize}[leftmargin=*, itemsep=0pt, topsep=-1pt]
+\item 参与设计融合大模型先验的两阶段 NLOS 成像框架，先通过最优传输与向量量化训练粗重建网络，再引入预训练文生图扩散模型将粗重建结果细化为高质量自然图像；在 STL-10 上 FID、DISTS、LPIPS、CLIP-Score 分别提升 17.3\%、8.3\%、12.6\%、4.0\%，体现多模态生成模型先验与下游重建任务融合能力，论文发表于 IEEE ICASSP 2025。
+\end{itemize}
+
+%-----------SKILLS-----------------
+\vspace{-1pt}
+\section{技能和竞赛}
+\begin{itemize}[leftmargin=*, itemsep=3pt, topsep=-1pt]
+\item \textbf{技能：} 熟练掌握 Python、C++、SQL，熟悉 Linux 开发环境；熟悉 PyTorch、TensorFlow 等深度学习框架；具备推荐系统召回、排序、多目标建模、特征工程、事件序列建模、AB 实验分析经验；熟悉 RAG、LangChain、Prompt 设计、LLM 应用链路和生成式推荐探索。
+\item \textbf{研究方向：} 推荐系统智能化、Foundation Model/生成式推荐、LLM/VLM 与推荐融合、多模态生成、向量量化、条件调制、跨域泛化。
+\item \textbf{竞赛：} 国际数学建模竞赛二等奖、辽宁省数学建模竞赛一等奖、英语竞赛国家级二等奖、数学竞赛国家级三等奖、蓝桥杯省级三等奖。
+\end{itemize}
+
+\end{document}

@@ -1,0 +1,144 @@
+%------------------------
+% English Resume (Localization Prompt Creation Focus)
+%------------------------
+
+\documentclass[a4paper,10pt]{article}
+
+\usepackage{latexsym}
+\usepackage{titlesec}
+\usepackage{marvosym}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{verbatim}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{setspace}
+\setstretch{0.96}
+
+\usepackage{geometry}
+\geometry{
+    top=0.30in,
+    bottom=0.22in,
+    footskip=0.20in,
+    headheight=0pt,
+    headsep=0pt,
+    left=0.34in,
+    right=0.34in,
+    includehead=false,
+    includefoot=false
+}
+
+\pagestyle{empty}
+
+\urlstyle{rm}
+\hypersetup{
+  colorlinks=true,
+  urlcolor=black,
+  linkcolor=black
+}
+
+\raggedright
+\setlength{\tabcolsep}{0in}
+\setlist[itemize]{itemsep=0pt, parsep=0pt, topsep=0pt}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{2pt}\item
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      {\fontsize{9.8pt}{10.2pt}\selectfont\textbf{#1}} & #2 \\
+      {#3} & {#4} \\
+    \end{tabular*}\vspace{-1pt}
+}
+
+\titleformat{\section}{
+  \vspace{-4pt}\raggedright\normalsize\bfseries
+}{}{0em}{}[\color{black}\titlerule \vspace{-1pt}]
+
+\newcommand{\resumeItem}[2]{
+  {
+    {\fontsize{9.8pt}{10.2pt}\selectfont\textbf{#1}}{ #2 \vspace{0pt}}
+  }
+}
+
+\newcommand{\resumeSubItem}[2]{\resumeItem{#1}{#2}\vspace{0pt}}
+\renewcommand{\labelitemii}{$\circ$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=*]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+
+\begin{document}
+\fontsize{9.2pt}{10.5pt}\selectfont
+
+%----------HEADING-----------------
+\begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r}
+  \textbf{{\LARGE Jiarui Zhang}} & Email: \href{mailto:itszhangjr@outlook.com}{itszhangjr@outlook.com}\\
+& Phone: +86-15105198218 \\
+\end{tabular*}
+
+%-----------SUMMARY-----------------
+\vspace{-8pt}
+\section{Profile}
+\vspace{-5pt}
+\begin{itemize}[leftmargin=*, itemsep=2pt, topsep=1pt]
+\item Localization and AI prompt practitioner with hands-on experience in Chinese user-facing content, LBS/local-life recommendation, POI and merchant semantics, and GPT-based prompt workflows.
+\item Strong fit for Simplified Chinese localization prompt creation: able to convert English source intent into concise, natural Chinese instructions, specify tone/formality/grammar constraints, and flag cultural risks, idioms, edge cases, and hallucination-prone outputs.
+\item Tourism-adjacent domain exposure through Dianping/Meituan food, hotel-like merchant discovery, location intent, distance-aware ranking, store visit conversion, and customer decision journeys.
+\end{itemize}
+
+%-----------WORK EXPERIENCE-----------------
+\vspace{-2pt}
+\section{Relevant Experience}
+\resumeSubItem{Meituan -- Machine Learning Engineer, Personalization \& Recommendation}\hfill{Jul 2025 -- Present}
+\begin{itemize}[leftmargin=*, itemsep=3pt, topsep=3pt]
+\item \textbf{Localized customer-facing recommendation copy:} Built an LLM-assisted pipeline for personalized merchant recommendation reasons in Dianping. Transformed search, click, transaction, review/note, and location behaviors into structured user context, then used prompt constraints to generate concise Chinese copy that connects user preference with verifiable merchant facts.
+\item \textbf{Prompt design and output quality control:} Wrote prompt rules to preserve source semantics, control length, avoid over-claiming, reduce templated language, and keep generated reasons aligned with UI/UX needs. Added signal filters and evidence checks so outputs remained natural, helpful, and grounded in source data.
+\item \textbf{Travel/local-life terminology and user intent:} Worked with POI, merchant category, distance, city, search keyword, visit, order, and review-derived attributes to understand how users choose restaurants, nearby places, and destination-specific services. Supported recommendation scenarios where location, accessibility, quality, price/value, and recent intent all affect customer decisions.
+\item \textbf{Cultural nuance and tone adaptation:} Modeled Chinese consumer decision signals such as nearby convenience, mealtime/nighttime demand, group dining, active search intent, and offline visit context. Tuned recommendation logic and copy inputs to avoid irrelevant suggestions and improve empathy for different city/supply/user segments.
+\item \textbf{Evaluation and risk awareness:} Used A/B metrics and qualitative checks to evaluate output usefulness and behavioral impact, including visit-purchase rate, intent rate, UV\_CTR, store visits, and low-quality exposure. Paid particular attention to edge cases such as sparse user history, low-supply cities, delayed conversion, misleading distance signals, and factual inconsistency in generated text.
+\item \textbf{Business impact:} Contributed to food recommendation improvements by expanding cross-scenario behavioral signals, search intent, Meituan-side transaction signals, mini-program/SaaS-side visit signals, and distance-aware supply strategies; lifted visit-purchase rate, intent rate, merchant UV\_CTR, and total store visits.
+\end{itemize}
+
+\resumeSubItem{Guoyuan Securities Co., Ltd. -- AI Engineer, LLM Applications}\hfill{Aug 2023 -- Oct 2023}
+\begin{itemize}[leftmargin=*, itemsep=1.5pt, topsep=4pt]
+\item \textbf{Chinese knowledge Q\&A assistant:} Built an RAG-based internal Q\&A prototype for employee information, floor locations, policies, procedures, and reimbursement standards. Converted Word/PDF/Excel/CSV sources into structured Markdown while preserving hierarchy, policy versions, contacts, and monetary details.
+\item \textbf{Instruction writing and grounded generation:} Implemented retrieval, context assembly, and constrained prompts for Chinese answers to high-frequency user queries. Focused on clarity, factual consistency, concise wording, and safe handling of policy-sensitive details.
+\end{itemize}
+
+%-----------PROJECT FIT-----------------
+\vspace{-1pt}
+\section{Localization \& Prompt Creation Fit}
+\begin{itemize}[leftmargin=*, itemsep=3pt, topsep=1pt]
+\item \textbf{Language pair and style:} Native Simplified Chinese user and fluent English reader; comfortable adapting English source meaning into natural, concise Chinese while specifying formality level, grammar preferences, terminology choices, and UI-friendly phrasing.
+\item \textbf{Prompt deliverables:} Able to write language-specific instructions, localized prompt variants, two example outputs per target language, evaluation notes, and risk/edge-case summaries for reviewers and downstream model testing.
+\item \textbf{Customer obsession:} Experienced in recommendation systems where wording must help users make quick local decisions. Prioritize traveler needs such as clarity, trust, location relevance, itinerary context, opening-time/distance sensitivity, and avoiding culturally awkward or overly literal translations.
+\item \textbf{Tourism and hotel relevance:} Familiar with location-specific terminology and traveler-adjacent scenarios, including POIs, nearby services, merchant categories, reviews, city context, transportation/distance constraints, booking-like decision factors, amenities, and destination discovery.
+\end{itemize}
+
+%-----------EDUCATION-----------------
+\vspace{-1pt}
+\section{Education}
+\vspace{-6pt}
+  \resumeSubHeadingListStart
+    \resumeSubheading
+      {University of Science and Technology of China}{}{M.S., Information and Communication Engineering}{Sep 2022 -- Jun 2025}
+      \vspace{-1pt}
+      {\newline{}\textbf{Awards:} First-Class Academic Scholarship (3 times); Outstanding Summer Camp Volunteer.}
+      \vspace{3pt}
+      {\newline{}\textbf{Publications:} First author on IEEE TIP (CCF-A); third author on IEEE ICASSP 2025 and IEEE ICME 2025.}
+      \resumeSubheading
+      {Northeastern University}{}
+      {B.S., Electronic Information Engineering}{Sep 2018 -- Jun 2022}
+      \vspace{-1pt}
+      {\newline{}\textbf{Rank:} 2/60 \hspace{1.7cm} \textbf{GPA:} 4.11/5.0 \hspace{1.7cm} \textbf{CET-4:} 564 \hspace{1.7cm} \textbf{CET-6:} 568}
+      \vspace{0pt}
+      {\newline{}\textbf{Honors:} University Outstanding Student; Jianlong Scholarship; First-Class Scholarship; Yao Tianshun Scholarship; Outstanding Student; Second-Class Scholarship.}
+    \resumeSubHeadingListEnd
+
+%-----------SKILLS-----------------
+\vspace{-1pt}
+\section{Skills}
+\begin{itemize}[leftmargin=*, itemsep=3pt, topsep=-1pt]
+\item \textbf{Localization \& Writing:} Simplified Chinese localization, EN-to-ZH adaptation, customer-facing microcopy, tone and formality guidelines, terminology consistency, cultural nuance, idiom handling, risk and edge-case review.
+\item \textbf{AI \& Prompting:} Prompt design, GPT-based systems, RAG, LangChain, grounded generation, hallucination mitigation, output evaluation, AI-assisted content workflows.
+\item \textbf{Domain \& Technical:} Travel/local-life POI terminology, LBS recommendation, search intent, reviews, merchant attributes, Python, SQL, C++, Linux, PyTorch, TensorFlow, A/B analysis.
+\end{itemize}
+
+\end{document}

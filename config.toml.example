@@ -1,0 +1,31 @@
+# Personalized Travel Planning Agent 配置示例。
+# 复制为 config.toml 并填入真实 key（config.toml 已在 .gitignore 中忽略）。
+# 环境变量优先级高于本文件，便于 CI / 临时覆盖。
+
+[llm]
+# provider: rule / qwen / deepseek / openai
+# 设为 rule（或留空 api_key）时走离线确定性兜底，不调用任何 LLM。
+provider = "rule"
+api_key = ""
+# 留空则按 provider 选择默认 base_url / model：
+#   qwen     -> https://dashscope.aliyuncs.com/compatible-mode/v1, qwen-plus
+#   deepseek -> https://api.deepseek.com/v1, deepseek-chat
+#   openai   -> https://api.openai.com/v1, gpt-4o-mini
+base_url = ""
+model = ""
+timeout_seconds = 30
+temperature = 0.2
+
+[amap]
+# 高德「Web 服务」key：用于后端 REST（POI / 天气 / 驾车路线）。
+web_key = ""
+base_url = "https://restapi.amap.com"
+# 高德「Web 端(JS API)」key：用于前端地图渲染（与上面是两把不同的 key）。
+js_key = ""
+timeout_seconds = 5
+
+[agent]
+# ReAct 递归上限，防止工具调用死循环。
+recursion_limit = 20
+max_tool_retries = 1
+request_timeout_seconds = 120

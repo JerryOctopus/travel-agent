@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Personalized Travel Planning Agent</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">🧭</span>
+        <div>
+          <h1>旅行规划 Agent</h1>
+          <p class="subtitle">LangGraph ReAct · 可控规划子图 · 高德地图</p>
+        </div>
+      </div>
+      <div class="status-pills">
+        <span id="agent-mode" class="pill pill-muted">连接中…</span>
+        <span id="amap-mode" class="pill pill-muted">地图未配置</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="chat-pane">
+        <div id="messages" class="messages"></div>
+        <div class="composer">
+          <textarea
+            id="input"
+            rows="2"
+            placeholder="例如：帮我规划杭州三天，喜欢自然和美食，轻松一点"
+          ></textarea>
+          <button id="send">发送</button>
+        </div>
+        <div class="examples">
+          <button class="example">帮我规划杭州三天，喜欢自然和美食，轻松一点</button>
+          <button class="example">北京两天，历史和美食，不要太累</button>
+          <button class="example">我想去旅行</button>
+        </div>
+      </section>
+
+      <section class="side-pane">
+        <div id="map" class="map"></div>
+        <div id="cards" class="cards"></div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

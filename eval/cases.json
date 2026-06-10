@@ -1,0 +1,42 @@
+[
+  {
+    "id": "beijing_history_food_2d",
+    "query": "帮我规划北京两天，喜欢历史和美食，不要太累",
+    "expected_city": "北京",
+    "expected_days": 2,
+    "required_interests": ["history", "food"]
+  },
+  {
+    "id": "hangzhou_nature_food_couple_3d",
+    "query": "帮我规划杭州三天情侣旅行，喜欢自然和美食，轻松一点，预算中等",
+    "expected_city": "杭州",
+    "expected_days": 3,
+    "required_interests": ["nature", "food", "couple"]
+  },
+  {
+    "id": "shanghai_citywalk_1d",
+    "query": "上海一天城市漫步，想看经典城市景观和吃点东西",
+    "expected_city": "上海",
+    "expected_days": 1,
+    "required_interests": ["citywalk", "food"]
+  },
+  {
+    "id": "chengdu_food_culture_3d",
+    "query": "成都三天，喜欢美食和文化，节奏轻松一点",
+    "expected_city": "成都",
+    "expected_days": 3,
+    "required_interests": ["food", "culture"]
+  },
+  {
+    "id": "xian_history_relaxed_2d",
+    "query": "西安两天历史文化游，不要太累",
+    "expected_city": "西安",
+    "expected_days": 2,
+    "required_interests": ["history", "culture"]
+  },
+  {
+    "id": "missing_city_and_days",
+    "query": "我想轻松一点，喜欢自然和美食",
+    "expected_clarification": true
+  }
+]
