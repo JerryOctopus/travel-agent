@@ -11,7 +11,6 @@ run_turn 是同步的（可能调用 LLM），这里放到线程池执行，避�
 from __future__ import annotations
 
 import asyncio
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +19,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from travel_agent.agent.runtime import run_turn
-from travel_agent.agent.session import SessionContext, build_session
 from travel_agent.settings import get_settings
+from travel_agent.storage.session_manager import SessionLifecycleManager
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 
@@ -30,27 +29,12 @@ app = FastAPI(title="Personalized Travel Planning Agent")
 if (WEB_DIR / "static").exists():
     app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 
-
-class SessionLifecycleManager:
-    """简单的会话隔离管理：session_id -> (SessionContext, history)。"""
-
-    def __init__(self) -> None:
-        self._sessions: dict[str, dict[str, Any]] = {}
-
-    def get_or_create(self, session_id: str | None) -> tuple[str, SessionContext, list]:
-        if session_id and session_id in self._sessions:
-            entry = self._sessions[session_id]
-            return session_id, entry["ctx"], entry["history"]
-        sid = session_id or f"sess_{uuid.uuid4().hex[:10]}"
-        ctx = build_session(session_id=sid)
-        self._sessions[sid] = {"ctx": ctx, "history": []}
-        return sid, ctx, self._sessions[sid]["history"]
-
-    def reset(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
+def _build_manager() -> SessionLifecycleManager:
+    settings = get_settings()
+    return SessionLifecycleManager(profile_dir=settings.memory.profile_dir)
 
 
-MANAGER = SessionLifecycleManager()
+MANAGER = _build_manager()
 
 
 @app.get("/")
@@ -64,8 +48,11 @@ async def config() -> JSONResponse:
     return JSONResponse(
         {
             "amap_js_key": settings.amap.js_key or "",
+            "amap_js_security_key": settings.amap.js_security_key or "",
             "real_agent_enabled": settings.llm.enabled,
             "amap_rest_enabled": settings.amap.rest_enabled,
+            "layered_enabled": settings.orchestration.layered_enabled,
+            "skills_enabled": settings.skills.enabled,
         }
     )
 
@@ -79,18 +66,24 @@ async def chat(websocket: WebSocket) -> None:
             payload = await websocket.receive_json()
             message = (payload.get("message") or "").strip()
             session_id = payload.get("session_id")
+            user_id = (payload.get("user_id") or "default").strip() or "default"
             if not message:
                 await websocket.send_json({"type": "error", "message": "空消息"})
                 continue
 
-            sid, ctx, history = MANAGER.get_or_create(session_id)
+            sid, ctx, history = MANAGER.get_or_create(session_id, user_id=user_id)
             await websocket.send_json({"type": "session", "session_id": sid})
             await websocket.send_json({"type": "status", "message": "正在思考与调用工具…"})
 
             try:
                 reply = await asyncio.wait_for(
                     asyncio.to_thread(
-                        run_turn, message, ctx, list(history), settings
+                        run_turn,
+                        message,
+                        ctx,
+                        list(history),
+                        settings,
+                        user_id,
                     ),
                     timeout=settings.agent.request_timeout_seconds,
                 )
@@ -103,6 +96,7 @@ async def chat(websocket: WebSocket) -> None:
 
             history.append(("user", message))
             history.append(("assistant", reply.text))
+            MANAGER.persist_turn(sid, ctx, history, user_id=user_id)
 
             await websocket.send_json(
                 {

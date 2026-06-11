@@ -65,6 +65,53 @@ class ArtifactStore:
             return None
         return max(records, key=lambda r: r["created_at"])["artifact_id"]
 
+    def load_from_disk(self) -> int:
+        """从落盘目录恢复本会话 artifacts（M4 L2）。"""
+        if self.artifact_dir is None:
+            return 0
+        session_dir = self.artifact_dir / self.session_id
+        if not session_dir.exists():
+            return 0
+        loaded = 0
+        for path in session_dir.glob("*.json"):
+            if path.name == "session_state.json":
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            artifact_id = record.get("artifact_id")
+            if artifact_id:
+                self._items[artifact_id] = record
+                loaded += 1
+        return loaded
+
+    def build_prompt_snapshot(self) -> str:
+        """L2：把本会话工具结果压缩成 system prompt 可注入的快照。"""
+        lines: list[str] = []
+        weather = self.latest("weather")
+        if weather:
+            lines.append(
+                f"- 天气：{weather.get('city')} {weather.get('condition')} "
+                f"{weather.get('temperature_c')}°C"
+            )
+        candidates = self.latest("candidates")
+        if candidates:
+            lines.append(f"- 已检索 POI：{candidates.get('city')} 共 {len(candidates.get('pois', []))} 个")
+        ranked = self.latest("ranked")
+        if ranked:
+            lines.append(f"- 已打分候选：{len(ranked.get('pois', []))} 个")
+        itinerary_pack = self.latest("itinerary")
+        if itinerary_pack:
+            itin = itinerary_pack.get("itinerary", {})
+            critic = itinerary_pack.get("critic", {})
+            lines.append(
+                f"- 已有行程：{itin.get('summary', '')}；critic通过={critic.get('passed')}"
+            )
+        if not lines:
+            return "（本会话尚无工具结果快照）"
+        return "\n".join(lines)
+
     def _persist(self, record: dict) -> None:
         if self.artifact_dir is None:
             return

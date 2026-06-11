@@ -37,14 +37,21 @@ def run_turn(
     ctx: SessionContext | None = None,
     history: list[tuple[str, str]] | None = None,
     settings: Settings | None = None,
+    user_id: str = "default",
 ) -> AgentReply:
     """运行一轮对话。``ctx`` 复用同一会话以支持多轮。"""
     settings = settings or get_settings()
     ctx = ctx or build_session()
+    history = history or []
+
+    if settings.orchestration.layered_enabled:
+        from travel_agent.orchestration.layered_agent import run_layered_turn
+
+        return run_layered_turn(user_message, ctx, settings)
 
     if settings.llm.enabled:
         try:
-            return _run_react(user_message, ctx, history or [], settings)
+            return _run_react(user_message, ctx, history, settings, user_id)
         except Exception as exc:  # 真实路径失败时优雅降级，保证可用
             reply = _run_fallback(user_message, ctx)
             reply.text = f"（ReAct agent 调用失败，已降级到离线兜底：{exc}）\n\n" + reply.text
@@ -72,19 +79,32 @@ def _run_react(
     ctx: SessionContext,
     history: list[tuple[str, str]],
     settings: Settings,
+    user_id: str = "default",
 ) -> AgentReply:
-    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
     from langgraph.prebuilt import create_react_agent
 
     from travel_agent.agent.lc_tools import build_tools
     from travel_agent.agent.prompts import build_system_prompt
+    from travel_agent.skills.loader import load_skills, skills_prompt_section
+    from travel_agent.storage.memory_framework import MemoryFramework
+    from travel_agent.storage.user_profile import UserProfileStore
 
-    tools = build_tools(ctx)
+    memory = MemoryFramework.build(
+        ctx, history, user_id, settings.memory, settings.llm.enabled
+    )
+    skills_section = ""
+    if settings.skills.enabled:
+        skills_section = skills_prompt_section(load_skills(settings.skills.skills_dir))
+
+    tools = build_tools(ctx, settings)
     model = _build_chat_model(settings)
     agent = create_react_agent(model, tools)
 
-    messages: list[Any] = [SystemMessage(content=build_system_prompt(ctx.profile))]
-    for role, content in history:
+    messages: list[Any] = [
+        SystemMessage(content=build_system_prompt(ctx.profile, memory, skills_section))
+    ]
+    for role, content in memory.history_for_prompt:
         messages.append(HumanMessage(content=content) if role == "user" else AIMessage(content=content))
     messages.append(HumanMessage(content=user_message))
 
@@ -109,6 +129,7 @@ def _run_react(
     clarification = "request_travel_info" in tool_trace and "plan_and_critique" not in tool_trace
     reply = _reply_from_store(ctx, final_text or "（无文本输出）", tool_trace, used_real_agent=True)
     reply.clarification = clarification
+    UserProfileStore(settings.memory.profile_dir).merge_and_save(user_id, ctx.profile)
     return reply
 
 

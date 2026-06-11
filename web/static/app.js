@@ -41,7 +41,7 @@ async function init() {
   els.agentMode.className = config.real_agent_enabled ? "pill pill-ok" : "pill pill-warn";
 
   if (config.amap_js_key) {
-    loadAmap(config.amap_js_key);
+    loadAmap(config.amap_js_key, config.amap_js_security_key);
   } else {
     els.map.textContent = "未配置高德 JS key（config.toml [amap].js_key），地图不可用";
   }
@@ -205,8 +205,10 @@ function renderCard(card) {
 }
 
 // ---- map ----
-function loadAmap(key) {
-  window._AMapSecurityConfig = window._AMapSecurityConfig || {};
+function loadAmap(key, securityKey) {
+  if (securityKey) {
+    window._AMapSecurityConfig = { securityJsCode: securityKey };
+  }
   const script = document.createElement("script");
   script.src = `https://webapi.amap.com/maps?v=2.0&key=${key}`;
   script.onload = () => {

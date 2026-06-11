@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from travel_agent.schemas import TravelProfile
+
+if TYPE_CHECKING:
+    from travel_agent.storage.memory_framework import MemoryFramework
 
 SYSTEM_BASE = """你是一个专业的中文旅行规划助手，通过自主调用工具来完成任务。
 
@@ -22,9 +27,22 @@ SYSTEM_BASE = """你是一个专业的中文旅行规划助手，通过自主调
 """
 
 
-def build_system_prompt(profile: TravelProfile) -> str:
+def build_system_prompt(
+    profile: TravelProfile,
+    memory: MemoryFramework | None = None,
+    skills_section: str = "",
+) -> str:
     snapshot = _profile_snapshot(profile)
-    return f"{SYSTEM_BASE}\n\n当前已知出行画像（多轮累积）：\n{snapshot}"
+    parts = [SYSTEM_BASE, f"\n当前已知出行画像（多轮累积）：\n{snapshot}"]
+    if memory is not None:
+        parts.append(f"\n【记忆模式：{memory.mode}】")
+        if memory.compressed_summary:
+            parts.append(f"\nL1 历史摘要：\n{memory.compressed_summary}")
+        parts.append(f"\nL2 本会话工具快照：\n{memory.l2_snapshot}")
+        parts.append(f"\nL3 跨会话用户画像：\n{memory.l3_snapshot}")
+    if skills_section:
+        parts.append(f"\n{skills_section}")
+    return "\n".join(parts)
 
 
 def _profile_snapshot(profile: TravelProfile) -> str:

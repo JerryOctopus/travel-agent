@@ -107,6 +107,36 @@ PYTHONPATH=src .venv/bin/python -m travel_agent.mcp_server
 # -> 从 MCP Server 拉取到 9 个工具：search_poi / plan_and_critique / ...
 ```
 
+## M4–M6 加分项（已实现）
+
+### M4 三层记忆 + 会话持久化
+
+- **L1** `MemoryCompressor`：历史超阈值时规则/LLM 压缩
+- **L2** `ArtifactStore`：工具结果落盘 + 注入 system prompt 快照
+- **L3** `UserProfileStore`：跨会话用户偏好（`data/profiles/`）
+- `SessionLifecycleManager`：按 `session_id` 恢复历史与 artifacts（重启可续）
+- `choose_memory_mode`：`full` / `compressed` / `profile_only`
+
+### M5 分层编排（默认关闭）
+
+`config.toml` 中 `[orchestration] layered_enabled = true` 开启：
+
+```text
+requirement → research → planning → risk → render
+```
+
+层校验失败回滚 checkpoint；指标落盘 `layer_metrics` artifact。聚合：
+
+```bash
+.venv/bin/python scripts/eval_layer_metrics.py
+```
+
+### M6 声明式 Skills
+
+`.storyline/skills/*/SKILL.md` 启动时加载为 `skill_<id>` 工具，无需改 Python。内置：
+
+- `full_trip_planner` / `rainy_day_alternative` / `structured_planner`
+
 ## 评估
 
 ```bash

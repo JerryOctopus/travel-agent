@@ -14,13 +14,15 @@ from langchain_core.tools import StructuredTool
 
 from travel_agent.agent import toolkit
 from travel_agent.agent.session import SessionContext
+from travel_agent.settings import Settings
+from travel_agent.skills.loader import build_skill_tools, load_skills
 
 
 def _dump(result: dict[str, Any]) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def build_tools(ctx: SessionContext) -> list[StructuredTool]:
+def build_tools(ctx: SessionContext, settings: Settings | None = None) -> list[StructuredTool]:
     def update_travel_profile(
         destination: str | None = None,
         days: int | None = None,
@@ -98,4 +100,7 @@ def build_tools(ctx: SessionContext) -> list[StructuredTool]:
         render_itinerary,
         render_map,
     ]
-    return [StructuredTool.from_function(fn) for fn in functions]
+    tools = [StructuredTool.from_function(fn) for fn in functions]
+    if settings and settings.skills.enabled:
+        tools.extend(build_skill_tools(load_skills(settings.skills.skills_dir)))
+    return tools

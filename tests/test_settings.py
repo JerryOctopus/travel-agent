@@ -21,6 +21,7 @@ def test_env_overrides_toml(tmp_path, monkeypatch):
         ),
         encoding="utf-8",
     )
+    monkeypatch.delenv("TRAVEL_AGENT_LLM_PROVIDER", raising=False)
     monkeypatch.setenv("TRAVEL_AGENT_LLM_API_KEY", "from_env")
     settings = load_settings(config)
 

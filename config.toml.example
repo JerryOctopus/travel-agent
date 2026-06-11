@@ -22,6 +22,8 @@ web_key = ""
 base_url = "https://restapi.amap.com"
 # 高德「Web 端(JS API)」key：用于前端地图渲染（与上面是两把不同的 key）。
 js_key = ""
+# 与 js_key 配对的安全密钥（控制台「安全密钥」一栏）。
+js_security_key = ""
 timeout_seconds = 5
 
 [agent]
@@ -29,3 +31,20 @@ timeout_seconds = 5
 recursion_limit = 20
 max_tool_retries = 1
 request_timeout_seconds = 120
+
+[memory]
+# L1：超过消息条数切换 compressed；超过 token 估算阈值切换 profile_only
+compress_message_threshold = 8
+profile_only_token_threshold = 4000
+keep_recent_turns = 4
+profile_dir = "data/profiles"
+
+[orchestration]
+# M5 分层编排开关（默认关闭；开启后走 requirement→research→planning→risk→render）
+layered_enabled = false
+max_layer_retries = 2
+
+[skills]
+# M6 声明式技能目录
+enabled = true
+skills_dir = ".storyline/skills"

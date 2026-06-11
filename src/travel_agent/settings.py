@@ -54,6 +54,8 @@ class AmapSettings:
     base_url: str = "https://restapi.amap.com"
     # 高德 JS API key：前端地图渲染
     js_key: str | None = None
+    # 高德 JS API 安全密钥（与 js_key 配对，需在加载地图脚本前注入）
+    js_security_key: str | None = None
     timeout_seconds: int = 5
 
     @property
@@ -69,10 +71,33 @@ class AgentSettings:
 
 
 @dataclass(frozen=True)
+class MemorySettings:
+    compress_message_threshold: int = 8
+    profile_only_token_threshold: int = 4000
+    keep_recent_turns: int = 4
+    profile_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data" / "profiles")
+
+
+@dataclass(frozen=True)
+class OrchestrationSettings:
+    layered_enabled: bool = False
+    max_layer_retries: int = 2
+
+
+@dataclass(frozen=True)
+class SkillsSettings:
+    skills_dir: Path = field(default_factory=lambda: PROJECT_ROOT / ".storyline" / "skills")
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class Settings:
     llm: LLMSettings = field(default_factory=LLMSettings)
     amap: AmapSettings = field(default_factory=AmapSettings)
     agent: AgentSettings = field(default_factory=AgentSettings)
+    memory: MemorySettings = field(default_factory=MemorySettings)
+    orchestration: OrchestrationSettings = field(default_factory=OrchestrationSettings)
+    skills: SkillsSettings = field(default_factory=SkillsSettings)
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -141,6 +166,9 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
     llm_toml = data.get("llm", {}) if isinstance(data.get("llm"), dict) else {}
     amap_toml = data.get("amap", {}) if isinstance(data.get("amap"), dict) else {}
     agent_toml = data.get("agent", {}) if isinstance(data.get("agent"), dict) else {}
+    memory_toml = data.get("memory", {}) if isinstance(data.get("memory"), dict) else {}
+    orch_toml = data.get("orchestration", {}) if isinstance(data.get("orchestration"), dict) else {}
+    skills_toml = data.get("skills", {}) if isinstance(data.get("skills"), dict) else {}
 
     provider = str(_pick("TRAVEL_AGENT_LLM_PROVIDER", llm_toml.get("provider"), "rule")).lower()
     llm = LLMSettings(
@@ -164,6 +192,9 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
             _pick("TRAVEL_AGENT_AMAP_BASE_URL", amap_toml.get("base_url"), "https://restapi.amap.com")
         ).rstrip("/"),
         js_key=_empty_to_none(_pick("TRAVEL_AGENT_AMAP_JS_KEY", amap_toml.get("js_key"), None)),
+        js_security_key=_empty_to_none(
+            _pick("TRAVEL_AGENT_AMAP_JS_SECURITY_KEY", amap_toml.get("js_security_key"), None)
+        ),
         timeout_seconds=_as_int(
             _pick("TRAVEL_AGENT_AMAP_TIMEOUT_SECONDS", amap_toml.get("timeout_seconds"), 5), 5
         ),
@@ -186,7 +217,64 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
         ),
     )
 
-    return Settings(llm=llm, amap=amap, agent=agent)
+    memory = MemorySettings(
+        compress_message_threshold=_as_int(
+            _pick(
+                "TRAVEL_AGENT_MEMORY_COMPRESS_THRESHOLD",
+                memory_toml.get("compress_message_threshold"),
+                8,
+            ),
+            8,
+        ),
+        profile_only_token_threshold=_as_int(
+            _pick(
+                "TRAVEL_AGENT_MEMORY_PROFILE_ONLY_TOKEN_THRESHOLD",
+                memory_toml.get("profile_only_token_threshold"),
+                4000,
+            ),
+            4000,
+        ),
+        keep_recent_turns=_as_int(
+            _pick("TRAVEL_AGENT_MEMORY_KEEP_RECENT_TURNS", memory_toml.get("keep_recent_turns"), 4),
+            4,
+        ),
+        profile_dir=Path(
+            str(_pick("TRAVEL_AGENT_PROFILE_DIR", memory_toml.get("profile_dir"), str(PROJECT_ROOT / "data" / "profiles")))
+        ),
+    )
+
+    orchestration = OrchestrationSettings(
+        layered_enabled=str(
+            _pick("TRAVEL_AGENT_LAYERED_ENABLED", orch_toml.get("layered_enabled"), "false")
+        ).lower()
+        in {"1", "true", "yes", "on"},
+        max_layer_retries=_as_int(
+            _pick("TRAVEL_AGENT_MAX_LAYER_RETRIES", orch_toml.get("max_layer_retries"), 2), 2
+        ),
+    )
+
+    skills = SkillsSettings(
+        skills_dir=Path(
+            str(
+                _pick(
+                    "TRAVEL_AGENT_SKILLS_DIR",
+                    skills_toml.get("skills_dir"),
+                    str(PROJECT_ROOT / ".storyline" / "skills"),
+                )
+            )
+        ),
+        enabled=str(_pick("TRAVEL_AGENT_SKILLS_ENABLED", skills_toml.get("enabled"), "true")).lower()
+        not in {"0", "false", "no", "off"},
+    )
+
+    return Settings(
+        llm=llm,
+        amap=amap,
+        agent=agent,
+        memory=memory,
+        orchestration=orchestration,
+        skills=skills,
+    )
 
 
 @lru_cache(maxsize=1)
