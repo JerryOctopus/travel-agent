@@ -17,12 +17,27 @@ import json
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from travel_agent.agent.serde import poi_to_dict
 from travel_agent.providers import TravelToolProvider, build_tool_provider
 from travel_agent.schemas import POI, TravelProfile
+
+# 当前 Subagent 任务元数据：由 SubagentRunner 在执行前 set，工具写入
+# artifact 时未显式传元数据则自动补全，保证并发场景下每条 artifact 都能
+# 关联到 request_id / task_id / agent（业务工具代码无需改动）。
+_TASK_META: ContextVar[dict | None] = ContextVar("travel_agent_task_meta", default=None)
+
+
+def set_current_task_meta(meta: dict | None):
+    """设置当前任务元数据，返回 reset token（调用方负责在 finally 中复位）。"""
+    return _TASK_META.set(meta)
+
+
+def reset_task_meta(token) -> None:
+    _TASK_META.reset(token)
 
 DEFAULT_POI_PATH = Path(__file__).resolve().parents[3] / "data" / "seed" / "pois.json"
 DEFAULT_ARTIFACT_DIR = Path(__file__).resolve().parents[3] / "data" / "artifacts"
@@ -112,6 +127,12 @@ class ArtifactStore:
             record["agent"] = agent
         if data_source is not None:
             record["data_source"] = data_source
+        # 未显式传入的元数据从当前 Subagent 任务上下文自动补全。
+        meta = _TASK_META.get()
+        if meta:
+            record.setdefault("request_id", meta.get("request_id"))
+            record.setdefault("task_id", meta.get("task_id"))
+            record.setdefault("agent", meta.get("agent"))
         with self._lock:
             self._items[artifact_id] = record
         self._persist(record)
@@ -137,6 +158,11 @@ class ArtifactStore:
                 if record is not None:
                     payloads.append(record["payload"])
         return payloads
+
+    def artifact_ids(self) -> set[str]:
+        """当前全部 artifact id 快照（供执行前后 diff 归因新产出）。"""
+        with self._lock:
+            return set(self._items.keys())
 
     def latest(self, kind: str) -> dict | None:
         record = self._latest_record(kind)

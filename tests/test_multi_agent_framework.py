@@ -165,11 +165,10 @@ def test_variant_presets_degrade_from_same_engine_model():
         capabilities_for_variant("v9")
 
 
-def test_engine_default_is_production_and_run_not_wired_yet():
+def test_engine_default_is_production():
     engine = MultiAgentEngine()
     assert engine.is_production
-    with pytest.raises(NotImplementedError):
-        engine.run()
+    assert engine.capabilities is PRODUCTION_CONFIG
 
 
 # --- V1 确定性派工 -------------------------------------------------------------- #
@@ -193,7 +192,8 @@ def test_build_fixed_tasks_expands_batches_with_dependencies():
     transport = next(task for task in tasks if task.agent == "transport")
     assert set(transport.depends_on) == {task.task_id for task in first_batch}
     planner = next(task for task in tasks if task.agent == "planner")
-    assert planner.depends_on == [transport.task_id]
+    # 累积依赖：planner 等待全部上游批次，从而拿到所有领域 evidence
+    assert set(planner.depends_on) == {task.task_id for task in tasks if task.agent != "planner"}
     assert all(task.request_id == "req_1" for task in tasks)
 
 

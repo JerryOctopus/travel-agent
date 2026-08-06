@@ -72,20 +72,19 @@ def build_fixed_tasks(
     tasks: list[SubagentTask] = []
     previous_ids: list[str] = []
     for batch in batches:
-        batch_ids: list[str] = []
-        for agent in batch:
-            task_id = new_task_id(agent)
-            tasks.append(
-                SubagentTask(
-                    request_id=request_id,
-                    task_id=task_id,
-                    agent=agent,
-                    instruction=task_brief or f"按 {agent} 职责完成本轮任务并输出结构化结论。",
-                    inputs=dict(inputs or {}),
-                    constraints=dict(constraints or {}),
-                    depends_on=list(previous_ids),
-                )
+        tasks.extend(
+            SubagentTask(
+                request_id=request_id,
+                task_id=new_task_id(agent),
+                agent=agent,
+                instruction=task_brief or f"按 {agent} 职责完成本轮任务并输出结构化结论。",
+                inputs=dict(inputs or {}),
+                constraints=dict(constraints or {}),
+                # 累积依赖：等待所有已完成批次，保证下游（尤其 planner）能通过
+                # depends_on 拿到全部上游 evidence 的 artifact_id。
+                depends_on=list(previous_ids),
             )
-            batch_ids.append(task_id)
-        previous_ids = batch_ids
+            for agent in batch
+        )
+        previous_ids.extend(task.task_id for task in tasks[-len(batch) :])
     return tasks

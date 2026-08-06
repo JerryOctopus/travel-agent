@@ -120,7 +120,53 @@ def run_semantic_review(
 
 def reviewer_prompt(review_ctx: ReviewContext) -> str:
     """组装完整 Reviewer prompt（Step 3 真实调用复用）。"""
-    return f"{_REVIEWER_INSTRUCTION}\n\n输入（JSON）：\n{review_ctx.to_prompt_text()}"
+    return f"{_REVIEWER_INSTRUCTION}\n\n输入（JSON）：\n{review_ctx.to_prompt_text()}\n\n只输出 JSON，格式：{{\"verdict\": \"pass|rework|failed\", \"issues\": [...]}}"
+
+
+def extract_json_payload(text: str) -> dict[str, Any]:
+    """从 LLM 回复中提取 JSON 对象（容错 markdown 围栏与前后缀文本）。"""
+    candidate = (text or "").strip()
+    if "```" in candidate:
+        fenced = candidate.split("```")
+        for part in fenced:
+            stripped = part.strip()
+            if stripped.startswith("{"):
+                candidate = stripped.strip("`").strip()
+                if candidate.startswith("json"):
+                    candidate = candidate[4:].strip()
+                break
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start == -1 or end <= start:
+        return {}
+    try:
+        parsed = json.loads(candidate[start : end + 1])
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def build_review_callable(settings: Any, model: Any | None = None) -> ReviewCallable | None:
+    """构建真实的单层无工具 LLM Review 调用；LLM 不可用时返回 None。
+
+    返回的 callable 只读 ReviewContext，直接调用模型一次，不挂载任何工具。
+    """
+    if model is None and not settings.llm.enabled:
+        return None
+
+    def review_callable(review_ctx: ReviewContext) -> dict[str, Any]:
+        active_model = model
+        if active_model is None:
+            from travel_agent.agent.runtime import _build_chat_model
+
+            active_model = _build_chat_model(settings)
+        from langchain_core.messages import HumanMessage
+
+        response = active_model.invoke([HumanMessage(content=reviewer_prompt(review_ctx))])
+        content = response.content if isinstance(response.content, str) else str(response.content)
+        return extract_json_payload(content)
+
+    return review_callable
 
 
 def resolve_delivery_status(
