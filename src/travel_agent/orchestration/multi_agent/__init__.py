@@ -1,0 +1,73 @@
+"""多 Agent 架构（生产 = Full = V3）基础框架包。
+
+Step 1 新增，尚未接入生产路由；现有 runtime / variants 行为不受影响。
+
+模块分工：
+
+- ``schemas``：SubagentTask / SubagentResult / ReviewIssue / ReviewResult /
+  EngineCapabilities 核心契约；
+- ``registry``：5 个执行型 Subagent 定义（Reviewer 不在其中）；
+- ``dispatch_rules``：V1 确定性 ``task_type → 批次`` 派工映射；
+- ``runner``：统一 Subagent 执行器（异常包装为 failed，不上抛）；
+- ``review``：Engine 直调的单层无工具 Semantic Reviewer 与修复周期判定；
+- ``orchestrator``：Main Orchestrator 工具面约束与 dispatch 工具骨架；
+- ``engine``：V0–V3 能力预设、配置别名与统一 Engine 骨架。
+"""
+
+from travel_agent.orchestration.multi_agent.engine import (
+    FULL_CONFIG,
+    PRODUCTION_CONFIG,
+    V0_CONFIG,
+    V1_CONFIG,
+    V2_CONFIG,
+    V3_CONFIG,
+    VARIANT_PRESETS,
+    MultiAgentEngine,
+    TurnOutcome,
+    capabilities_for_variant,
+    requires_semantic_review,
+)
+from travel_agent.orchestration.multi_agent.registry import (
+    SUBAGENT_REGISTRY,
+    SubagentDefinition,
+    all_subagent_tool_names,
+    get_subagent,
+    list_subagents,
+)
+from travel_agent.orchestration.multi_agent.runner import SubagentRunner
+from travel_agent.orchestration.multi_agent.schemas import (
+    EngineCapabilities,
+    ReviewIssue,
+    ReviewResult,
+    SubagentResult,
+    SubagentTask,
+    new_request_id,
+    new_task_id,
+)
+
+__all__ = [
+    "FULL_CONFIG",
+    "PRODUCTION_CONFIG",
+    "V0_CONFIG",
+    "V1_CONFIG",
+    "V2_CONFIG",
+    "V3_CONFIG",
+    "VARIANT_PRESETS",
+    "MultiAgentEngine",
+    "TurnOutcome",
+    "capabilities_for_variant",
+    "requires_semantic_review",
+    "SUBAGENT_REGISTRY",
+    "SubagentDefinition",
+    "all_subagent_tool_names",
+    "get_subagent",
+    "list_subagents",
+    "SubagentRunner",
+    "EngineCapabilities",
+    "ReviewIssue",
+    "ReviewResult",
+    "SubagentResult",
+    "SubagentTask",
+    "new_request_id",
+    "new_task_id",
+]
