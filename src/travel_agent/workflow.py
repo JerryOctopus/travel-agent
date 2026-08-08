@@ -10,7 +10,7 @@ from travel_agent.rag import retrieve_destination_knowledge
 from travel_agent.recommendation import score_pois
 from travel_agent.reviser import revise_itinerary
 from travel_agent.schemas import TravelProfile, WorkflowResult
-from travel_agent.workflow_rules import extract_profile_rule_based
+from travel_agent.workflow_rules import extract_profile_rule_based, normalize_interests
 
 
 DEFAULT_POI_PATH = Path(__file__).resolve().parents[2] / "data" / "seed" / "pois.json"
@@ -87,8 +87,10 @@ def merge_profile(base: TravelProfile, update: TravelProfile) -> TravelProfile:
         days=update.days or base.days,
         start_date=update.start_date or base.start_date,
         budget_level=update.budget_level or base.budget_level,
-        interests=_merge_unique(base.interests, update.interests),
+        budget_limit=update.budget_limit or base.budget_limit,
+        interests=normalize_interests(_merge_unique(base.interests, update.interests)),
         companions=update.companions or base.companions,
+        party_size=update.party_size or base.party_size,
         pace=update.pace if update.pace != "standard" else base.pace,
         hotel_area=update.hotel_area or base.hotel_area,
         food_preference=_merge_unique(base.food_preference, update.food_preference),

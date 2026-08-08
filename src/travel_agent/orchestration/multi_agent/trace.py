@@ -8,7 +8,7 @@
   增量累积，仅在回合边界由单线程调用 ``flush_to_store`` 一次性落 artifact；
 - 每条记录携带 request_id / task_id / agent，并发场景下可精确关联。
 
-Step 5 将用它统一替换 layer_trace；Step 2 只提供线程安全的轨迹设施与测试。
+agent_trace 是多 Agent 架构的唯一执行轨迹设施，提供线程安全的轨迹累积与测试。
 """
 
 from __future__ import annotations

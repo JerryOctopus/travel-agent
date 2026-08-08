@@ -222,31 +222,66 @@ def repair_targets(review: ReviewResult) -> list[str]:
 
 
 def _build_review_result(raw: Any, start: float) -> ReviewResult:
-    raw = raw if isinstance(raw, dict) else {}
-    verdict = str(raw.get("verdict") or VERDICT_FAILED)
+    if not isinstance(raw, dict):
+        return _invalid_review("review payload 不是 JSON object", start)
+    verdict = str(raw.get("verdict") or "")
     if verdict not in (VERDICT_PASS, VERDICT_REWORK, VERDICT_FAILED):
-        verdict = VERDICT_FAILED
+        return _invalid_review(f"非法 verdict: {verdict!r}", start)
+    raw_issues = raw.get("issues")
+    if not isinstance(raw_issues, list):
+        return _invalid_review("issues 必须是 list", start)
     issues: list[ReviewIssue] = []
-    for item in raw.get("issues") or []:
+    for index, item in enumerate(raw_issues):
         if not isinstance(item, dict):
-            continue
-        severity = str(item.get("severity") or SEVERITY_NONCRITICAL)
+            return _invalid_review(f"issues[{index}] 不是 object", start)
+        severity = str(item.get("severity") or "")
         if severity not in SEVERITIES:
-            severity = SEVERITY_NONCRITICAL
+            return _invalid_review(f"issues[{index}] severity 非法: {severity!r}", start)
+        issue_type = str(item.get("issue_type") or "").strip()
+        description = str(item.get("description") or "").strip()
+        evidence = item.get("evidence", [])
+        repair_target = str(item.get("repair_target") or "").strip()
+        repair_instruction = str(item.get("repair_instruction") or "").strip()
+        if not issue_type or not description:
+            return _invalid_review(f"issues[{index}] 缺少 issue_type/description", start)
+        if not isinstance(evidence, list):
+            return _invalid_review(f"issues[{index}] evidence 必须是 list", start)
+        if repair_target and repair_target not in {
+            "attraction",
+            "hotel",
+            "restaurant",
+            "transport",
+            "planner",
+        }:
+            return _invalid_review(f"issues[{index}] repair_target 非法", start)
+        if severity == SEVERITY_RECOVERABLE and (not repair_target or not repair_instruction):
+            return _invalid_review(f"issues[{index}] recoverable 缺少修复目标或指令", start)
         issues.append(
             ReviewIssue(
-                issue_type=str(item.get("issue_type") or "unspecified"),
+                issue_type=issue_type,
                 severity=severity,
-                description=str(item.get("description") or ""),
-                evidence=[str(entry) for entry in (item.get("evidence") or [])],
-                repair_target=str(item.get("repair_target") or ""),
-                repair_instruction=str(item.get("repair_instruction") or ""),
+                description=description,
+                evidence=[str(entry) for entry in evidence],
+                repair_target=repair_target,
+                repair_instruction=repair_instruction,
             )
         )
+    if verdict == VERDICT_REWORK and not any(
+        issue.severity == SEVERITY_RECOVERABLE for issue in issues
+    ):
+        return _invalid_review("rework verdict 缺少 recoverable issue", start)
     return ReviewResult(
         verdict=verdict,
         issues=issues,
         token_usage=dict(raw.get("token_usage") or {}),
+        duration_ms=_elapsed_ms(start),
+    )
+
+
+def _invalid_review(reason: str, start: float) -> ReviewResult:
+    return ReviewResult(
+        verdict=VERDICT_FAILED,
+        error=f"invalid reviewer output: {reason}",
         duration_ms=_elapsed_ms(start),
     )
 

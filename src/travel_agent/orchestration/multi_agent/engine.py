@@ -17,7 +17,8 @@
   不经过 SubagentRunner，是 Engine 直调的一次无工具 LLM 调用；
 - 修复周期最多一次：定向重派领域 Subagent（可跳过）→ Planner 重规划 →
   不再二轮 Review；整个周期只计一次 rework；
-- 渲染统一经 Renderer Gate（render_gate.render_plan_outcome）。
+- 渲染统一经 Renderer Gate（render_gate.render_plan_outcome）；
+- 可观测性统一为 agent_trace：每轮执行在回合边界一次性落 artifact。
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from travel_agent.orchestration.multi_agent.schemas import (
     new_request_id,
     new_task_id,
 )
+from travel_agent.orchestration.multi_agent.trace import AgentTraceLog
 
 # --- V0–V3 能力预设 --------------------------------------------------------- #
 
@@ -116,6 +118,7 @@ class TurnOutcome:
     map_payload: dict[str, Any] | None = None
     gate_status: str = "skipped"
     review: ReviewResult | None = None
+    trace_artifact_id: str | None = None
 
 
 class MultiAgentEngine:
@@ -164,25 +167,97 @@ class MultiAgentEngine:
             return self._run_v0(ctx, settings, user_message, history or [])
 
         runner = self._resolve_runner(ctx, settings)
-        plan_before = ctx.store.latest_id("itinerary")
 
         if self.capabilities.dispatch == "fixed":
             outcome = self._run_fixed(ctx, runner, rid, task_type, task_brief or user_message)
         else:
-            outcome = self._run_dynamic(ctx, settings, runner, rid, user_message, task_brief)
+            outcome = self._run_dynamic(
+                ctx,
+                settings,
+                runner,
+                rid,
+                user_message,
+                task_brief,
+                task_type,
+            )
 
         if outcome.status == STATUS_CLARIFICATION_REQUIRED:
+            self._flush_trace(ctx, rid, outcome)
             return outcome
 
-        plan_after = ctx.store.latest_id("itinerary")
-        plan_produced = bool(plan_after and plan_after != plan_before)
-        outcome.plan_artifact_id = plan_after if plan_produced else None
-
-        if plan_produced:
+        outcome.plan_artifact_id = _plan_artifact_id_from_results(
+            ctx,
+            outcome.results,
+            rid,
+        )
+        plan_required = _plan_required_for_turn(self.capabilities.dispatch, task_type)
+        if plan_required and not outcome.plan_artifact_id:
+            outcome.status = STATUS_INCOMPLETE
+            if not outcome.reply:
+                outcome.reply = "Planner 未成功产出本轮 TravelPlan，当前结果不可交付。"
+        elif outcome.plan_artifact_id:
             self._apply_review_and_render(
                 ctx, settings, outcome, task_type, task_brief or user_message, rid
             )
+        self._flush_trace(ctx, rid, outcome)
         return outcome
+
+    def _flush_trace(self, ctx: Any, request_id: str, outcome: TurnOutcome) -> None:
+        """回合边界一次性落 agent_trace（含派工/Review/渲染结论）。"""
+        store = getattr(ctx, "store", None)
+        if store is None:
+            return
+        trace = AgentTraceLog(request_id)
+        trace.append(
+            "orchestration",
+            agent="engine",
+            status=outcome.status,
+            detail={
+                "mode": self.capabilities.mode,
+                "dispatch": self.capabilities.dispatch,
+                "rework_used": outcome.rework_used,
+                "plan_artifact_id": outcome.plan_artifact_id,
+            },
+        )
+        for result in outcome.results:
+            if not isinstance(result, SubagentResult):
+                continue
+            trace.append(
+                "subagent",
+                agent=result.agent,
+                task_id=result.task_id,
+                status=result.status,
+                detail={
+                    "attempt": result.attempt,
+                    "tool_trace": list(result.tool_trace),
+                    "evidence": list(result.evidence),
+                    "warnings": list(result.warnings),
+                    "duration_ms": result.duration_ms,
+                },
+            )
+        if outcome.review is not None:
+            trace.append(
+                "review",
+                agent="reviewer",
+                status=outcome.review.verdict,
+                detail={
+                    "issues": [
+                        {"issue_type": issue.issue_type, "severity": issue.severity}
+                        for issue in outcome.review.issues
+                    ]
+                },
+            )
+        if outcome.plan_artifact_id:
+            trace.append(
+                "render",
+                agent="engine",
+                status=outcome.gate_status,
+                detail={"plan_artifact_id": outcome.plan_artifact_id},
+            )
+        try:
+            outcome.trace_artifact_id = trace.flush_to_store(store)
+        except Exception:  # noqa: BLE001 — 轨迹落盘失败不影响交付
+            outcome.trace_artifact_id = None
 
     # ------------------------------------------------------------------ #
     # V0：单 Agent 全工具（薄适配既有 runtime._run_react）
@@ -225,8 +300,17 @@ class MultiAgentEngine:
     ) -> TurnOutcome:
         from travel_agent.orchestration.multi_agent.fixed_dispatch import run_fixed_dispatch
 
+        if task_type == TaskType.ITINERARY_REVISION and not ctx.store.latest_id("itinerary"):
+            return TurnOutcome(
+                status=STATUS_CLARIFICATION_REQUIRED,
+                reply="当前会话没有可修改的既有行程，请先生成或提供一份行程。",
+            )
         status, results = run_fixed_dispatch(
-            runner, request_id, task_type, task_brief=task_brief
+            runner,
+            request_id,
+            task_type,
+            task_brief=task_brief,
+            inputs=_fixed_turn_inputs(ctx, task_type),
         )
         if status == STATUS_CLARIFICATION_REQUIRED:
             return TurnOutcome(
@@ -247,6 +331,7 @@ class MultiAgentEngine:
         request_id: str,
         user_message: str,
         task_brief: str,
+        task_type: TaskType | None,
     ) -> TurnOutcome:
         from travel_agent.orchestration.multi_agent.orchestrator_agent import run_orchestrator
 
@@ -265,8 +350,16 @@ class MultiAgentEngine:
                 reply=orch.get("reply") or "需要补充目的地/天数等关键信息。",
                 results=results,
             )
+        status = STATUS_COMPLETED
+        if _plan_required_for_turn("dynamic", task_type):
+            planner = next((result for result in reversed(results) if result.agent == "planner"), None)
+            if planner is None or planner.status not in {
+                STATUS_COMPLETED,
+                STATUS_COMPLETED_WITH_WARNINGS,
+            }:
+                status = STATUS_INCOMPLETE
         return TurnOutcome(
-            status=STATUS_COMPLETED,
+            status=status,
             reply=orch.get("reply") or "",
             results=results,
         )
@@ -293,7 +386,12 @@ class MultiAgentEngine:
         outcome.cards = render.get("cards") or []
         outcome.map_payload = render.get("map_payload")
         outcome.gate_status = render.get("gate_status") or "skipped"
-        outcome.status = delivery
+        if outcome.gate_status in {"rejected", "rendered_incomplete"}:
+            outcome.status = STATUS_INCOMPLETE
+        elif not render.get("rendered"):
+            outcome.status = delivery if delivery in {STATUS_FAILED, STATUS_INCOMPLETE} else STATUS_INCOMPLETE
+        else:
+            outcome.status = delivery
 
     def _run_review_cycle(
         self,
@@ -354,6 +452,8 @@ class MultiAgentEngine:
         domain_targets = [name for name in targets if name != "planner"]
         instructions = _repair_instructions_by_agent(review)
         new_artifact_ids: list[str] = []
+        previous_plan = ctx.store.get(outcome.plan_artifact_id) or {}
+        planner_input_ids = list(previous_plan.get("source_artifact_ids") or [])
         for agent in domain_targets:
             task = SubagentTask(
                 request_id=request_id,
@@ -365,19 +465,28 @@ class MultiAgentEngine:
             result = runner.run_subagent(task)
             outcome.results.append(result)
             new_artifact_ids.extend(_evidence_ids(result))
+        for artifact_id in new_artifact_ids:
+            if artifact_id not in planner_input_ids:
+                planner_input_ids.append(artifact_id)
 
         planner_task = SubagentTask(
             request_id=request_id,
             task_id=new_task_id("planner"),
             agent="planner",
             instruction="使用修复周期更新后的领域证据重新规划，并执行 plan_and_critique。",
-            inputs={"artifact_ids": new_artifact_ids},
+            inputs={"artifact_ids": planner_input_ids},
             attempt=2,
         )
         planner_result = runner.run_subagent(planner_task)
         outcome.results.append(planner_result)
-        outcome.plan_artifact_id = ctx.store.latest_id("itinerary")
+        outcome.plan_artifact_id = _plan_artifact_id_from_results(
+            ctx,
+            [planner_result],
+            request_id,
+        )
         if planner_result.status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS):
+            if not outcome.plan_artifact_id:
+                return STATUS_INCOMPLETE
             # 修复后不再 Review；recoverable 问题按带告警交付。
             return STATUS_COMPLETED_WITH_WARNINGS
         return STATUS_FAILED
@@ -454,6 +563,48 @@ def _evidence_ids(result: SubagentResult) -> list[str]:
         if artifact_id and artifact_id not in ids:
             ids.append(artifact_id)
     return ids
+
+
+def _plan_required_for_turn(dispatch: str, task_type: TaskType | None) -> bool:
+    """完整规划/修改必须有 Planner；动态未知任务也按 fail-closed 处理。"""
+    if task_type in {TaskType.ROUTE_QUERY, TaskType.POI_ADVICE, TaskType.DAY_ADVICE}:
+        return False
+    return task_type in REVIEW_REQUIRED_TASK_TYPES or dispatch == "dynamic"
+
+
+def _fixed_turn_inputs(ctx: Any, task_type: TaskType | None) -> dict[str, Any]:
+    if task_type != TaskType.ITINERARY_REVISION:
+        return {}
+    existing_id = ctx.store.latest_id("itinerary")
+    return {"artifact_ids": [existing_id]} if existing_id else {}
+
+
+def _plan_artifact_id_from_results(
+    ctx: Any,
+    results: list[Any],
+    request_id: str,
+) -> str | None:
+    """只接受成功 Planner 在本 request/task 中明确回报的 itinerary artifact。"""
+    for result in reversed(results):
+        if not isinstance(result, SubagentResult):
+            continue
+        if result.agent != "planner" or result.status not in {
+            STATUS_COMPLETED,
+            STATUS_COMPLETED_WITH_WARNINGS,
+        }:
+            continue
+        for artifact_id in reversed(_evidence_ids(result)):
+            record = ctx.store.get_record(artifact_id)
+            if record is None:
+                continue
+            if (
+                record.get("kind") == "itinerary"
+                and record.get("request_id") == request_id
+                and record.get("task_id") == result.task_id
+                and record.get("agent") == "planner"
+            ):
+                return artifact_id
+    return None
 
 
 def _repair_instructions_by_agent(review: ReviewResult) -> dict[str, str]:

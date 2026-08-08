@@ -1,38 +1,43 @@
 # Personalized Travel Planning Agent
 
-基于 **LangGraph** 的可控旅行规划 Agent。
+基于 **LangGraph** 的多 Agent 可控旅行规划系统。
 
-- **外层是真正自主 tool calling 的 ReAct agent**：LLM 在多轮对话中自主决定调用
-  高德 POI / 天气 / 路线等工具、何时追问、何时触发规划；
-- **内层是可控、可评估的规划子图** `plan_and_critique`（plan → critic → revise
-  闭环），保证最终行程是约束满足、可执行的，而不是 LLM 一次性吐出的不可控文本。
+- **生产入口固定 Multi-Agent Full（V3）**：Main Orchestrator 动态派工给五个领域
+  Subagent（景点 / 餐厅 / 酒店 / 交通 / 规划），Reviewer 语义审查最多一次定向
+  修复周期，渲染统一由 Engine 经 Renderer Gate 执行；
+- **规划核心是可控、可评估的规划子图** `plan_and_critique`（plan → critic → revise
+  闭环），保证最终行程是约束满足、可执行的，而不是 LLM 一次性吐出的不可控文本；
+- **V0–V3 消融对照共用同一 Engine**：同一模型 / 工具 / 数据 / Token 预算下显式
+  复现四种编排版本，证明多智能体不是「为了复杂而复杂」。
 
 > 一句话卖点：既展示 agent 能力（真实自主 tool calling + 真实 API），又展示
-> 「知道何时该用确定性控制」的工程判断力（可控规划子图 + 量化评估）。
+> 「知道何时该用确定性控制」的工程判断力（可控规划子图 + Renderer Gate + 量化评估）。
 
-完整目标与里程碑见 [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md)。
+完整目标与里程碑见 [docs/PROJECT_PLAN.md](docs/PROJECT_PLAN.md)（**M0–M8 均已落地**）。
 
 ## 架构
 
 ```mermaid
 flowchart TB
   user["用户"] --> web["FastAPI + Web (WebSocket /chat, 高德JS地图, A2UI卡片)"]
-  web --> agent["LangGraph create_react_agent (真实 tool calling)"]
-  agent --> tools["工具层 (LangChain @tool)"]
-  subgraph tools
-    poi["search_poi (高德REST/本地)"]
-    wx["check_weather"]
-    route["plan_route"]
-    rec["recommend_candidates (多目标打分+多样性重排)"]
-    planning["plan_and_critique 子图: plan -> critic -> revise"]
-    clarify["request_travel_info"]
-    render["render_map / render_itinerary"]
+  web --> entry["run_production_turn (固定 Multi-Agent Full = V3)"]
+  subgraph engine["MultiAgentEngine"]
+    orch["Main Orchestrator (动态派工, 不持有渲染工具)"]
+    sub["五个 Subagent: attraction / restaurant / hotel / transport / planner"]
+    review["Reviewer (语义审查 + 最多一次定向修复)"]
+    gate["Renderer Gate (统一渲染, 绑定 plan_artifact_id)"]
+    orch --> sub
+    sub --> review
+    review --> gate
   end
-  agent -. 同一套 toolkit .-> mcp["FastMCP Server (streamable-http)"]
-  agent --> store["ArtifactStore (会话级落盘)"]
+  entry --> engine
+  sub --> tools["工具层 (LangChain @tool, 按 agent 白名单)"]
+  gate --> cards["A2UI 卡片 / 高德地图数据"]
+  engine -. 同一套 toolkit .-> mcp["FastMCP Server (streamable-http)"]
+  engine --> store["ArtifactStore (会话级落盘)"]
 ```
 
-- 无 LLM key 时，`run_turn` 自动降级为**确定性兜底**（复用同一套工具按固定顺序
+- 无 LLM key 时，`run_production_turn` 自动降级为**确定性兜底**（复用同一套工具按固定顺序
   跑通），保证项目可离线演示；有 key 时走真正的 ReAct 自主编排。
 - in-process agent 与 MCP server 共用 `travel_agent.agent.toolkit` 的同一套工具实现
   （单一事实源），避免「黑盒大工具」。
@@ -80,6 +85,10 @@ PYTHONPATH=src .venv/bin/python -m travel_agent.server
 | `search_poi` | 检索候选 POI（高德优先，本地 seed 兜底） |
 | `check_weather` | 天气（雨天户外冲突判断） |
 | `plan_route` | 两点距离/通勤时长 |
+| `build_constraints` | 从画像生成可验证 ConstraintSet |
+| `search_restaurant` | 餐厅候选：菜系 / 区域 / 预算 |
+| `search_hotel` | 酒店候选：区域 / 预算 / 评分 |
+| `estimate_budget` | 住宿 / 餐饮 / 门票 / 市内交通预算估算 |
 | `recommend_candidates` | 多目标打分 + 多样性重排 |
 | `plan_and_critique` | **可控规划子图**：plan → critic → revise 闭环 |
 | `render_itinerary` / `render_map` | A2UI 卡片 / 高德地图数据 |
@@ -150,9 +159,10 @@ PYTHONPATH=src .venv/bin/python scripts/run_eval.py
 评估分五层（理解 / Agent / 规划 / 闭环 / 分层），在离线确定性路径下可复现。
 当前结论（小样本，已如实标注局限，见 [docs/EVALUATION.md](docs/EVALUATION.md)）：
 
-- 闭环层：critic→reviser 把违规项从 5 降到 0（下降 100%）；
-- Agent 层：任务完成率 100%、平均工具步数 4.5；
-- 理解层：目的地/天数抽取准确率、追问触达率均为 1.0。
+评估分四组（理解 / Agent、ChinaTravel 式计划质量、闭环、真实多 Agent 的
+agent_trace 口径），详见 [docs/EVALUATION.md](docs/EVALUATION.md)。
+V2 数据集、指标、故障归因与微调门槛详见 [docs/EVALUATION_V2.md](docs/EVALUATION_V2.md)。
+面试讲述稿见 [docs/INTERVIEW_PITCH.md](docs/INTERVIEW_PITCH.md)。
 
 ## 测试
 
@@ -173,7 +183,9 @@ PYTHONPATH=src .venv/bin/python chat_demo.py
 
 - [开发路线与里程碑](docs/PROJECT_PLAN.md)
 - [评估报告](docs/EVALUATION.md)
+- [面试讲述稿](docs/INTERVIEW_PITCH.md)
 - [架构设计](docs/ARCHITECTURE.md)
+- [V0–V3 架构消融实验](docs/ABLATION_V0_V3.md)
 - [工具接口](docs/TOOL_INTERFACE.md)
 - [LLM 结构化抽取设计](docs/LLM_EXTRACTOR.md)
 - [数据结构说明](docs/DATA_STRUCTURE.md)

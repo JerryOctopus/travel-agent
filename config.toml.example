@@ -40,9 +40,9 @@ keep_recent_turns = 4
 profile_dir = "data/profiles"
 
 [orchestration]
-# M5 分层编排开关（默认关闭；开启后走 requirement→research→planning→risk→render）
-layered_enabled = false
-max_layer_retries = 2
+# 生产入口固定 Multi-Agent Full（V3），此处无开关可配。
+# 仅 V0–V3 消融实验（run_variant_turn）共用的 Token 硬上限；<=0 表示不设上限。
+variant_token_budget = 0
 
 [skills]
 # M6 声明式技能目录

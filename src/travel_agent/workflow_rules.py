@@ -41,6 +41,68 @@ INTEREST_KEYWORDS = {
     "购物": "shopping",
 }
 
+CANONICAL_INTERESTS = frozenset(INTEREST_KEYWORDS.values())
+
+INTEREST_DISPLAY_LABELS: dict[str, str] = {
+    "nature": "自然",
+    "food": "美食",
+    "culture": "文化",
+    "history": "历史",
+    "museum": "博物馆",
+    "couple": "情侣",
+    "citywalk": "城市漫步",
+    "family": "亲子",
+    "nightlife": "夜生活",
+    "shopping": "购物",
+}
+
+PACE_DISPLAY_LABELS: dict[str, str] = {
+    "relaxed": "轻松",
+    "standard": "适中",
+    "intensive": "紧凑",
+}
+
+BUDGET_DISPLAY_LABELS: dict[str, str] = {
+    "low": "经济",
+    "mid": "中等",
+    "high": "高档",
+}
+
+
+def normalize_interest(tag: str) -> str:
+    text = tag.strip()
+    if not text:
+        return text
+    if text in INTEREST_KEYWORDS:
+        return INTEREST_KEYWORDS[text]
+    lower = text.lower()
+    if lower in CANONICAL_INTERESTS:
+        return lower
+    return text
+
+
+def format_interests_display(interests: list[str]) -> str:
+    """兴趣标签 → 面向用户的中文展示。"""
+    return "、".join(INTEREST_DISPLAY_LABELS.get(item, item) for item in interests)
+
+
+def format_pace_display(pace: str) -> str:
+    return PACE_DISPLAY_LABELS.get(pace, pace)
+
+
+def format_budget_display(budget: str) -> str:
+    return BUDGET_DISPLAY_LABELS.get(budget, budget)
+
+
+def normalize_interests(interests: list[str]) -> list[str]:
+    """中英文兴趣标签去重归一（自然/美食 → nature/food）。"""
+    merged: list[str] = []
+    for item in interests:
+        canonical = normalize_interest(item)
+        if canonical and canonical not in merged:
+            merged.append(canonical)
+    return merged
+
 
 def extract_profile_rule_based(user_message: str) -> TravelProfile:
     return TravelProfile(

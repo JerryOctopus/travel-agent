@@ -80,8 +80,10 @@ class MemorySettings:
 
 @dataclass(frozen=True)
 class OrchestrationSettings:
-    layered_enabled: bool = False
-    max_layer_retries: int = 2
+    # V0–V3 消融实验四版本共用的 Token 硬上限；<=0 表示不设上限。
+    # 生产入口固定使用 Multi-Agent Full（V3），不读取任何 variant 配置；
+    # 版本选择只能通过 orchestration.variants.run_variant_turn 显式指定。
+    variant_token_budget: int = 0
 
 
 @dataclass(frozen=True)
@@ -244,12 +246,13 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
     )
 
     orchestration = OrchestrationSettings(
-        layered_enabled=str(
-            _pick("TRAVEL_AGENT_LAYERED_ENABLED", orch_toml.get("layered_enabled"), "false")
-        ).lower()
-        in {"1", "true", "yes", "on"},
-        max_layer_retries=_as_int(
-            _pick("TRAVEL_AGENT_MAX_LAYER_RETRIES", orch_toml.get("max_layer_retries"), 2), 2
+        variant_token_budget=_as_int(
+            _pick(
+                "TRAVEL_AGENT_VARIANT_TOKEN_BUDGET",
+                orch_toml.get("variant_token_budget"),
+                0,
+            ),
+            0,
         ),
     )
 

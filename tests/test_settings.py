@@ -45,3 +45,5 @@ def test_defaults_disabled_without_keys(tmp_path, monkeypatch):
     assert settings.llm.enabled is False
     assert settings.amap.rest_enabled is False
     assert settings.agent.recursion_limit == 20
+    assert settings.orchestration.variant_token_budget == 0
+    assert not hasattr(settings.orchestration, "variant")

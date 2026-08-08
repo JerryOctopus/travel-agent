@@ -20,6 +20,9 @@ from typing import Any, Callable
 
 from travel_agent.orchestration.multi_agent.runner import SubagentRunner
 from travel_agent.orchestration.multi_agent.schemas import (
+    STATUS_COMPLETED,
+    STATUS_COMPLETED_WITH_WARNINGS,
+    STATUS_FAILED,
     SubagentResult,
     SubagentTask,
     new_request_id,
@@ -88,6 +91,7 @@ def build_dispatch_tool(runner: SubagentRunner, request_id: str | None = None) -
     短暂持有（Step 2 用死锁测试验证）。
     """
     rid = request_id or new_request_id()
+    results_by_task: dict[str, SubagentResult] = {}
 
     def dispatch_subagent(
         agent: str,
@@ -95,15 +99,58 @@ def build_dispatch_tool(runner: SubagentRunner, request_id: str | None = None) -
         inputs: dict | None = None,
         depends_on: list | None = None,
     ) -> str:
+        task_id = new_task_id(agent)
+        merged_inputs = dict(inputs or {})
+        dependency_ids: list[str] = []
+        unresolved: list[str] = []
+        for dependency_task_id in depends_on or []:
+            dependency = results_by_task.get(str(dependency_task_id))
+            if dependency is None or dependency.status not in {
+                STATUS_COMPLETED,
+                STATUS_COMPLETED_WITH_WARNINGS,
+            }:
+                unresolved.append(str(dependency_task_id))
+                continue
+            for artifact_id in _evidence_artifact_ids(dependency):
+                if artifact_id not in dependency_ids:
+                    dependency_ids.append(artifact_id)
+
+        explicit_ids = [str(aid) for aid in (merged_inputs.get("artifact_ids") or []) if aid]
+        for artifact_id in dependency_ids:
+            if artifact_id not in explicit_ids:
+                explicit_ids.append(artifact_id)
+        if explicit_ids:
+            merged_inputs["artifact_ids"] = explicit_ids
+
         task = SubagentTask(
             request_id=rid,
-            task_id=new_task_id(agent),
+            task_id=task_id,
             agent=agent,
             instruction=instruction,
-            inputs=dict(inputs or {}),
+            inputs=merged_inputs,
             depends_on=list(depends_on or []),
         )
-        result: SubagentResult = runner.run_subagent(task)
+        if unresolved:
+            result = SubagentResult(
+                request_id=rid,
+                task_id=task_id,
+                agent=agent,
+                status=STATUS_FAILED,
+                error=f"unresolved dependencies: {unresolved}",
+                unresolved=[f"dependency:{item}" for item in unresolved],
+            )
+        else:
+            result = runner.run_subagent(task)
+        results_by_task[result.task_id] = result
         return json.dumps(result.to_dict(), ensure_ascii=False, default=str)
 
     return dispatch_subagent
+
+
+def _evidence_artifact_ids(result: SubagentResult) -> list[str]:
+    artifact_ids: list[str] = []
+    for item in result.evidence:
+        artifact_id = item.get("artifact_id") if isinstance(item, dict) else None
+        if artifact_id and artifact_id not in artifact_ids:
+            artifact_ids.append(str(artifact_id))
+    return artifact_ids

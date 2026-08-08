@@ -1,9 +1,12 @@
 # 项目计划
 
-> 本文档已从「固定流水线 + 待做 Web」的旧叙事，重写为「真正落地的 LangGraph
-> Agent」的目标架构与迁移路线图。采用混合方案（B）：外层是真正的 ReAct
-> agent（LLM 自主 tool calling），内层保留约束感知 planner-critic-reviser
-> 作为可控规划核心，作为项目的差异化技术深度点。
+> ⚠️ **状态更新（Step 4）**：本文档是 M0–M9 阶段的历史规划记录。
+> 文中 M9 五层 `LayeredTravelAgent` 编排已在多 Agent 架构改造 Step 4 中
+> 删除，生产链路收敛为 `MultiAgentEngine`（V0–V3 共用同一 Engine，生产入口
+> 固定 Multi-Agent Full = V3），可观测性统一为 agent_trace。
+> M9 历史代码保留在 git tag `m9-layered-final`。
+> 现行架构见 [ARCHITECTURE.md](ARCHITECTURE.md) 与
+> [ABLATION_V0_V3.md](ABLATION_V0_V3.md)。
 >
 > 实现模式参考 `../../TravelAgent-AI-main`（借鉴架构与模式，不照搬功能集）。
 

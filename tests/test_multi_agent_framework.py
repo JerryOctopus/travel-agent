@@ -349,7 +349,15 @@ def test_delivery_status_rules_by_severity():
 
     rework = _review(
         "rework",
-        [{"issue_type": "pace", "severity": "recoverable", "description": "节奏"}],
+        [
+            {
+                "issue_type": "pace",
+                "severity": "recoverable",
+                "description": "节奏",
+                "repair_target": "planner",
+                "repair_instruction": "降低行程强度",
+            }
+        ],
     )
     status, repair = resolve_delivery_status(
         rework, reviewer_enabled=True, max_rework=1, rework_used=0
@@ -374,9 +382,26 @@ def test_repair_targets_ordered_with_planner_last():
     review = _review(
         "rework",
         [
-            {"severity": "recoverable", "repair_target": "planner", "issue_type": "a"},
-            {"severity": "recoverable", "repair_target": "transport", "issue_type": "b"},
-            {"severity": "critical", "repair_target": "hotel", "issue_type": "c"},
+            {
+                "severity": "recoverable",
+                "repair_target": "planner",
+                "repair_instruction": "修复 a",
+                "issue_type": "a",
+                "description": "a issue",
+            },
+            {
+                "severity": "recoverable",
+                "repair_target": "transport",
+                "repair_instruction": "修复 b",
+                "issue_type": "b",
+                "description": "b issue",
+            },
+            {
+                "severity": "critical",
+                "repair_target": "hotel",
+                "issue_type": "c",
+                "description": "c issue",
+            },
         ],
     )
     assert repair_targets(review) == ["transport", "planner"]

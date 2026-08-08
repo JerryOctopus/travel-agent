@@ -53,9 +53,8 @@ class SubagentRunner:
     在 executor 前后承担三件确定性的事（不依赖 LLM 自觉）：
 
     1. 设置任务元数据上下文（工具写 artifact 自动带 request/task/agent）；
-    2. planner 任务执行前，按 inputs["artifact_ids"] 物化指定领域结果，
-       避免 planner 依赖并发下不可靠的 latest()；
-    3. 执行后按 store diff 归因本任务新产出的 evidence 与 payload。
+    2. planner 任务只绑定 inputs["artifact_ids"] 中的明确领域结果；
+    3. 执行后按 request_id/task_id/agent 元数据归因本任务产物。
     """
 
     def __init__(self, ctx: Any, executor: SubagentExecutor | None = None) -> None:
@@ -96,12 +95,36 @@ class SubagentRunner:
             )
 
         store = getattr(self._ctx, "store", None)
+        artifact_ids = [str(aid) for aid in (task.inputs.get("artifact_ids") or []) if aid]
         if task.agent == "planner":
-            self._stage_planner_inputs(task)
-        before_ids = store.artifact_ids() if store is not None else set()
+            invalid_ids = [
+                artifact_id
+                for artifact_id in artifact_ids
+                if store is None or store.get_record(artifact_id) is None
+            ]
+            if not artifact_ids or invalid_ids:
+                reason = "planner requires explicit artifact_ids"
+                if invalid_ids:
+                    reason += f"; missing={invalid_ids}"
+                return SubagentResult(
+                    request_id=task.request_id,
+                    task_id=task.task_id,
+                    agent=task.agent,
+                    status=STATUS_FAILED,
+                    attempt=task.attempt,
+                    error=reason,
+                    duration_ms=_elapsed_ms(start),
+                )
+        elif artifact_ids and store is not None:
+            task.inputs["artifact_inputs"] = _compact_dependency_inputs(store, artifact_ids)
 
         token = set_current_task_meta(
-            {"request_id": task.request_id, "task_id": task.task_id, "agent": task.agent}
+            {
+                "request_id": task.request_id,
+                "task_id": task.task_id,
+                "agent": task.agent,
+                "artifact_ids": artifact_ids,
+            }
         )
         try:
             raw = self._executor(definition, task, self._ctx)
@@ -118,28 +141,16 @@ class SubagentRunner:
         finally:
             reset_task_meta(token)
 
-        new_ids = sorted(store.artifact_ids() - before_ids) if store is not None else []
-        return _build_result(task, raw, start, store, new_ids)
-
-    def _stage_planner_inputs(self, task: SubagentTask) -> None:
-        """把任务显式指定的 artifact 物化为新记录，planner 的既有工具
-        （内部读 latest）因此只会消费指定结果，而非并发写入的其他产物。"""
-        store = getattr(self._ctx, "store", None)
-        artifact_ids = [aid for aid in (task.inputs.get("artifact_ids") or []) if aid]
-        if store is None or not artifact_ids:
-            return
-        for artifact_id in artifact_ids:
-            record = store.get_record(artifact_id)
-            if record is None:
-                continue
-            store.put(
-                record.get("kind") or "staged",
-                record.get("payload") or {},
-                request_id=task.request_id,
-                task_id=task.task_id,
-                agent="planner",
-                data_source=record.get("data_source"),
+        new_ids = (
+            store.artifact_ids_for_task(
+                task.request_id,
+                task.task_id,
+                agent=task.agent,
             )
+            if store is not None
+            else []
+        )
+        return _build_result(task, raw, start, store, new_ids)
 
 
 def _build_result(
@@ -194,3 +205,37 @@ def _build_result(
 
 def _elapsed_ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
+
+
+def _compact_dependency_inputs(store: Any, artifact_ids: list[str]) -> list[dict[str, Any]]:
+    """给非 Planner 下游提供可执行的紧凑依赖数据；Planner 仍只按 ID 自取。"""
+    compact: list[dict[str, Any]] = []
+    for artifact_id in artifact_ids:
+        record = store.get_record(artifact_id)
+        payload = store.get(artifact_id)
+        if record is None or not isinstance(payload, dict):
+            continue
+        kind = str(record.get("kind") or "")
+        value: dict[str, Any] = {"city": payload.get("city")}
+        if kind == "candidates":
+            value["pois"] = [
+                {"poi_id": item.get("poi_id"), "name": item.get("name")}
+                for item in (payload.get("pois") or [])[:12]
+                if isinstance(item, dict)
+            ]
+        elif kind == "hotels":
+            value["hotels"] = [
+                {"poi_id": item.get("hotel_id"), "name": item.get("name")}
+                for item in (payload.get("hotels") or [])[:8]
+                if isinstance(item, dict)
+            ]
+        elif kind == "restaurants":
+            value["restaurants"] = [
+                {"poi_id": item.get("poi_id"), "name": item.get("name")}
+                for item in (payload.get("restaurants") or [])[:8]
+                if isinstance(item, dict)
+            ]
+        else:
+            value = {key: payload.get(key) for key in sorted(payload)[:12]}
+        compact.append({"artifact_id": artifact_id, "kind": kind, "payload": value})
+    return compact

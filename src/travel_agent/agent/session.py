@@ -39,6 +39,11 @@ def set_current_task_meta(meta: dict | None):
 def reset_task_meta(token) -> None:
     _TASK_META.reset(token)
 
+
+def current_task_meta() -> dict:
+    """返回当前 Subagent 任务元数据的只读快照。"""
+    return dict(_TASK_META.get() or {})
+
 DEFAULT_POI_PATH = Path(__file__).resolve().parents[3] / "data" / "seed" / "pois.json"
 DEFAULT_ARTIFACT_DIR = Path(__file__).resolve().parents[3] / "data" / "artifacts"
 
@@ -163,6 +168,25 @@ class ArtifactStore:
         """当前全部 artifact id 快照（供执行前后 diff 归因新产出）。"""
         with self._lock:
             return set(self._items.keys())
+
+    def artifact_ids_for_task(
+        self,
+        request_id: str,
+        task_id: str,
+        *,
+        agent: str | None = None,
+    ) -> list[str]:
+        """按任务元数据返回该任务自己产出的 artifact，禁止全局 diff 串线。"""
+        with self._lock:
+            records = [
+                record
+                for record in self._items.values()
+                if record.get("request_id") == request_id
+                and record.get("task_id") == task_id
+                and (agent is None or record.get("agent") == agent)
+            ]
+        records.sort(key=lambda record: (record["created_at"], record["artifact_id"]))
+        return [str(record["artifact_id"]) for record in records]
 
     def latest(self, kind: str) -> dict | None:
         record = self._latest_record(kind)

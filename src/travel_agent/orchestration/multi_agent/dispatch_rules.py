@@ -26,8 +26,8 @@ from travel_agent.orchestration.multi_agent.schemas import (
 TASK_TYPE_SUBAGENT_MAP: dict[TaskType, tuple[tuple[str, ...], ...]] = {
     # A 到 B 怎么走 / 交通方式 / 耗时
     TaskType.ROUTE_QUERY: (("transport",),),
-    # 住哪 / 选酒店 / 选区域等咨询（酒店区域比较需要动线参考）
-    TaskType.POI_ADVICE: (("hotel", "transport"),),
+    # 住哪 / 选酒店 / 选区域等咨询：先取得 POI/酒店候选，再做动线比较。
+    TaskType.POI_ADVICE: (("attraction", "hotel"), ("transport",)),
     # 天气 / 特定日期去哪玩的轻量建议
     TaskType.DAY_ADVICE: (("attraction",),),
     # 修改既有行程：由 planner 基于既有 artifact 重新规划

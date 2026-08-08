@@ -1,6 +1,8 @@
 """多 Agent 架构（生产 = Full = V3）基础框架包。
 
-Step 1 新增，尚未接入生产路由；现有 runtime / variants 行为不受影响。
+生产入口（``agent.runtime.run_production_turn``）固定使用
+``PRODUCTION_CONFIG``；V0–V3 消融实验通过 ``variants.run_variant_turn``
+显式选择同一 Engine 的能力预设。
 
 模块分工：
 

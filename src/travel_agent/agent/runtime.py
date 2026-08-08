@@ -17,6 +17,7 @@ from typing import Any
 from travel_agent.agent import toolkit
 from travel_agent.agent.render import build_itinerary_cards, build_map_payload
 from travel_agent.agent.session import SessionContext, build_session
+from travel_agent.agent.turn_analysis import analyze_travel_turn
 from travel_agent.settings import Settings, get_settings
 from travel_agent.workflow_rules import extract_profile_rule_based
 
@@ -32,31 +33,69 @@ class AgentReply:
     profile: dict[str, Any] = field(default_factory=dict)
 
 
-def run_turn(
+def run_production_turn(
     user_message: str,
     ctx: SessionContext | None = None,
     history: list[tuple[str, str]] | None = None,
     settings: Settings | None = None,
     user_id: str = "default",
 ) -> AgentReply:
-    """运行一轮对话。``ctx`` 复用同一会话以支持多轮。"""
+    """生产固定入口：固定使用 Multi-Agent Full（V3），不读取 variant。"""
     settings = settings or get_settings()
     ctx = ctx or build_session()
     history = history or []
 
-    if settings.orchestration.layered_enabled:
-        from travel_agent.orchestration.layered_agent import run_layered_turn
-
-        return run_layered_turn(user_message, ctx, settings)
-
     if settings.llm.enabled:
         try:
-            return _run_react(user_message, ctx, history, settings, user_id)
-        except Exception as exc:  # 真实路径失败时优雅降级，保证可用
+            analysis = analyze_travel_turn(user_message, ctx, settings, history)
+            return _run_multi_agent(user_message, ctx, history, settings, analysis)
+        except Exception as exc:  # 多 Agent 路径失败时保留原有离线 fallback
             reply = _run_fallback(user_message, ctx)
-            reply.text = f"（ReAct agent 调用失败，已降级到离线兜底：{exc}）\n\n" + reply.text
+            reply.text = f"（多 Agent 执行失败，已降级到离线兜底：{exc}）\n\n" + reply.text
             return reply
     return _run_fallback(user_message, ctx)
+
+
+def _run_multi_agent(
+    user_message: str,
+    ctx: SessionContext,
+    history: list[tuple[str, str]],
+    settings: Settings,
+    analysis: Any,
+) -> AgentReply:
+    """生产 Multi-Agent Full（V3）链路；不读取 variant。"""
+    from travel_agent.orchestration.multi_agent import PRODUCTION_CONFIG, MultiAgentEngine
+
+    engine = MultiAgentEngine(PRODUCTION_CONFIG)
+    outcome = engine.run_turn(
+        ctx,
+        settings,
+        user_message,
+        task_type=analysis.task_type,
+        task_brief=user_message,
+        history=history,
+    )
+    return _reply_from_outcome(ctx, outcome)
+
+
+def _reply_from_outcome(ctx: SessionContext, outcome: Any) -> AgentReply:
+    """把 Engine TurnOutcome 转为产品 AgentReply。"""
+    from travel_agent.orchestration.multi_agent.schemas import STATUS_CLARIFICATION_REQUIRED
+
+    tool_trace = [
+        name
+        for result in outcome.results
+        for name in (getattr(result, "tool_trace", None) or [])
+    ]
+    return AgentReply(
+        text=outcome.reply,
+        cards=list(outcome.cards),
+        map_payload=outcome.map_payload,
+        tool_trace=tool_trace,
+        used_real_agent=True,
+        clarification=outcome.status == STATUS_CLARIFICATION_REQUIRED,
+        profile=toolkit._profile_brief(ctx.profile),
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -33,8 +33,10 @@ class TravelProfile:
     days: int | None = None  # 旅行天数
     start_date: str | None = None  # 出发日期
     budget_level: BudgetLevel | None = None  # 预算等级
+    budget_limit: float | None = None  # 总预算上限（元）
     interests: list[str] = field(default_factory=list)  # 兴趣偏好
     companions: str | None = None  # 同行人
+    party_size: int | None = None  # 出行人数
     pace: Pace = "standard"  # 旅行节奏
     hotel_area: str | None = None  # 住宿区域
     food_preference: list[str] = field(default_factory=list)  # 饮食偏好

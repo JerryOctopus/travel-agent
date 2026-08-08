@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from travel_agent.agent.runtime import run_turn
+from travel_agent.agent.runtime import run_production_turn
 from travel_agent.agent.session import build_session
 
 
 def test_offline_turn_produces_itinerary(offline_settings):
     ctx = build_session(persist=False)
-    reply = run_turn(
+    reply = run_production_turn(
         "帮我规划杭州三天，喜欢自然和美食，轻松一点",
         ctx=ctx,
         settings=offline_settings,
@@ -23,7 +23,7 @@ def test_offline_turn_produces_itinerary(offline_settings):
 
 def test_offline_turn_asks_when_missing(offline_settings):
     ctx = build_session(persist=False)
-    reply = run_turn("我想去旅行", ctx=ctx, settings=offline_settings)
+    reply = run_production_turn("我想去旅行", ctx=ctx, settings=offline_settings)
 
     assert reply.clarification is True
     assert reply.map_payload is None
@@ -32,10 +32,10 @@ def test_offline_turn_asks_when_missing(offline_settings):
 
 def test_multi_turn_accumulates_profile(offline_settings):
     ctx = build_session(persist=False)
-    first = run_turn("我想去北京", ctx=ctx, settings=offline_settings)
+    first = run_production_turn("我想去北京", ctx=ctx, settings=offline_settings)
     assert first.clarification is True
 
-    second = run_turn("玩两天，喜欢历史", ctx=ctx, settings=offline_settings)
+    second = run_production_turn("玩两天，喜欢历史", ctx=ctx, settings=offline_settings)
     assert second.clarification is False
     assert second.profile["destination"] == "北京"
     assert second.profile["days"] == 2

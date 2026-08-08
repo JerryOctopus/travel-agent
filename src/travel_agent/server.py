@@ -5,7 +5,7 @@
 - ``/chat`` WebSocket：按 session 维持多轮上下文，逐事件推送
   状态/卡片/地图/文本（A2UI 风格），并带超时保护。
 
-run_turn 是同步的（可能调用 LLM），这里放到线程池执行，避免阻塞事件循环。
+run_production_turn 是同步的（可能调用 LLM），这里放到线程池执行，避免阻塞事件循环。
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from travel_agent.agent.runtime import run_turn
+from travel_agent.agent.runtime import run_production_turn
 from travel_agent.settings import get_settings
 from travel_agent.storage.session_manager import SessionLifecycleManager
 
@@ -51,7 +51,6 @@ async def config() -> JSONResponse:
             "amap_js_security_key": settings.amap.js_security_key or "",
             "real_agent_enabled": settings.llm.enabled,
             "amap_rest_enabled": settings.amap.rest_enabled,
-            "layered_enabled": settings.orchestration.layered_enabled,
             "skills_enabled": settings.skills.enabled,
         }
     )
@@ -78,7 +77,7 @@ async def chat(websocket: WebSocket) -> None:
             try:
                 reply = await asyncio.wait_for(
                     asyncio.to_thread(
-                        run_turn,
+                        run_production_turn,
                         message,
                         ctx,
                         list(history),

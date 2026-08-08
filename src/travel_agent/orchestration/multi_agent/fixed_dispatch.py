@@ -20,6 +20,8 @@ from travel_agent.orchestration.multi_agent.dispatch_rules import (
 )
 from travel_agent.orchestration.multi_agent.schemas import (
     STATUS_COMPLETED,
+    STATUS_COMPLETED_WITH_WARNINGS,
+    STATUS_FAILED,
     SubagentResult,
     SubagentTask,
 )
@@ -54,11 +56,32 @@ def run_fixed_dispatch(
     ordered: list[SubagentResult] = []
     for task in tasks:
         upstream_artifacts: list[str] = []
+        unresolved_dependencies: list[str] = []
         for dep_id in task.depends_on:
             dep_result = results_by_id.get(dep_id)
-            if dep_result is None:
+            if dep_result is None or dep_result.status not in {
+                STATUS_COMPLETED,
+                STATUS_COMPLETED_WITH_WARNINGS,
+            }:
+                unresolved_dependencies.append(dep_id)
                 continue
-            upstream_artifacts.extend(_evidence_artifact_ids(dep_result))
+            artifact_ids = _evidence_artifact_ids(dep_result)
+            if not artifact_ids:
+                unresolved_dependencies.append(dep_id)
+                continue
+            upstream_artifacts.extend(artifact_ids)
+        if unresolved_dependencies:
+            result = SubagentResult(
+                request_id=request_id,
+                task_id=task.task_id,
+                agent=task.agent,
+                status=STATUS_FAILED,
+                error=f"unresolved dependencies: {unresolved_dependencies}",
+                unresolved=[f"dependency:{item}" for item in unresolved_dependencies],
+            )
+            results_by_id[task.task_id] = result
+            ordered.append(result)
+            continue
         if upstream_artifacts:
             merged = list(task.inputs.get("artifact_ids") or [])
             for aid in upstream_artifacts:

@@ -17,9 +17,7 @@ from typing import Any
 
 from travel_agent.agent.render import (
     build_itinerary_cards,
-    build_layer_trace_card,
     build_map_payload,
-    build_supplement_cards,
 )
 from travel_agent.agent.serde import (
     itinerary_to_dict,
@@ -27,7 +25,7 @@ from travel_agent.agent.serde import (
     poi_from_dict,
     poi_to_dict,
 )
-from travel_agent.agent.session import SessionContext
+from travel_agent.agent.session import SessionContext, current_task_meta
 from travel_agent.constraints import ConstraintSet
 from travel_agent.planning_subgraph import plan_and_critique as run_plan_and_critique
 from travel_agent.recommendation import score_pois
@@ -386,10 +384,18 @@ def check_weather(ctx: SessionContext, city: str | None = None) -> dict[str, Any
                 "suggestion": "建议出发前通过官方天气服务复核，并准备室内备选点。",
             },
         )
-    ctx.store.put("weather", {"city": target_city, "condition": weather.condition,
-                              "temperature_c": weather.temperature_c, "source": weather.source})
+    artifact_id = ctx.store.put(
+        "weather",
+        {
+            "city": target_city,
+            "condition": weather.condition,
+            "temperature_c": weather.temperature_c,
+            "source": weather.source,
+        },
+    )
     return _ok(
         f"{target_city} 天气：{weather.condition}，约 {weather.temperature_c}°C（{weather.source}）。",
+        artifact_id=artifact_id,
         city=target_city,
         condition=weather.condition,
         temperature_c=weather.temperature_c,
@@ -410,14 +416,23 @@ def plan_route(
         return _err("找不到对应 POI，请确认 poi_id 来自 search_poi 返回的结果。")
     transport = mode if mode in VALID_TRANSPORT else ctx.profile.transport_mode
     route = ctx.provider.estimate_route(origin, destination, transport)
+    route_payload = {
+        "origin_poi_id": origin.poi_id,
+        "destination_poi_id": destination.poi_id,
+        "origin_name": origin.name,
+        "destination_name": destination.name,
+        "distance_km": route.distance_km,
+        "duration_min": route.duration_min,
+        "mode": route.mode,
+        "source": route.source,
+        "estimated_cost": _estimate_transport_cost(route.distance_km, route.mode),
+    }
+    artifact_id = ctx.store.put("routes", route_payload)
     return _ok(
         f"{origin.name} → {destination.name}：约 {route.duration_min} 分钟 / "
         f"{route.distance_km} 公里（{route.mode}, {route.source}）。",
-        distance_km=route.distance_km,
-        duration_min=route.duration_min,
-        mode=route.mode,
-        source=route.source,
-        estimated_cost=_estimate_transport_cost(route.distance_km, route.mode),
+        artifact_id=artifact_id,
+        **route_payload,
     )
 
 
@@ -497,6 +512,7 @@ def search_hotel(
         category="hotel",
         max_results=max_results * 2,
     )
+    ctx.remember_pois(poi_hotels)
     hotels = _hotels_from_pois(poi_hotels, target_area, target_budget)
     if not hotels:
         hotels = _mock_hotels(target_city, target_area, target_budget)
@@ -571,17 +587,43 @@ def estimate_budget(
 # --------------------------------------------------------------------------- #
 # 推荐打分 + 可控规划子图
 # --------------------------------------------------------------------------- #
-def recommend_candidates(ctx: SessionContext, top_k: int = 12) -> dict[str, Any]:
-    """对候选 POI 做多目标打分 + 多样性重排，产出排序后的规划输入。"""
-    candidates_artifact = ctx.store.latest("candidates")
-    if not candidates_artifact:
-        return _err("还没有候选 POI，请先调用 search_poi。")
-    pois = [poi_from_dict(p) for p in candidates_artifact["pois"]]
+def recommend_candidates(
+    ctx: SessionContext,
+    top_k: int = 12,
+    artifact_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """只按明确 artifact_id 对候选 POI/餐厅做重排。"""
+    records, error = _planner_input_records(
+        ctx,
+        artifact_ids,
+        allowed_kinds={"candidates", "restaurants"},
+        legacy_kinds=("candidates", "restaurants"),
+    )
+    if error:
+        return _err(error)
+    pois_by_id: dict[str, POI] = {}
+    source_ids: list[str] = []
+    for record in records:
+        payload = record["payload"]
+        raw_pois = payload.get("pois") or payload.get("restaurants") or []
+        for raw_poi in raw_pois:
+            try:
+                poi = poi_from_dict(raw_poi)
+            except Exception:
+                continue
+            pois_by_id[poi.poi_id] = poi
+        source_ids.append(record["artifact_id"])
+    if not pois_by_id:
+        return _err("明确指定的 artifact 中没有可规划 POI，请先调用 search_poi。")
+    pois = list(pois_by_id.values())
     ranked = score_pois(pois, ctx.profile)
     top = ranked[: max(1, top_k)]
     artifact_id = ctx.store.put(
         "ranked",
-        {"pois": [_scored_to_dict(s) for s in ranked]},
+        {
+            "pois": [_scored_to_dict(s) for s in ranked],
+            "source_artifact_ids": source_ids,
+        },
     )
     return _ok(
         f"完成多目标打分与多样性重排，输出 {len(ranked)} 个排序候选。",
@@ -594,11 +636,49 @@ def recommend_candidates(ctx: SessionContext, top_k: int = 12) -> dict[str, Any]
     )
 
 
-def plan_and_critique(ctx: SessionContext, max_iters: int = 3) -> dict[str, Any]:
-    """运行可控规划子图：plan → critic → revise 闭环，输出约束满足的行程。"""
-    ranked_artifact = ctx.store.latest("ranked")
+def plan_and_critique(
+    ctx: SessionContext,
+    max_iters: int = 3,
+    artifact_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """按明确 artifact_id 聚合全部领域结果并生成 TravelPlan。"""
+    records, error = _planner_input_records(
+        ctx,
+        artifact_ids,
+        allowed_kinds={
+            "candidates",
+            "ranked",
+            "weather",
+            "hotels",
+            "restaurants",
+            "routes",
+            "budget",
+            "constraints",
+            "itinerary",
+        },
+        legacy_kinds=(
+            "ranked",
+            "candidates",
+            "weather",
+            "hotels",
+            "restaurants",
+            "routes",
+            "budget",
+            "constraints",
+            "itinerary",
+        ),
+        include_current_task_outputs=True,
+    )
+    if error:
+        return _err(error)
+    ranked_artifact = next(
+        (record["payload"] for record in reversed(records) if record["kind"] == "ranked"),
+        None,
+    )
     if not ranked_artifact:
-        return _err("还没有排序候选，请先调用 recommend_candidates。")
+        ranked_artifact = _ranked_from_previous_itinerary(records, ctx)
+    if not ranked_artifact:
+        return _err("明确指定的 artifact 中没有排序候选，请先调用 recommend_candidates。")
     if not ctx.profile.destination or not ctx.profile.days:
         return _err("缺少 destination 或 days，无法规划，请先补全画像。")
 
@@ -626,6 +706,7 @@ def plan_and_critique(ctx: SessionContext, max_iters: int = 3) -> dict[str, Any]
                 "suggestion": "建议出发前使用地图导航复核实际路况和通勤时间。",
             },
         )
+    domain_inputs = _collect_domain_inputs(records)
     artifact_id = ctx.store.put(
         "itinerary",
         {
@@ -642,6 +723,8 @@ def plan_and_critique(ctx: SessionContext, max_iters: int = 3) -> dict[str, Any]
             "original_issue_count": result.original_issue_count,
             "final_issue_count": result.final_issue_count,
             "iterations": result.iterations,
+            "source_artifact_ids": [record["artifact_id"] for record in records],
+            "domain_inputs": domain_inputs,
         },
     )
     return _ok(
@@ -659,6 +742,136 @@ def plan_and_critique(ctx: SessionContext, max_iters: int = 3) -> dict[str, Any]
     )
 
 
+def _planner_input_records(
+    ctx: SessionContext,
+    artifact_ids: list[str] | None,
+    *,
+    allowed_kinds: set[str],
+    legacy_kinds: tuple[str, ...],
+    include_current_task_outputs: bool = False,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """解析工具输入；planner 永远只读任务绑定 ID，非 planner 保留旧链兼容。"""
+    meta = current_task_meta()
+    planner_task = meta.get("agent") == "planner"
+    requested = [str(aid) for aid in (artifact_ids or []) if aid]
+
+    if planner_task:
+        bound = [str(aid) for aid in (meta.get("artifact_ids") or []) if aid]
+        if include_current_task_outputs:
+            bound.extend(
+                ctx.store.artifact_ids_for_task(
+                    str(meta.get("request_id") or ""),
+                    str(meta.get("task_id") or ""),
+                    agent="planner",
+                )
+            )
+        allowed_ids = list(dict.fromkeys(bound))
+        if requested:
+            unbound = [artifact_id for artifact_id in requested if artifact_id not in allowed_ids]
+            if unbound:
+                return [], f"planner 收到未绑定的 artifact_id: {unbound}"
+        else:
+            requested = allowed_ids
+    elif not requested:
+        # 兼容 V0/离线单 Agent；该分支不属于 planner Subagent。
+        requested = [
+            artifact_id
+            for kind in legacy_kinds
+            if (artifact_id := ctx.store.latest_id(kind)) is not None
+        ]
+
+    records: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for artifact_id in dict.fromkeys(requested):
+        record = ctx.store.get_record(artifact_id)
+        if record is None:
+            missing.append(artifact_id)
+            continue
+        if record.get("kind") not in allowed_kinds:
+            continue
+        payload = ctx.store.get(artifact_id)
+        if not isinstance(payload, dict):
+            missing.append(artifact_id)
+            continue
+        records.append(
+            {
+                "artifact_id": artifact_id,
+                "kind": str(record.get("kind") or ""),
+                "payload": payload,
+            }
+        )
+    if missing:
+        return [], f"artifact_id 不存在或 payload 非法: {missing}"
+    return records, None
+
+
+def _ranked_from_previous_itinerary(
+    records: list[dict[str, Any]],
+    ctx: SessionContext,
+) -> dict[str, Any] | None:
+    """行程修改时从明确绑定的旧 itinerary 恢复候选，禁止读 latest。"""
+    previous = next(
+        (record for record in reversed(records) if record["kind"] == "itinerary"),
+        None,
+    )
+    if previous is None:
+        return None
+    itinerary = previous["payload"].get("itinerary") or {}
+    pois_by_id: dict[str, POI] = {}
+    for day in itinerary.get("days") or []:
+        for stop in day.get("stops") or []:
+            raw_poi = stop.get("poi") if isinstance(stop, dict) else None
+            if not isinstance(raw_poi, dict):
+                continue
+            try:
+                poi = poi_from_dict(raw_poi)
+            except Exception:
+                continue
+            pois_by_id[poi.poi_id] = poi
+    if not pois_by_id:
+        return None
+    ranked = score_pois(list(pois_by_id.values()), ctx.profile)
+    return {
+        "pois": [_scored_to_dict(item) for item in ranked],
+        "source_artifact_ids": [previous["artifact_id"]],
+    }
+
+
+def _collect_domain_inputs(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """把全部明确绑定的领域结果写入 Planner 产出的 plan artifact。"""
+    inputs: dict[str, Any] = {
+        "attractions": [],
+        "hotels": [],
+        "restaurants": [],
+        "transport": [],
+        "weather": [],
+        "budgets": [],
+        "constraints": [],
+        "previous_itineraries": [],
+    }
+    key_by_kind = {
+        "candidates": "attractions",
+        "hotels": "hotels",
+        "restaurants": "restaurants",
+        "routes": "transport",
+        "weather": "weather",
+        "budget": "budgets",
+        "constraints": "constraints",
+        "itinerary": "previous_itineraries",
+    }
+    for record in records:
+        target = key_by_kind.get(record["kind"])
+        if target is None:
+            continue
+        inputs[target].append(
+            {
+                "artifact_id": record["artifact_id"],
+                "payload": record["payload"],
+            }
+        )
+    return inputs
+
+
 # --------------------------------------------------------------------------- #
 # 渲染
 # --------------------------------------------------------------------------- #
@@ -670,15 +883,12 @@ def render_itinerary(ctx: SessionContext) -> dict[str, Any]:
     weather = ctx.store.latest("weather")
     cards = build_itinerary_cards(payload, weather)
     cards.extend(
-        build_supplement_cards(
+        _build_supplement_cards(
             restaurants=ctx.store.latest("restaurants"),
             hotels=ctx.store.latest("hotels"),
             budget=ctx.store.latest("budget"),
         )
     )
-    layer_card = build_layer_trace_card(ctx.store.latest("layer_trace"))
-    if layer_card:
-        cards.append(layer_card)
     return _ok("已生成行程卡片。", cards=cards)
 
 
@@ -733,13 +943,14 @@ def gated_render_itinerary(
     payload = record["payload"]
     critic_passed = bool(payload.get("critic", {}).get("passed") is True)
     incomplete = mark_incomplete or not critic_passed
-    weather = ctx.store.latest("weather")
+    domain_inputs = payload.get("domain_inputs") or {}
+    weather = _last_domain_payload(domain_inputs, "weather")
     cards = build_itinerary_cards(payload, weather)
     cards.extend(
-        build_supplement_cards(
-            restaurants=ctx.store.latest("restaurants"),
-            hotels=ctx.store.latest("hotels"),
-            budget=ctx.store.latest("budget"),
+        _build_supplement_cards(
+            restaurants=_last_domain_payload(domain_inputs, "restaurants"),
+            hotels=_last_domain_payload(domain_inputs, "hotels"),
+            budget=_last_domain_payload(domain_inputs, "budgets"),
         )
     )
     gate_status = "rendered_incomplete" if incomplete else "rendered"
@@ -755,6 +966,52 @@ def gated_render_itinerary(
         plan_artifact_id=plan_artifact_id,
         critic_passed=critic_passed,
     )
+
+
+def _last_domain_payload(domain_inputs: dict[str, Any], key: str) -> dict[str, Any] | None:
+    entries = domain_inputs.get(key) or []
+    if not isinstance(entries, list) or not entries:
+        return None
+    item = entries[-1]
+    payload = item.get("payload") if isinstance(item, dict) else None
+    return payload if isinstance(payload, dict) else None
+
+
+def _build_supplement_cards(
+    *,
+    restaurants: dict[str, Any] | None = None,
+    hotels: dict[str, Any] | None = None,
+    budget: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Planner 领域输入的轻量卡片，不依赖未暂存 renderer 扩展。"""
+    cards: list[dict[str, Any]] = []
+    if restaurants:
+        cards.append(
+            {
+                "type": "restaurants",
+                "city": restaurants.get("city"),
+                "items": list(restaurants.get("restaurants") or [])[:6],
+            }
+        )
+    if hotels:
+        cards.append(
+            {
+                "type": "hotels",
+                "city": hotels.get("city"),
+                "items": list(hotels.get("hotels") or [])[:5],
+            }
+        )
+    if budget:
+        cards.append(
+            {
+                "type": "budget",
+                "city": budget.get("city"),
+                "days": budget.get("days"),
+                "total_low": budget.get("total_low"),
+                "total_high": budget.get("total_high"),
+            }
+        )
+    return cards
 
 
 def gated_render_map(

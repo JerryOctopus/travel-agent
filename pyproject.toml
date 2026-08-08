@@ -25,6 +25,14 @@ mcp = [
   "fastmcp>=0.2.0",
   "langchain-mcp-adapters>=0.1.0",
 ]
+chinatravel = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "datasets>=2.18",
+  "jsonschema>=4.0",
+  "tqdm>=4.66",
+  "geopy>=2.4",
+]
 
 [project.scripts]
 travel-agent-web = "travel_agent.server:main"

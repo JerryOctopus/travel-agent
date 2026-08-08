@@ -16,7 +16,12 @@ from typing import Any
 from langchain_core.tools import StructuredTool
 
 from travel_agent.agent import toolkit
-from travel_agent.agent.session import SessionContext, session_tool_lock, should_serialize_tool
+from travel_agent.agent.session import (
+    SessionContext,
+    current_task_meta,
+    session_tool_lock,
+    should_serialize_tool,
+)
 from travel_agent.settings import Settings
 from travel_agent.skills.loader import build_skill_tools, load_skills
 
@@ -104,11 +109,16 @@ def build_tools(
 
     def request_preference_guide() -> str:
         """目的地与天数已齐、但用户未表达偏好时，引导兴趣/节奏/预算等；用户可说「随便」跳过。"""
-        from travel_agent.settings import get_settings
-        from travel_agent.storage.user_memory import get_user_memory_service
+        # L3 memory 是可选扩展，不得成为 Step 4 多 Agent 核心快照的硬依赖。
+        l3 = None
+        try:
+            from travel_agent.settings import get_settings
+            from travel_agent.storage.user_memory import get_user_memory_service
 
-        settings_obj = settings or get_settings()
-        l3 = get_user_memory_service(settings_obj.memory).load_stable_profile(user_id)
+            settings_obj = settings or get_settings()
+            l3 = get_user_memory_service(settings_obj.memory).load_stable_profile(user_id)
+        except ImportError:
+            pass
         return _dump(toolkit.request_preference_guide(ctx, l3))
 
     def search_poi(
@@ -177,12 +187,24 @@ def build_tools(
 
     def recommend_candidates(top_k: int = 12) -> str:
         """对已检索候选做一次重排。成功后不要重复调用，下一步调用 plan_and_critique。"""
-        return _dump(toolkit.recommend_candidates(ctx, top_k))
+        return _dump(
+            toolkit.recommend_candidates(
+                ctx,
+                top_k,
+                artifact_ids=_bound_planner_artifact_ids(ctx),
+            )
+        )
 
     def plan_and_critique(max_iters: int = 3) -> str:
         """运行可控规划子图（plan→critic→revise 闭环），产出约束满足的结构化行程。
         调用前需先 recommend_candidates，且画像里已有 destination 和 days；成功后本轮结束，系统自动渲染。"""
-        return _dump(toolkit.plan_and_critique(ctx, max_iters))
+        return _dump(
+            toolkit.plan_and_critique(
+                ctx,
+                max_iters,
+                artifact_ids=_bound_planner_artifact_ids(ctx, include_outputs=True),
+            )
+        )
 
     def render_itinerary() -> str:
         """把规划好的行程渲染为前端 A2UI 卡片。"""
@@ -264,6 +286,27 @@ def build_tools(
     if settings and settings.skills.enabled:
         tools.extend(build_skill_tools(load_skills(settings.skills.skills_dir)))
     return tools
+
+
+def _bound_planner_artifact_ids(
+    ctx: SessionContext,
+    *,
+    include_outputs: bool = False,
+) -> list[str] | None:
+    """把 Planner task 的显式输入绑定到工具调用，不由 LLM 猜测 latest。"""
+    meta = current_task_meta()
+    if meta.get("agent") != "planner":
+        return None
+    artifact_ids = [str(aid) for aid in (meta.get("artifact_ids") or []) if aid]
+    if include_outputs:
+        artifact_ids.extend(
+            ctx.store.artifact_ids_for_task(
+                str(meta.get("request_id") or ""),
+                str(meta.get("task_id") or ""),
+                agent="planner",
+            )
+        )
+    return list(dict.fromkeys(artifact_ids))
 
 
 def _parse_tool_payload(value: Any) -> dict[str, Any]:

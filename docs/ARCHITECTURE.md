@@ -1,5 +1,11 @@
 # 架构设计
 
+> ⚠️ **状态更新（Step 4）**：本文档主体是项目初期的工作流设计记录。
+> 现行生产链路已收敛为多 Agent 架构：`run_production_turn` 固定调用
+> `MultiAgentEngine`（Main Orchestrator + 五个领域 Subagent + Reviewer +
+> Renderer Gate，即 Multi-Agent Full = V3）；V0–V3 消融见
+> [ABLATION_V0_V3.md](ABLATION_V0_V3.md)，可观测性统一为 agent_trace。
+
 ## 系统形态
 
 ```text

@@ -191,7 +191,13 @@ def test_v2_dynamic_engine_aggregates_dispatch_results(monkeypatch):
         "travel_agent.orchestration.multi_agent.orchestrator_agent.run_orchestrator",
         fake_orchestrator,
     )
-    outcome = engine.run_turn(ctx, None, "西湖到灵隐寺怎么走", request_id="req_v2")
+    outcome = engine.run_turn(
+        ctx,
+        None,
+        "西湖到灵隐寺怎么走",
+        request_id="req_v2",
+        task_type=TaskType.ROUTE_QUERY,
+    )
     assert outcome.status == STATUS_COMPLETED
     assert outcome.reply == "已安排交通调研。"
     assert outcome.results[0].agent == "transport"
