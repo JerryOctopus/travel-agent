@@ -312,6 +312,41 @@ def test_local_and_mcp_publish_identical_logical_names_and_public_fields(offline
         for tool in remote
     }
     assert local_fields == remote_fields
+    local_schemas = {tool.name: tool.args_schema.model_json_schema() for tool in local}
+    for tool in remote:
+        remote_schema = tool.parameters
+        remote_properties = dict(remote_schema.get("properties") or {})
+        remote_properties.pop("session_id", None)
+        remote_properties.pop("task_context", None)
+        local_properties = local_schemas[tool.name].get("properties") or {}
+        assert {
+            name: {key: value for key, value in schema.items() if key not in {"title", "description"}}
+            for name, schema in local_properties.items()
+        } == {
+            name: {key: value for key, value in schema.items() if key not in {"title", "description"}}
+            for name, schema in remote_properties.items()
+        }
+        assert set(local_schemas[tool.name].get("required") or []) == (
+            set(remote_schema.get("required") or []) - {"session_id", "task_context"}
+        )
+
+
+def test_fastmcp_tool_result_normalizes_to_shared_envelope() -> None:
+    import asyncio
+
+    from travel_agent.agent.tool_source import _normalize_envelope
+    from travel_agent.mcp_server import mcp
+
+    result = asyncio.run(
+        mcp.call_tool(
+            "request_travel_info",
+            {"session_id": "direct-contract", "missing_fields": ["destination"]},
+        )
+    )
+    payload = json.loads(_normalize_envelope(result, "request_travel_info"))
+    assert payload["isError"] is False
+    assert payload["summary"]
+    assert "_profile_snapshot" not in payload
 
 
 def test_local_tools_do_not_hold_session_lock_across_io(monkeypatch, offline_settings) -> None:

@@ -146,6 +146,11 @@ def _normalize_envelope(
 ) -> str:
     # MCP adapters may expose FastMCP's content blocks rather than the decoded
     # structured payload.  Accept one textual block, but never invent semantics.
+    structured = getattr(value, "structured_content", None)
+    if isinstance(structured, dict):
+        value = structured
+    elif hasattr(value, "content"):
+        value = getattr(value, "content")
     if isinstance(value, list) and len(value) == 1:
         block = value[0]
         value = getattr(block, "text", None) or (
