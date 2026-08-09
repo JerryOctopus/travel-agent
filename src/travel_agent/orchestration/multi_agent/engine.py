@@ -165,6 +165,61 @@ class MultiAgentEngine:
         turn_inputs: dict[str, Any] | None = None,
     ) -> TurnOutcome:
         rid = request_id or new_request_id()
+        from travel_agent.orchestration.multi_agent.trace import (
+            AgentTraceLog,
+            reset_current_trace,
+            set_current_trace,
+        )
+
+        trace = AgentTraceLog(rid)
+        token = set_current_trace(trace)
+        try:
+            return self._run_turn(
+                ctx,
+                settings,
+                user_message,
+                task_type=task_type,
+                task_brief=task_brief,
+                request_id=rid,
+                history=history,
+                existing_plan_artifact_id=existing_plan_artifact_id,
+                turn_inputs=turn_inputs,
+            )
+        except Exception as exc:
+            trace.append(
+                "orchestration",
+                agent="engine",
+                status=STATUS_FAILED,
+                error=f"{type(exc).__name__}: {exc}",
+                detail={
+                    "mode": self.capabilities.mode,
+                    "dispatch": self.capabilities.dispatch,
+                },
+            )
+            store = getattr(ctx, "store", None)
+            if store is not None:
+                try:
+                    trace.flush_to_store(store)
+                except Exception:
+                    pass
+            raise
+        finally:
+            reset_current_trace(token)
+
+    def _run_turn(
+        self,
+        ctx: Any,
+        settings: Any,
+        user_message: str,
+        *,
+        task_type: TaskType | None = None,
+        task_brief: str = "",
+        request_id: str | None = None,
+        history: list[tuple[str, str]] | None = None,
+        existing_plan_artifact_id: str | None = None,
+        turn_inputs: dict[str, Any] | None = None,
+    ) -> TurnOutcome:
+        rid = request_id or new_request_id()
         if self.capabilities.mode == "single":
             outcome = self._run_v0(ctx, settings, user_message, history or [], rid)
         else:
@@ -220,7 +275,9 @@ class MultiAgentEngine:
         store = getattr(ctx, "store", None)
         if store is None:
             return
-        trace = AgentTraceLog(request_id)
+        from travel_agent.orchestration.multi_agent.trace import current_trace
+
+        trace = current_trace() or AgentTraceLog(request_id)
         trace.append(
             "orchestration",
             agent="engine",
@@ -232,34 +289,6 @@ class MultiAgentEngine:
                 "plan_artifact_id": outcome.plan_artifact_id,
             },
         )
-        for result in outcome.results:
-            if not isinstance(result, SubagentResult):
-                continue
-            trace.append(
-                "subagent",
-                agent=result.agent,
-                task_id=result.task_id,
-                status=result.status,
-                detail={
-                    "attempt": result.attempt,
-                    "tool_trace": list(result.tool_trace),
-                    "evidence": list(result.evidence),
-                    "warnings": list(result.warnings),
-                    "duration_ms": result.duration_ms,
-                },
-            )
-        if outcome.review is not None:
-            trace.append(
-                "review",
-                agent="reviewer",
-                status=outcome.review.verdict,
-                detail={
-                    "issues": [
-                        {"issue_type": issue.issue_type, "severity": issue.severity}
-                        for issue in outcome.review.issues
-                    ]
-                },
-            )
         if outcome.plan_artifact_id:
             trace.append(
                 "render",
@@ -494,6 +523,24 @@ class MultiAgentEngine:
         )
         review = run_semantic_review(review_ctx, review_callable=review_callable)
         outcome.review = review
+        from travel_agent.orchestration.multi_agent.trace import current_trace
+
+        trace = current_trace()
+        if trace is not None:
+            trace.append(
+                "review",
+                agent="reviewer",
+                status=review.verdict,
+                attempt=1,
+                error=review.error,
+                duration_ms=review.duration_ms,
+                detail={
+                    "issues": [
+                        {"issue_type": issue.issue_type, "severity": issue.severity}
+                        for issue in review.issues
+                    ]
+                },
+            )
         delivery, start_repair = resolve_delivery_status(
             review,
             reviewer_enabled=True,
@@ -555,20 +602,45 @@ class MultiAgentEngine:
         if planner_result.status in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS):
             if not outcome.plan_artifact_id:
                 return STATUS_INCOMPLETE
-            # 修复后不再 Review；recoverable 问题按带告警交付。
+            # No second semantic review, but deterministic acceptance is mandatory.
+            from travel_agent.agent.toolkit import _validate_plan_gate
+
+            gate_error, _record = _validate_plan_gate(ctx, outcome.plan_artifact_id)
+            repaired = ctx.store.get(outcome.plan_artifact_id) or {}
+            critic = repaired.get("critic") or {}
+            critical_issues = [
+                issue
+                for issue in (critic.get("issues") or [])
+                if str(issue.get("severity") or "").lower() in {"error", "critical"}
+            ]
+            if (
+                gate_error
+                or critic.get("passed") is not True
+                or critical_issues
+                or planner_result.unresolved
+            ):
+                return STATUS_INCOMPLETE
+            # 修复后不再 Review；通过 hard critic/Gate 后按带告警交付。
             return STATUS_COMPLETED_WITH_WARNINGS
-        return STATUS_FAILED
+        # A failed repair is a non-deliverable turn, not a transport/runtime
+        # success.  Keep the top-level contract fail-closed.
+        return STATUS_INCOMPLETE
 
     # ------------------------------------------------------------------ #
     def _resolve_runner(self, ctx: Any, settings: Any) -> Any:
         if self._runner is not None:
+            bound_ctx = getattr(self._runner, "context", None)
+            if bound_ctx is not None and bound_ctx is not ctx:
+                raise RuntimeError(
+                    "injected SubagentRunner is session-scoped and cannot be reused across SessionContext"
+                )
             return self._runner
         from travel_agent.orchestration.multi_agent.executor import build_subagent_executor
         from travel_agent.orchestration.multi_agent.runner import SubagentRunner
 
         executor = build_subagent_executor(settings, model=self._subagent_model)
-        self._runner = SubagentRunner(ctx, executor)
-        return self._runner
+        # Auto-created runners are per run/session. Never cache the first ctx.
+        return SubagentRunner(ctx, executor)
 
 
 # --- 辅助 ------------------------------------------------------------------- #

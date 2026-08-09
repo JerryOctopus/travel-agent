@@ -149,7 +149,9 @@ class ArtifactStore:
             "kind": kind,
             "session_id": self.session_id,
             "created_at": time.time(),
-            "payload": payload,
+            # Store owns its payload.  Neither the caller nor a reader may keep
+            # a mutable alias to state protected by the store lock.
+            "payload": copy.deepcopy(payload),
         }
         if request_id is not None:
             record["request_id"] = request_id
@@ -189,13 +191,13 @@ class ArtifactStore:
     def get(self, artifact_id: str) -> dict | None:
         with self._lock:
             record = self._items.get(artifact_id)
-        return record["payload"] if record else None
+            return copy.deepcopy(record["payload"]) if record else None
 
     def get_record(self, artifact_id: str) -> dict | None:
         """返回完整记录（含元数据），供 Planner/审计校验产出者与状态。"""
         with self._lock:
             record = self._items.get(artifact_id)
-        return dict(record) if record else None
+            return copy.deepcopy(record) if record else None
 
     def get_payloads(self, artifact_ids: list[str]) -> list[dict]:
         """按明确 artifact_id 列表批量取 payload，缺失的 id 跳过。"""
@@ -204,7 +206,7 @@ class ArtifactStore:
             for artifact_id in artifact_ids:
                 record = self._items.get(artifact_id)
                 if record is not None:
-                    payloads.append(record["payload"])
+                    payloads.append(copy.deepcopy(record["payload"]))
         return payloads
 
     def artifact_ids(self) -> set[str]:
@@ -231,9 +233,25 @@ class ArtifactStore:
         records.sort(key=lambda record: (record["created_at"], record["artifact_id"]))
         return [str(record["artifact_id"]) for record in records]
 
+    def artifact_ids_for_request(self, request_id: str, *, kind: str | None = None) -> list[str]:
+        """Return only artifacts owned by one request, ordered by occurrence."""
+        with self._lock:
+            records = [
+                copy.deepcopy(record)
+                for record in self._items.values()
+                if record.get("request_id") == request_id
+                and (kind is None or record.get("kind") == kind)
+            ]
+        records.sort(key=lambda record: (record["created_at"], record["artifact_id"]))
+        return [str(record["artifact_id"]) for record in records]
+
+    def latest_id_for_request(self, request_id: str, kind: str) -> str | None:
+        ids = self.artifact_ids_for_request(request_id, kind=kind)
+        return ids[-1] if ids else None
+
     def latest(self, kind: str) -> dict | None:
         record = self._latest_record(kind)
-        return record["payload"] if record else None
+        return copy.deepcopy(record["payload"]) if record else None
 
     def latest_id(self, kind: str) -> str | None:
         record = self._latest_record(kind)
@@ -329,13 +347,18 @@ class SessionContext:
     evaluation_trace_enabled: bool = False
     evaluation_trace: list[dict] = field(default_factory=list)
     request_control: RequestControl | None = field(default=None, repr=False)
+    _state_lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False, compare=False
+    )
 
     def remember_pois(self, pois: list[POI]) -> None:
-        for poi in pois:
-            self.pois_by_id[poi.poi_id] = poi
+        with self._state_lock:
+            for poi in pois:
+                self.pois_by_id[poi.poi_id] = poi
 
     def poi(self, poi_id: str) -> POI | None:
-        return self.pois_by_id.get(poi_id)
+        with self._state_lock:
+            return self.pois_by_id.get(poi_id)
 
     def clone_isolated(self, control: RequestControl | None = None) -> "SessionContext":
         """Copy mutable request state while sharing only the provider implementation."""
@@ -364,12 +387,13 @@ class SessionContext:
         if snapshot.request_control is not None:
             snapshot.request_control.check_active()
         self.store.merge_records(snapshot.store.snapshot_records())
-        self.profile = copy.deepcopy(snapshot.profile)
-        self.pois_by_id = copy.deepcopy(snapshot.pois_by_id)
-        self.pending_preference_observations = copy.deepcopy(
-            snapshot.pending_preference_observations
-        )
-        self.evaluation_trace = copy.deepcopy(snapshot.evaluation_trace)
+        with self._state_lock:
+            self.profile = copy.deepcopy(snapshot.profile)
+            self.pois_by_id = copy.deepcopy(snapshot.pois_by_id)
+            self.pending_preference_observations = copy.deepcopy(
+                snapshot.pending_preference_observations
+            )
+            self.evaluation_trace = copy.deepcopy(snapshot.evaluation_trace)
 
     def merge_task_from(self, snapshot: "SessionContext", base_ids: set[str]) -> None:
         """Publish only a successful isolated task's new artifacts and POI cache."""
@@ -379,10 +403,11 @@ class SessionContext:
         self.store.merge_records(
             {artifact_id: record for artifact_id, record in records.items() if artifact_id not in base_ids}
         )
-        self.pois_by_id.update(copy.deepcopy(snapshot.pois_by_id))
-        if snapshot.evaluation_trace_enabled:
-            existing = len(self.evaluation_trace)
-            self.evaluation_trace.extend(copy.deepcopy(snapshot.evaluation_trace[existing:]))
+        with self._state_lock:
+            self.pois_by_id.update(copy.deepcopy(snapshot.pois_by_id))
+            if snapshot.evaluation_trace_enabled:
+                existing = len(self.evaluation_trace)
+                self.evaluation_trace.extend(copy.deepcopy(snapshot.evaluation_trace[existing:]))
 
 
 def build_session(

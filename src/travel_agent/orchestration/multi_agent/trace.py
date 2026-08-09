@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import threading
 import time
+import copy
+from contextvars import ContextVar
 from typing import Any
 
 
@@ -35,6 +37,9 @@ class AgentTraceLog:
         agent: str = "",
         task_id: str = "",
         status: str = "",
+        attempt: int | None = None,
+        error: str | None = None,
+        duration_ms: int | float | None = None,
         detail: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """原子追加一条轨迹记录并返回该记录。"""
@@ -44,7 +49,10 @@ class AgentTraceLog:
             "agent": agent,
             "kind": kind,
             "status": status,
-            "detail": dict(detail or {}),
+            "attempt": attempt,
+            "error": error,
+            "duration_ms": duration_ms,
+            "detail": copy.deepcopy(detail or {}),
             "created_at": time.time(),
         }
         with self._lock:
@@ -54,12 +62,12 @@ class AgentTraceLog:
     def append_many(self, entries: list[dict[str, Any]]) -> None:
         """批量原子追加（一次锁内完成，避免中途被读到半截状态）。"""
         with self._lock:
-            self._entries.extend(entries)
+            self._entries.extend(copy.deepcopy(entries))
 
     def snapshot(self) -> list[dict[str, Any]]:
-        """返回按追加顺序的浅拷贝列表。"""
+        """返回独立快照，调用方不能改写内部 trace。"""
         with self._lock:
-            return list(self._entries)
+            return copy.deepcopy(self._entries)
 
     def __len__(self) -> int:
         with self._lock:
@@ -77,3 +85,20 @@ class AgentTraceLog:
             request_id=self.request_id,
             agent="engine",
         )
+
+
+_CURRENT_TRACE: ContextVar[AgentTraceLog | None] = ContextVar(
+    "travel_agent_agent_trace", default=None
+)
+
+
+def set_current_trace(trace: AgentTraceLog):
+    return _CURRENT_TRACE.set(trace)
+
+
+def reset_current_trace(token) -> None:
+    _CURRENT_TRACE.reset(token)
+
+
+def current_trace() -> AgentTraceLog | None:
+    return _CURRENT_TRACE.get()

@@ -144,33 +144,97 @@ def run_turn_lifecycle(
 ) -> Any:
     """Execute the shared lifecycle; capabilities only select engine strategy."""
     del user_id  # persistence policy is intentionally outside architecture variants
-    prepared = prepare_turn(user_message, ctx, settings, history)
-    if prepared.early_reply is not None:
-        return prepared.early_reply
-
-    if not settings.llm.enabled:
-        return _run_offline_fallback(ctx, prepared)
-
-    from travel_agent.agent.runtime import _reply_from_outcome
+    from travel_agent.agent.runtime import AgentReply, _reply_from_outcome
+    from travel_agent.orchestration.meter import (
+        TurnBudgetExhausted,
+        TurnMeter,
+        turn_meter_scope,
+    )
     from travel_agent.orchestration.multi_agent import MultiAgentEngine
 
-    engine = MultiAgentEngine(capabilities)
+    request_id = new_request_id()
+    llm_settings = settings.llm
+    orchestration_settings = getattr(settings, "orchestration", None)
+    meter = TurnMeter(
+        request_id=request_id,
+        token_budget=int(
+            getattr(orchestration_settings, "variant_token_budget", 0) or 0
+        ),
+        llm_call_budget=int(
+            getattr(orchestration_settings, "variant_llm_call_budget", 0) or 0
+        ),
+        tool_call_budget=int(
+            getattr(orchestration_settings, "variant_tool_call_budget", 0) or 0
+        ),
+        input_cost_per_million=float(
+            getattr(llm_settings, "input_cost_per_million", 0.0) or 0.0
+        ),
+        output_cost_per_million=float(
+            getattr(llm_settings, "output_cost_per_million", 0.0) or 0.0
+        ),
+    )
+    reply: Any
     try:
-        outcome = engine.run_turn(
-            ctx,
-            settings,
-            user_message,
-            task_type=prepared.analysis.task_type,
-            task_brief=user_message,
-            history=prepared.history,
-            existing_plan_artifact_id=prepared.existing_plan_artifact_id,
-            turn_inputs=prepared.turn_inputs,
+        with turn_meter_scope(meter):
+            prepared = prepare_turn(user_message, ctx, settings, history)
+            if prepared.early_reply is not None:
+                reply = prepared.early_reply
+            elif not settings.llm.enabled:
+                reply = _run_offline_fallback(ctx, prepared, request_id=request_id)
+            else:
+                engine = MultiAgentEngine(capabilities)
+                try:
+                    outcome = engine.run_turn(
+                        ctx,
+                        settings,
+                        user_message,
+                        task_type=prepared.analysis.task_type,
+                        task_brief=user_message,
+                        request_id=request_id,
+                        history=prepared.history,
+                        existing_plan_artifact_id=prepared.existing_plan_artifact_id,
+                        turn_inputs=prepared.turn_inputs,
+                    )
+                    reply = _reply_from_outcome(ctx, outcome)
+                except TurnBudgetExhausted as exc:
+                    reply = AgentReply(
+                        text="本轮调用预算已耗尽，未继续发起新的模型调用。",
+                        profile=toolkit._profile_brief(ctx.profile),
+                        status=STATUS_INCOMPLETE,
+                        failure_reason="budget_exhausted",
+                    )
+                    setattr(reply, "raw_failure", f"{type(exc).__name__}: {exc}")
+                except Exception as exc:  # every variant shares identical fallback policy
+                    reply = _run_offline_fallback(ctx, prepared, request_id=request_id)
+                    reply.text = f"（多 Agent 执行失败，已降级到离线兜底：{exc}）\n\n" + reply.text
+                    setattr(reply, "raw_failure", f"{type(exc).__name__}: {exc}")
+                    setattr(reply, "fallback_triggered", True)
+    except TurnBudgetExhausted as exc:
+        reply = AgentReply(
+            text="本轮调用预算已耗尽，未继续发起新的模型或工具调用。",
+            profile=toolkit._profile_brief(ctx.profile),
+            status=STATUS_INCOMPLETE,
+            failure_reason="budget_exhausted",
         )
-    except Exception as exc:  # all variants share the same deterministic fallback
-        reply = _run_offline_fallback(ctx, prepared)
-        reply.text = f"（多 Agent 执行失败，已降级到离线兜底：{exc}）\n\n" + reply.text
-        return reply
-    return _reply_from_outcome(ctx, outcome)
+        setattr(reply, "raw_failure", f"{type(exc).__name__}: {exc}")
+    finally:
+        meter.finish()
+    setattr(reply, "request_id", request_id)
+    setattr(reply, "turn_metrics", meter.snapshot())
+    if not getattr(reply, "agent_trace", None):
+        trace_id = ctx.store.latest_id_for_request(request_id, "agent_trace")
+        if trace_id:
+            setattr(
+                reply,
+                "agent_trace",
+                list((ctx.store.get(trace_id) or {}).get("items") or []),
+            )
+    if not hasattr(reply, "raw_failure"):
+        setattr(reply, "raw_failure", None)
+    if not hasattr(reply, "fallback_triggered"):
+        setattr(reply, "fallback_triggered", False)
+    setattr(reply, "final_outcome", getattr(reply, "status", None))
+    return reply
 
 
 def _hydrate_profile_from_plan(ctx: SessionContext, plan_id: str) -> None:
@@ -191,7 +255,12 @@ def _revision_source_ids(ctx: SessionContext, plan_id: str) -> list[str]:
     return ids
 
 
-def _run_offline_fallback(ctx: SessionContext, prepared: PreparedTurn) -> Any:
+def _run_offline_fallback(
+    ctx: SessionContext,
+    prepared: PreparedTurn,
+    *,
+    request_id: str | None = None,
+) -> Any:
     """Shared deterministic fallback with explicit plan ID and Renderer Gate."""
     from travel_agent.agent.runtime import AgentReply
     from travel_agent.agent.session import reset_task_meta, set_current_task_meta
@@ -208,7 +277,7 @@ def _run_offline_fallback(ctx: SessionContext, prepared: PreparedTurn) -> Any:
             failure_reason="offline_capability_unavailable",
         )
 
-    request_id = new_request_id()
+    request_id = request_id or new_request_id()
     task_id = new_task_id("fallback")
     token = set_current_task_meta(
         {
@@ -218,35 +287,50 @@ def _run_offline_fallback(ctx: SessionContext, prepared: PreparedTurn) -> Any:
         }
     )
     trace: list[str] = []
+
+    def call_tool(name: str, fn, *args, **kwargs):
+        from travel_agent.orchestration.meter import current_turn_meter
+
+        meter = current_turn_meter()
+        started = meter.begin_tool("fallback") if meter is not None else None
+        failed = True
+        try:
+            value = fn(*args, **kwargs)
+            failed = bool(isinstance(value, dict) and value.get("isError"))
+            trace.append(name)
+            return value
+        finally:
+            if meter is not None and started is not None:
+                meter.finish_tool("fallback", started, error=failed)
+
     try:
         if prepared.analysis.task_type == TaskType.FULL_TRIP_PLAN:
-            attraction = toolkit.search_poi(ctx)
-            trace.append("search_poi")
-            weather = toolkit.check_weather(ctx)
-            trace.append("check_weather")
+            attraction = call_tool("search_poi", toolkit.search_poi, ctx)
+            weather = call_tool("check_weather", toolkit.check_weather, ctx)
             input_ids = [
                 item.get("artifact_id")
                 for item in (attraction, weather)
                 if item.get("artifact_id")
             ]
             if ctx.profile.hotel_area:
-                hotel = toolkit.search_hotel(ctx)
-                trace.append("search_hotel")
+                hotel = call_tool("search_hotel", toolkit.search_hotel, ctx)
                 if hotel.get("artifact_id"):
                     input_ids.append(hotel["artifact_id"])
             if ctx.profile.food_preference or "food" in ctx.profile.interests:
-                restaurant = toolkit.search_restaurant(ctx)
-                trace.append("search_restaurant")
+                restaurant = call_tool("search_restaurant", toolkit.search_restaurant, ctx)
                 if restaurant.get("artifact_id"):
                     input_ids.append(restaurant["artifact_id"])
-            budget = toolkit.estimate_budget(ctx)
-            trace.append("estimate_budget")
+            budget = call_tool("estimate_budget", toolkit.estimate_budget, ctx)
             if budget.get("artifact_id"):
                 input_ids.append(budget["artifact_id"])
         else:
             input_ids = list(prepared.turn_inputs.get("artifact_ids") or [])
-        ranked = toolkit.recommend_candidates(ctx, artifact_ids=input_ids)
-        trace.append("recommend_candidates")
+        ranked = call_tool(
+            "recommend_candidates",
+            toolkit.recommend_candidates,
+            ctx,
+            artifact_ids=input_ids,
+        )
         if ranked.get("artifact_id"):
             input_ids.append(ranked["artifact_id"])
     finally:
@@ -265,8 +349,9 @@ def _run_offline_fallback(ctx: SessionContext, prepared: PreparedTurn) -> Any:
         }
     )
     try:
-        plan = toolkit.plan_and_critique(ctx, artifact_ids=input_ids)
-        trace.append("plan_and_critique")
+        plan = call_tool(
+            "plan_and_critique", toolkit.plan_and_critique, ctx, artifact_ids=input_ids
+        )
     finally:
         reset_task_meta(token)
 

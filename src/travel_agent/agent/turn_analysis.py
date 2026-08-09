@@ -292,17 +292,19 @@ def _analyze_with_llm(
     prompt += f"\n当前用户输入：{user_message}"
 
     model = _build_chat_model(settings)
-    callbacks = None
+    from travel_agent.orchestration.meter import meter_callbacks
+
+    callbacks = meter_callbacks("preflight")
     if evaluation_trace is not None:
         from travel_agent.agent.evaluation_trace import EvaluationTraceCallback
 
-        callbacks = [
+        callbacks.append(
             EvaluationTraceCallback(
                 evaluation_trace,
                 model=settings.llm.model,
                 phase="turn_analysis",
             )
-        ]
+        )
     response = model.invoke(
         [
             SystemMessage(content=_TURN_ANALYSIS_SYSTEM),

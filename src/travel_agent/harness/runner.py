@@ -152,6 +152,11 @@ class AgentHarness:
                 status=getattr(reply, "status", None),
                 plan_artifact_id=getattr(reply, "plan_artifact_id", None),
                 agent_trace=list(getattr(reply, "agent_trace", None) or []),
+                request_id=getattr(reply, "request_id", None),
+                turn_metrics=dict(getattr(reply, "turn_metrics", None) or {}),
+                raw_failure=getattr(reply, "raw_failure", None),
+                fallback_triggered=bool(getattr(reply, "fallback_triggered", False)),
+                final_outcome=getattr(reply, "final_outcome", None),
             )
         except Exception as exc:  # noqa: BLE001
             duration_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -282,14 +287,30 @@ def _finalize_case(
         turns=result.turns,
         final_profile=result.final_profile,
         final_artifacts=result.final_artifacts,
-        passed=_all_known_metrics_pass(metrics),
+        passed=_all_known_metrics_pass(metrics, production=bool(case.gold_outcome)),
         metrics=metrics,
         errors=result.errors,
     )
 
 
-def _all_known_metrics_pass(metrics: dict[str, Any]) -> bool | None:
-    known = [value for value in metrics.values() if isinstance(value, bool)]
+# production_v1 专属布尔指标；旧 schema case 无 gold，不参与 passed 合取。
+_PRODUCTION_BOOLEAN_KEYS = {
+    "strict_task_success",
+    "expected_outcome_match",
+    "grounding_ok",
+    "feasibility_ok",
+    "authorization_ok",
+    "architecture_policy_ok",
+    "gating_passed",
+}
+
+
+def _all_known_metrics_pass(metrics: dict[str, Any], *, production: bool) -> bool | None:
+    known = [
+        value
+        for key, value in metrics.items()
+        if isinstance(value, bool) and (production or key not in _PRODUCTION_BOOLEAN_KEYS)
+    ]
     if not known:
         return None
     return all(known)

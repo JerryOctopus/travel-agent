@@ -152,6 +152,11 @@ def build_dispatch_tool(
         inputs: dict | None = None,
         depends_on: list | None = None,
     ) -> str:
+        from travel_agent.orchestration.meter import current_turn_meter
+
+        meter = current_turn_meter()
+        if meter is not None:
+            meter.record_dispatch(agent)
         task_id = new_task_id(agent)
         merged_inputs = dict(base_inputs or {})
         merged_inputs.update(inputs or {})

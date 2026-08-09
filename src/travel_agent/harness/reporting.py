@@ -302,7 +302,12 @@ def _real_multi_agent_row(
         for tool in tools
     ]
     all_tools = list((last.tool_trace if last else []) or flat_agent_tools)
-    required_agents = ["attraction", "hotel", "restaurant", "transport", "planner"]
+    from travel_agent.agent.turn_analysis import classify_task_type_rule_based
+    from travel_agent.orchestration.multi_agent.dispatch_rules import resolve_task_batches
+
+    task_type = classify_task_type_rule_based(case.turns[-1]) if case.turns else None
+    batches = resolve_task_batches(task_type) or ()
+    required_agents = list(dict.fromkeys(agent for batch in batches for agent in batch))
     required_tools = ["search_poi", "recommend_candidates", "plan_and_critique"]
     disallowed_tools_by_agent = {
         agent: [
@@ -318,6 +323,7 @@ def _real_multi_agent_row(
         "itinerary_produced": itinerary is not None,
         "agent_trace_present": bool(trace_items),
         "required_agents_present": all(agent in agent_names for agent in required_agents),
+        "required_agents": required_agents,
         "research_tools_ok": any(
             tool in flat_agent_tools
             for tool in ("search_poi", "check_weather", "plan_route")

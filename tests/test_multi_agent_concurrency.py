@@ -303,7 +303,7 @@ def test_dispatch_without_lock_allows_nested_business_tools():
 
 
 def test_lc_tools_serialized_skips_dispatch_tools():
-    """lc_tools 包装链：dispatch 类工具不进 serialized，业务工具仍加锁。"""
+    """Legacy session lock no longer wraps provider/tool I/O."""
     from travel_agent.agent.lc_tools import build_tools
     from travel_agent.agent.session import build_session
     from travel_agent.settings import load_settings
@@ -326,24 +326,34 @@ def test_lc_tools_serialized_skips_dispatch_tools():
     thread = threading.Thread(target=call_business_tool)
     thread.start()
     thread.join(timeout=0.3)
-    assert thread.is_alive() and not completed.is_set()  # 业务工具被 serialized 阻塞
+    assert not thread.is_alive() and completed.is_set()
     lock.release()
-    thread.join(timeout=10)
-    assert completed.is_set()
 
 
 def test_mcp_wrapper_skips_dispatch_tools():
-    """MCP 路径：dispatch 类工具直接透传不加锁，业务工具仍包装。"""
+    """MCP adapter injects context without holding the legacy lock."""
     from langchain_core.tools import StructuredTool
 
     from travel_agent.agent.tool_source import _wrap_mcp_tool_with_session
 
-    dispatch = StructuredTool.from_function(
-        func=lambda: "ok", name="dispatch_subagent", description="d"
+    def dispatch(session_id: str = "default", task_context: dict | None = None):
+        return {"isError": False, "summary": "ok"}
+
+    def business(session_id: str = "default", task_context: dict | None = None):
+        return {"isError": False, "summary": "ok"}
+
+    dispatch_tool = StructuredTool.from_function(
+        func=dispatch, name="dispatch_subagent", description="d"
     )
-    business = StructuredTool.from_function(
-        func=lambda: "ok", name="search_poi", description="b"
+    business_tool = StructuredTool.from_function(
+        func=business, name="search_poi", description="b"
     )
-    assert _wrap_mcp_tool_with_session(dispatch, "sess_mcp") is dispatch  # 透传
-    wrapped = _wrap_mcp_tool_with_session(business, "sess_mcp")
-    assert wrapped is not business and wrapped.name == "search_poi"
+    assert _wrap_mcp_tool_with_session(dispatch_tool, "sess_mcp") is not dispatch_tool
+    wrapped = _wrap_mcp_tool_with_session(business_tool, "sess_mcp")
+    assert wrapped is not business_tool and wrapped.name == "search_poi"
+    lock = session_tool_lock("sess_mcp")
+    lock.acquire()
+    try:
+        assert '"isError": false' in wrapped.invoke({})
+    finally:
+        lock.release()

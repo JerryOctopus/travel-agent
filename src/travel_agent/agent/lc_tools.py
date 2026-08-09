@@ -231,23 +231,33 @@ def build_tools(
         render_map,
     ]
     def traced(fn):
-        if not ctx.evaluation_trace_enabled:
+        from travel_agent.orchestration.meter import current_turn_meter
+
+        if not ctx.evaluation_trace_enabled and current_turn_meter() is None and ctx.request_control is None:
             return fn
 
         @wraps(fn)
         def wrapper(*args, **kwargs):
             started = time.perf_counter()
+            if ctx.request_control is not None:
+                ctx.request_control.check_active()
             record: dict[str, Any] = {
                 "kind": "tool",
                 "name": fn.__name__,
                 "arguments": _redact_arguments(kwargs),
             }
+            meter = current_turn_meter()
+            meta = current_task_meta()
+            role = str(meta.get("agent") or "main")
+            meter_started = meter.begin_tool(role) if meter is not None else None
             try:
                 result = fn(*args, **kwargs)
                 payload = _parse_tool_payload(result)
                 record["status"] = "error" if payload.get("isError") else "ok"
                 record["data_source"] = _find_data_source(payload) or type(ctx.provider).__name__
                 record["fallback_reason"] = payload.get("fallback_reason")
+                if ctx.request_control is not None:
+                    ctx.request_control.check_active()
                 return result
             except Exception as exc:
                 record["status"] = "error"
@@ -255,26 +265,19 @@ def build_tools(
                 raise
             finally:
                 record["duration_ms"] = round((time.perf_counter() - started) * 1000, 2)
-                ctx.evaluation_trace.append(record)
+                if meter is not None and meter_started is not None:
+                    meter.finish_tool(
+                        role, meter_started, error=record.get("status") == "error"
+                    )
+                if ctx.evaluation_trace_enabled:
+                    with ctx._state_lock:
+                        ctx.evaluation_trace.append(record)
 
         return wrapper
 
     def serialized(fn):
-        """同一 session 内串行执行工具：ToolNode 会并行跑同一 AIMessage
-        里的多个 tool_call，而工具共享可变 ctx，fail-closed 按会话加锁。
-
-        dispatch 类工具（内部会派生 Subagent）不加锁，否则不可重入的
-        session 锁会同线程嵌套自锁 → 死锁（见 session.UNLOCKED_TOOL_NAMES）。"""
-        if not should_serialize_tool(fn.__name__):
-            return fn
-        lock = session_tool_lock(ctx.session_id)
-
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            with lock:
-                return fn(*args, **kwargs)
-
-        return wrapper
+        """Compatibility hook: toolkit/store own short state locks; I/O stays unlocked."""
+        return fn
 
     tools = [
         StructuredTool.from_function(

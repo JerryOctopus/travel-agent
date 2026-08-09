@@ -162,7 +162,12 @@ def build_review_callable(settings: Any, model: Any | None = None) -> ReviewCall
             active_model = _build_chat_model(settings)
         from langchain_core.messages import HumanMessage
 
-        response = active_model.invoke([HumanMessage(content=reviewer_prompt(review_ctx))])
+        from travel_agent.orchestration.meter import meter_callbacks
+
+        response = active_model.invoke(
+            [HumanMessage(content=reviewer_prompt(review_ctx))],
+            config={"callbacks": meter_callbacks("reviewer")},
+        )
         content = response.content if isinstance(response.content, str) else str(response.content)
         return extract_json_payload(content)
 

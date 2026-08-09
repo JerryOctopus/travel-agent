@@ -40,6 +40,8 @@ class LLMSettings:
     model: str = "gpt-4o-mini"
     timeout_seconds: int = 30
     temperature: float = 0.2
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -79,11 +81,23 @@ class MemorySettings:
 
 
 @dataclass(frozen=True)
+class McpSettings:
+    use_mcp_tools: bool = False
+    auto_start: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8765
+    server_name: str = "travel"
+    timeout_seconds: int = 30
+
+
+@dataclass(frozen=True)
 class OrchestrationSettings:
     # V0–V3 消融实验四版本共用的 Token 硬上限；<=0 表示不设上限。
     # 生产入口固定使用 Multi-Agent Full（V3），不读取任何 variant 配置；
     # 版本选择只能通过 orchestration.variants.run_variant_turn 显式指定。
     variant_token_budget: int = 0
+    variant_llm_call_budget: int = 0
+    variant_tool_call_budget: int = 0
 
 
 @dataclass(frozen=True)
@@ -99,6 +113,7 @@ class Settings:
     agent: AgentSettings = field(default_factory=AgentSettings)
     memory: MemorySettings = field(default_factory=MemorySettings)
     orchestration: OrchestrationSettings = field(default_factory=OrchestrationSettings)
+    mcp: McpSettings = field(default_factory=McpSettings)
     skills: SkillsSettings = field(default_factory=SkillsSettings)
 
 
@@ -170,6 +185,7 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
     agent_toml = data.get("agent", {}) if isinstance(data.get("agent"), dict) else {}
     memory_toml = data.get("memory", {}) if isinstance(data.get("memory"), dict) else {}
     orch_toml = data.get("orchestration", {}) if isinstance(data.get("orchestration"), dict) else {}
+    mcp_toml = data.get("mcp", {}) if isinstance(data.get("mcp"), dict) else {}
     skills_toml = data.get("skills", {}) if isinstance(data.get("skills"), dict) else {}
 
     provider = str(_pick("TRAVEL_AGENT_LLM_PROVIDER", llm_toml.get("provider"), "rule")).lower()
@@ -185,6 +201,22 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
         ),
         temperature=_as_float(
             _pick("TRAVEL_AGENT_LLM_TEMPERATURE", llm_toml.get("temperature"), 0.2), 0.2
+        ),
+        input_cost_per_million=_as_float(
+            _pick(
+                "TRAVEL_AGENT_LLM_INPUT_COST_PER_MILLION",
+                llm_toml.get("input_cost_per_million"),
+                0.0,
+            ),
+            0.0,
+        ),
+        output_cost_per_million=_as_float(
+            _pick(
+                "TRAVEL_AGENT_LLM_OUTPUT_COST_PER_MILLION",
+                llm_toml.get("output_cost_per_million"),
+                0.0,
+            ),
+            0.0,
         ),
     )
 
@@ -254,6 +286,39 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
             ),
             0,
         ),
+        variant_llm_call_budget=_as_int(
+            _pick(
+                "TRAVEL_AGENT_VARIANT_LLM_CALL_BUDGET",
+                orch_toml.get("variant_llm_call_budget"),
+                0,
+            ),
+            0,
+        ),
+        variant_tool_call_budget=_as_int(
+            _pick(
+                "TRAVEL_AGENT_VARIANT_TOOL_CALL_BUDGET",
+                orch_toml.get("variant_tool_call_budget"),
+                0,
+            ),
+            0,
+        ),
+    )
+
+    mcp = McpSettings(
+        use_mcp_tools=str(
+            _pick("TRAVEL_AGENT_MCP_USE_TOOLS", mcp_toml.get("use_mcp_tools"), "false")
+        ).lower()
+        in {"1", "true", "yes", "on"},
+        auto_start=str(
+            _pick("TRAVEL_AGENT_MCP_AUTO_START", mcp_toml.get("auto_start"), "false")
+        ).lower()
+        in {"1", "true", "yes", "on"},
+        host=str(_pick("TRAVEL_AGENT_MCP_HOST", mcp_toml.get("host"), "127.0.0.1")),
+        port=_as_int(_pick("TRAVEL_AGENT_MCP_PORT", mcp_toml.get("port"), 8765), 8765),
+        server_name=str(_pick("TRAVEL_AGENT_MCP_SERVER_NAME", mcp_toml.get("server_name"), "travel")),
+        timeout_seconds=_as_int(
+            _pick("TRAVEL_AGENT_MCP_TIMEOUT", mcp_toml.get("timeout_seconds"), 30), 30
+        ),
     )
 
     skills = SkillsSettings(
@@ -276,6 +341,7 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
         agent=agent,
         memory=memory,
         orchestration=orchestration,
+        mcp=mcp,
         skills=skills,
     )
 

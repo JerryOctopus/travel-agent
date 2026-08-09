@@ -69,7 +69,7 @@ def build_subagent_executor(settings: Any, model: Any | None = None):
     """构建真实执行器闭包。``model`` 可注入（测试用 Fake LLM）。"""
 
     def executor(definition: SubagentDefinition, task: SubagentTask, ctx: Any) -> dict[str, Any]:
-        from travel_agent.agent.lc_tools import build_tools
+        from travel_agent.agent.tool_source import resolve_tools
 
         active_model = model
         if active_model is None:
@@ -79,8 +79,8 @@ def build_subagent_executor(settings: Any, model: Any | None = None):
 
             active_model = _build_chat_model(settings)
 
-        all_tools = build_tools(ctx, settings)
         allowed = set(definition.tool_names)
+        all_tools, _source = resolve_tools(ctx, settings) if allowed else ([], "local")
         counter: dict[str, int] = {"n": 0}
         tools = [
             _budget_guard(tool, definition.max_tool_calls, counter)
@@ -97,26 +97,30 @@ def build_subagent_executor(settings: Any, model: Any | None = None):
             HumanMessage(content=task.prompt_text()),
         ]
 
-        callbacks = None
+        from travel_agent.orchestration.meter import meter_callbacks
+
+        callbacks = meter_callbacks(
+            "planner" if definition.name == "planner" else f"worker:{definition.name}"
+        )
         local_trace: list[dict] = []
         if ctx is not None and getattr(ctx, "evaluation_trace_enabled", False):
             from travel_agent.agent.evaluation_trace import EvaluationTraceCallback
 
-            callbacks = [
+            callbacks.append(
                 EvaluationTraceCallback(
                     ctx.evaluation_trace,
                     model=settings.llm.model,
                     phase=f"subagent_{definition.name}",
                 )
-            ]
+            )
         else:
             from travel_agent.agent.evaluation_trace import EvaluationTraceCallback
 
-            callbacks = [
+            callbacks.append(
                 EvaluationTraceCallback(
                     local_trace, model=getattr(settings.llm, "model", ""), phase=f"subagent_{definition.name}"
                 )
-            ]
+            )
 
         try:
             state = agent.invoke(

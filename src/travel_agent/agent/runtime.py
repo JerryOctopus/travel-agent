@@ -38,6 +38,11 @@ class AgentReply:
     status: str | None = None
     plan_artifact_id: str | None = None
     agent_trace: list[dict[str, Any]] = field(default_factory=list)
+    request_id: str | None = None
+    turn_metrics: dict[str, Any] = field(default_factory=dict)
+    raw_failure: str | None = None
+    fallback_triggered: bool = False
+    final_outcome: str | None = None
 
 
 def run_production_turn(
@@ -155,11 +160,13 @@ def _run_react(
     settings: Settings,
     user_id: str = "default",
 ) -> AgentReply:
+    import asyncio
+
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
     from langgraph.prebuilt import create_react_agent
 
-    from travel_agent.agent.lc_tools import build_tools
     from travel_agent.agent.prompts import build_system_prompt
+    from travel_agent.agent.tool_source import resolve_tools_async
     from travel_agent.skills.loader import load_skills, skills_prompt_section
     from travel_agent.storage.memory_framework import MemoryFramework
     from travel_agent.storage.user_profile import UserProfileStore
@@ -171,7 +178,7 @@ def _run_react(
     if settings.skills.enabled:
         skills_section = skills_prompt_section(load_skills(settings.skills.skills_dir))
 
-    tools = build_tools(ctx, settings)
+    tools, _ = asyncio.run(resolve_tools_async(ctx, settings, user_id=user_id))
     model = _build_chat_model(settings)
     agent = create_react_agent(model, tools)
 
@@ -182,9 +189,25 @@ def _run_react(
         messages.append(HumanMessage(content=content) if role == "user" else AIMessage(content=content))
     messages.append(HumanMessage(content=user_message))
 
+    from travel_agent.orchestration.meter import meter_callbacks
+
+    callbacks = meter_callbacks("v0_main")
+    if ctx.evaluation_trace_enabled:
+        from travel_agent.agent.evaluation_trace import EvaluationTraceCallback
+
+        callbacks.append(
+            EvaluationTraceCallback(
+                ctx.evaluation_trace,
+                model=settings.llm.model,
+                phase="react",
+            )
+        )
     state = agent.invoke(
         {"messages": messages},
-        config={"recursion_limit": settings.agent.recursion_limit},
+        config={
+            "recursion_limit": settings.agent.recursion_limit,
+            **({"callbacks": callbacks} if callbacks else {}),
+        },
     )
 
     out_messages = state["messages"]

@@ -230,7 +230,12 @@ def build_agent_events(
     if closed_loop:
         events.append({"event_type": "plan_and_critique_started"})
         events.append({"event_type": "plan_and_critique_finished"})
-    trace = agent_trace if agent_trace is not None else artifacts.get("agent_trace")
+    if agent_trace is not None:
+        trace = agent_trace
+    elif result.last_turn is not None and result.last_turn.agent_trace:
+        trace = {"items": result.last_turn.agent_trace}
+    else:
+        trace = artifacts.get("agent_trace")
     items = list((trace or {}).get("items") or [])
     review_entries = [item for item in items if item.get("kind") == "review"]
     for _ in review_entries:
@@ -521,6 +526,12 @@ def evaluate_production_case(
         "gating": gating,
         "normalized_plan": normalized_plan,
         "actions": actions,
+        # Keep execution health orthogonal to the semantic outcome label.
+        "raw_failure": result.last_turn.raw_failure if result.last_turn else None,
+        "fallback_triggered": bool(
+            result.last_turn.fallback_triggered if result.last_turn else False
+        ),
+        "final_outcome": result.last_turn.final_outcome if result.last_turn else None,
         "llm_judge": {"status": "not_run", "reason": "Attach a frozen judge adapter."},
     }
 

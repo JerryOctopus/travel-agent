@@ -70,9 +70,7 @@ def run_variant_turn(
         raise ValueError(
             f"未知的消融实验变体: {variant!r}，可用: {sorted(VARIANTS)}"
         )
-    trace_start = len(ctx.evaluation_trace) if ctx.evaluation_trace_enabled else 0
     reply = _run_variant_turn(spec, user_message, ctx, settings, history, user_id)
-    _audit_token_budget(ctx, settings, key, trace_start, reply)
     return reply
 
 
@@ -100,16 +98,17 @@ def _run_variant_turn(
 
 
 def _record_reply_metrics(ctx: SessionContext, spec: VariantSpec, reply: AgentReply) -> None:
-    previous = ctx.store.latest("variant_metrics") or {}
     ctx.store.put(
         "variant_metrics",
         {
-            **previous,
             "variant": spec.name,
             "mode": spec.capabilities.mode,
             "dispatch": spec.capabilities.dispatch,
             "status": getattr(reply, "status", None),
+            "meter": dict(getattr(reply, "turn_metrics", None) or {}),
         },
+        request_id=getattr(reply, "request_id", None),
+        agent="engine",
     )
 
 
@@ -131,42 +130,3 @@ def _record_engine_metrics(ctx: SessionContext, spec: VariantSpec, outcome: Any)
             "rework_used": outcome.rework_used,
         }
     ctx.store.put("variant_metrics", metrics)
-
-
-def _audit_token_budget(
-    ctx: SessionContext,
-    settings: Settings,
-    variant: str,
-    trace_start: int,
-    reply: AgentReply,
-) -> None:
-    """四版本统一的 Token 硬上限审计。
-
-    各版本在编排内部已做硬停止；这里做轮末总量审计：超限时把该 case
-    标记 budget_exceeded，保证成本边界对所有版本同样“硬”。
-    """
-    budget = settings.orchestration.variant_token_budget
-    previous = ctx.store.latest("variant_metrics") or {}
-    metrics = {
-        **previous,
-        "variant": variant,
-    }
-    if not budget or budget <= 0:
-        ctx.store.put("variant_metrics", metrics)
-        return
-    tokens_used = 0
-    for record in ctx.evaluation_trace[trace_start:]:
-        if record.get("kind") == "model" and record.get("total_tokens") is not None:
-            tokens_used += int(record["total_tokens"])
-    exceeded = tokens_used >= budget
-    metrics.update(
-        {
-            "tokens_used": tokens_used,
-            "token_budget": budget,
-            "budget_exceeded": exceeded,
-        }
-    )
-    ctx.store.put("variant_metrics", metrics)
-    if exceeded and not getattr(reply, "failure_reason", None):
-        # AgentReply 在较老 runtime 快照中没有该字段；dataclass 非 slots，兼容附加。
-        setattr(reply, "failure_reason", "budget_exceeded")

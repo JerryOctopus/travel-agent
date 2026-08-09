@@ -55,6 +55,11 @@ def run_fixed_dispatch(
     results_by_id: dict[str, SubagentResult] = {}
     ordered: list[SubagentResult] = []
     for task in tasks:
+        from travel_agent.orchestration.meter import current_turn_meter
+
+        meter = current_turn_meter()
+        if meter is not None:
+            meter.record_dispatch(task.agent)
         upstream_artifacts: list[str] = []
         unresolved_dependencies: list[str] = []
         for dep_id in task.depends_on:

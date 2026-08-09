@@ -64,7 +64,34 @@ class SubagentRunner:
         self._ctx = ctx
         self._executor = executor
 
+    @property
+    def context(self) -> Any:
+        return self._ctx
+
     def run_subagent(self, task: SubagentTask) -> SubagentResult:
+        result = self._run_subagent(task)
+        from travel_agent.orchestration.multi_agent.trace import current_trace
+
+        trace = current_trace()
+        if trace is not None:
+            trace.append(
+                "subagent",
+                agent=result.agent,
+                task_id=result.task_id,
+                status=result.status,
+                attempt=result.attempt,
+                error=result.error,
+                duration_ms=result.duration_ms,
+                detail={
+                    "tool_trace": list(result.tool_trace),
+                    "evidence": list(result.evidence),
+                    "warnings": list(result.warnings),
+                    "unresolved": list(result.unresolved),
+                },
+            )
+        return result
+
+    def _run_subagent(self, task: SubagentTask) -> SubagentResult:
         """执行单个任务并返回结构化结果；任何异常都包装为 failed，不上抛。"""
         from travel_agent.agent.session import (
             reset_task_meta,

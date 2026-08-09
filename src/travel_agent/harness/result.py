@@ -25,6 +25,11 @@ class HarnessTurnResult:
     status: str | None = None
     plan_artifact_id: str | None = None
     agent_trace: list[dict[str, Any]] = field(default_factory=list)
+    request_id: str | None = None
+    turn_metrics: dict[str, Any] = field(default_factory=dict)
+    raw_failure: str | None = None
+    fallback_triggered: bool = False
+    final_outcome: str | None = None
 
 
 @dataclass(frozen=True)

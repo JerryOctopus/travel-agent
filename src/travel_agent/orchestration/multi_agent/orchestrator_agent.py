@@ -63,10 +63,10 @@ def build_orchestrator_tools(
 
     results_sink 收集每次 dispatch 的 SubagentResult，供 Engine 聚合。
     """
-    from travel_agent.agent.lc_tools import build_tools
+    from travel_agent.agent.tool_source import resolve_tools
 
     sink = results_sink if results_sink is not None else []
-    all_tools = build_tools(ctx, settings)
+    all_tools, _source = resolve_tools(ctx, settings)
     # render 工具不暴露给 Orchestrator：渲染必须经 Engine 的 Renderer Gate。
     allowed = ORCHESTRATOR_ALLOWED_TOOLS - {"render_itinerary", "render_map"}
     base_tools = [tool for tool in filter_orchestrator_tools(all_tools) if tool.name in allowed]
@@ -149,9 +149,14 @@ def run_orchestrator(
     for role, content in (history or [])[-8:]:
         messages.append(AIMessage(content=content) if role == "assistant" else HumanMessage(content=content))
     messages.append(HumanMessage(content="\n".join(context_lines) + "\n当前请求：" + user_message))
+    from travel_agent.orchestration.meter import meter_callbacks
+
     state = agent.invoke(
         {"messages": messages},
-        config={"recursion_limit": max(settings.agent.recursion_limit, 24)},
+        config={
+            "recursion_limit": max(settings.agent.recursion_limit, 24),
+            "callbacks": meter_callbacks("orchestrator"),
+        },
     )
     out_messages = state.get("messages", [])
     tool_trace = [

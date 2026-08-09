@@ -123,6 +123,11 @@ def _clear_profile_slot(profile: TravelProfile, name: str) -> None:
 
 
 def update_travel_profile(ctx: SessionContext, **fields: Any) -> dict[str, Any]:
+    with ctx._state_lock:
+        return _update_travel_profile_locked(ctx, **fields)
+
+
+def _update_travel_profile_locked(ctx: SessionContext, **fields: Any) -> dict[str, Any]:
     """把已知出行信息合并进会话画像（destination/days/interests/budget 等）。"""
     cleaned = clean_profile_fields(fields)
 
@@ -208,6 +213,15 @@ def apply_profile_patches(
     ctx: SessionContext,
     patches: dict[str, dict[str, Any]] | None = None,
     record_preferences: bool = True,
+) -> dict[str, Any]:
+    with ctx._state_lock:
+        return _apply_profile_patches_locked(ctx, patches, record_preferences)
+
+
+def _apply_profile_patches_locked(
+    ctx: SessionContext,
+    patches: dict[str, dict[str, Any]] | None,
+    record_preferences: bool,
 ) -> dict[str, Any]:
     """按 SET/CLEAR patch 语义更新画像；未出现在 patches 中的槽位保持 UNCHANGED。
 
