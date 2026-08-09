@@ -149,8 +149,8 @@ eval_ablation.py --variants v0..v3 / harness.cli / eval_product_multi_model / ev
 ## 9. 当前测试结果
 
 ```text
-混合工作区 pytest tests/  →  351 passed, 1 skipped
-独立 clean checkout pytest tests/  →  160 passed
+混合工作区 pytest tests/  →  353 passed, 1 skipped
+独立 clean checkout pytest tests/  →  162 passed
 grep -rnE "layered|layer_trace" src/ tests/  →  零命中
 ```
 
