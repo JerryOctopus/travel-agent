@@ -263,6 +263,19 @@ def test_mcp_contract_is_fail_closed() -> None:
     assert "dispatch_subagent" not in LOGICAL_TOOL_NAMES
 
 
+def test_loopback_mcp_client_ignores_environment_proxy(monkeypatch) -> None:
+    from travel_agent.agent.tool_source import _loopback_httpx_client
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:9999")
+    client = _loopback_httpx_client()
+    try:
+        assert client._trust_env is False
+        assert client.follow_redirects is True
+    finally:
+        asyncio_run = __import__("asyncio").run
+        asyncio_run(client.aclose())
+
+
 def test_cancelled_mcp_result_cannot_merge_into_live_snapshot() -> None:
     def remote(session_id: str = "default", task_context: dict | None = None) -> dict:
         control.cancel()

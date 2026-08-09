@@ -49,6 +49,23 @@ def _mcp_url(settings: Settings) -> str:
     return f"http://{settings.mcp.host}:{settings.mcp.port}/mcp/"
 
 
+def _loopback_httpx_client(headers=None, timeout=None, auth=None):
+    """Local MCP must not be routed through process-wide HTTP proxies."""
+    import httpx
+
+    kwargs: dict[str, Any] = {
+        "follow_redirects": True,
+        "trust_env": False,
+    }
+    if headers is not None:
+        kwargs["headers"] = headers
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    if auth is not None:
+        kwargs["auth"] = auth
+    return httpx.AsyncClient(**kwargs)
+
+
 def _wrap_mcp_tool_with_session(tool: BaseTool, ctx: SessionContext | str) -> BaseTool:
     """Inject transport-only context without holding a lock across MCP I/O."""
     session_id = ctx.session_id if isinstance(ctx, SessionContext) else str(ctx)
@@ -218,16 +235,15 @@ async def resolve_tools_async(
         try:
             from langchain_mcp_adapters.client import MultiServerMCPClient
 
-            client = MultiServerMCPClient(
-                {
-                    mcp_settings.server_name: {
+            connection: dict[str, Any] = {
                         "transport": "streamable_http",
                         "url": _mcp_url(settings),
                         "timeout": timedelta(seconds=mcp_settings.timeout_seconds),
                         "headers": {"X-Travel-Session-Id": ctx.session_id},
-                    }
-                }
-            )
+            }
+            if str(mcp_settings.host).strip().lower() in {"127.0.0.1", "localhost", "::1"}:
+                connection["httpx_client_factory"] = _loopback_httpx_client
+            client = MultiServerMCPClient({mcp_settings.server_name: connection})
             tools = await client.get_tools()
             wrapped = [_wrap_mcp_tool_with_session(tool, ctx) for tool in tools]
             validate_tool_contract(wrapped, source="mcp")
