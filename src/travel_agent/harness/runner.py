@@ -149,6 +149,9 @@ class AgentHarness:
                 tool_calls=tool_calls,
                 model_calls=[dict(item) for item in trace if item.get("kind") == "model"],
                 memory_snapshot=_memory_snapshot(self.settings, user_id),
+                status=getattr(reply, "status", None),
+                plan_artifact_id=getattr(reply, "plan_artifact_id", None),
+                agent_trace=list(getattr(reply, "agent_trace", None) or []),
             )
         except Exception as exc:  # noqa: BLE001
             duration_ms = round((time.perf_counter() - started) * 1000, 2)

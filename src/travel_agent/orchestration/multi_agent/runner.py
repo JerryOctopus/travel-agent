@@ -21,6 +21,8 @@ LLM 执行路径（create_react_agent + token/duration 采集）在 Step 3 接�
 
 from __future__ import annotations
 
+import contextvars
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import time
 from typing import Any, Callable
 
@@ -30,6 +32,7 @@ from travel_agent.orchestration.multi_agent.registry import (
 )
 from travel_agent.orchestration.multi_agent.schemas import (
     STATUS_COMPLETED,
+    STATUS_BUDGET_EXHAUSTED,
     STATUS_FAILED,
     SubagentResult,
     SubagentTask,
@@ -118,16 +121,45 @@ class SubagentRunner:
         elif artifact_ids and store is not None:
             task.inputs["artifact_inputs"] = _compact_dependency_inputs(store, artifact_ids)
 
-        token = set_current_task_meta(
-            {
-                "request_id": task.request_id,
-                "task_id": task.task_id,
-                "agent": task.agent,
-                "artifact_ids": artifact_ids,
-            }
+        isolated_ctx = (
+            self._ctx.clone_isolated() if hasattr(self._ctx, "clone_isolated") else self._ctx
         )
+        isolated_store = getattr(isolated_ctx, "store", None)
+        base_ids = isolated_store.artifact_ids() if isolated_store is not None else set()
+
+        def _execute() -> Any:
+            token = set_current_task_meta(
+                {
+                    "request_id": task.request_id,
+                    "task_id": task.task_id,
+                    "agent": task.agent,
+                    "artifact_ids": artifact_ids,
+                    "revision_directives": dict(
+                        task.inputs.get("revision_directives") or {}
+                    ),
+                }
+            )
+            try:
+                return self._executor(definition, task, isolated_ctx)
+            finally:
+                reset_task_meta(token)
+
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"subagent-{task.agent}")
+        future = pool.submit(contextvars.copy_context().run, _execute)
         try:
-            raw = self._executor(definition, task, self._ctx)
+            raw = future.result(timeout=definition.timeout_seconds)
+        except FutureTimeoutError:
+            future.cancel()
+            return SubagentResult(
+                request_id=task.request_id,
+                task_id=task.task_id,
+                agent=task.agent,
+                status=STATUS_BUDGET_EXHAUSTED,
+                attempt=task.attempt,
+                error=f"timeout after {definition.timeout_seconds:g}s",
+                warnings=["Subagent 执行达到 timeout_seconds 硬上限"],
+                duration_ms=_elapsed_ms(start),
+            )
         except Exception as exc:  # noqa: BLE001 — 统一包装为 failed，不上抛
             return SubagentResult(
                 request_id=task.request_id,
@@ -139,7 +171,21 @@ class SubagentRunner:
                 duration_ms=_elapsed_ms(start),
             )
         finally:
-            reset_task_meta(token)
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        if isolated_ctx is not self._ctx and hasattr(self._ctx, "merge_task_from"):
+            try:
+                self._ctx.merge_task_from(isolated_ctx, base_ids)
+            except Exception as exc:  # cancelled request or failed atomic publish
+                return SubagentResult(
+                    request_id=task.request_id,
+                    task_id=task.task_id,
+                    agent=task.agent,
+                    status=STATUS_FAILED,
+                    attempt=task.attempt,
+                    error=f"{type(exc).__name__}: {exc}",
+                    duration_ms=_elapsed_ms(start),
+                )
 
         new_ids = (
             store.artifact_ids_for_task(

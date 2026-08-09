@@ -161,35 +161,48 @@ class MultiAgentEngine:
         task_brief: str = "",
         request_id: str | None = None,
         history: list[tuple[str, str]] | None = None,
+        existing_plan_artifact_id: str | None = None,
+        turn_inputs: dict[str, Any] | None = None,
     ) -> TurnOutcome:
         rid = request_id or new_request_id()
         if self.capabilities.mode == "single":
-            return self._run_v0(ctx, settings, user_message, history or [])
-
-        runner = self._resolve_runner(ctx, settings)
-
-        if self.capabilities.dispatch == "fixed":
-            outcome = self._run_fixed(ctx, runner, rid, task_type, task_brief or user_message)
+            outcome = self._run_v0(ctx, settings, user_message, history or [], rid)
         else:
-            outcome = self._run_dynamic(
-                ctx,
-                settings,
-                runner,
-                rid,
-                user_message,
-                task_brief,
-                task_type,
-            )
+            runner = self._resolve_runner(ctx, settings)
+            if self.capabilities.dispatch == "fixed":
+                outcome = self._run_fixed(
+                    ctx,
+                    runner,
+                    rid,
+                    task_type,
+                    task_brief or user_message,
+                    existing_plan_artifact_id,
+                    turn_inputs or {},
+                )
+            else:
+                outcome = self._run_dynamic(
+                    ctx,
+                    settings,
+                    runner,
+                    rid,
+                    user_message,
+                    task_brief,
+                    task_type,
+                    history or [],
+                    existing_plan_artifact_id,
+                    turn_inputs or {},
+                )
 
         if outcome.status == STATUS_CLARIFICATION_REQUIRED:
             self._flush_trace(ctx, rid, outcome)
             return outcome
 
-        outcome.plan_artifact_id = _plan_artifact_id_from_results(
-            ctx,
-            outcome.results,
-            rid,
-        )
+        if self.capabilities.mode != "single":
+            outcome.plan_artifact_id = _plan_artifact_id_from_results(
+                ctx,
+                outcome.results,
+                rid,
+            )
         plan_required = _plan_required_for_turn(self.capabilities.dispatch, task_type)
         if plan_required and not outcome.plan_artifact_id:
             outcome.status = STATUS_INCOMPLETE
@@ -263,28 +276,51 @@ class MultiAgentEngine:
     # V0：单 Agent 全工具（薄适配既有 runtime._run_react）
     # ------------------------------------------------------------------ #
     def _run_v0(
-        self, ctx: Any, settings: Any, user_message: str, history: list[tuple[str, str]]
+        self,
+        ctx: Any,
+        settings: Any,
+        user_message: str,
+        history: list[tuple[str, str]],
+        request_id: str,
     ) -> TurnOutcome:
         from travel_agent.agent.runtime import _run_react
+        from travel_agent.agent.session import reset_task_meta, set_current_task_meta
 
+        task_id = new_task_id("single_agent")
+        token = set_current_task_meta(
+            {"request_id": request_id, "task_id": task_id, "agent": "single_agent"}
+        )
         try:
             reply = _run_react(user_message, ctx, history, settings)
         except Exception as exc:  # noqa: BLE001
             return TurnOutcome(status=STATUS_FAILED, reply=f"执行失败：{exc}")
+        finally:
+            reset_task_meta(token)
         if getattr(reply, "clarification", False):
             return TurnOutcome(status=STATUS_CLARIFICATION_REQUIRED, reply=reply.text)
+        plan_id = next(
+            (
+                artifact_id
+                for artifact_id in reversed(
+                    ctx.store.artifact_ids_for_task(request_id, task_id, agent="single_agent")
+                )
+                if (ctx.store.get_record(artifact_id) or {}).get("kind") == "itinerary"
+            ),
+            None,
+        )
         critic_passed = bool(
-            (ctx.store.latest("itinerary") or {}).get("critic", {}).get("passed") is True
+            ((ctx.store.get(plan_id) if plan_id else {}) or {}).get("critic", {}).get("passed")
+            is True
         )
         status = (
             STATUS_COMPLETED
-            if critic_passed or ctx.store.latest_id("itinerary") is None
+            if critic_passed or plan_id is None
             else STATUS_INCOMPLETE
         )
         return TurnOutcome(
             status=status,
             reply=reply.text,
-            plan_artifact_id=ctx.store.latest_id("itinerary"),
+            plan_artifact_id=plan_id,
         )
 
     # ------------------------------------------------------------------ #
@@ -297,10 +333,12 @@ class MultiAgentEngine:
         request_id: str,
         task_type: TaskType | None,
         task_brief: str,
+        existing_plan_artifact_id: str | None,
+        turn_inputs: dict[str, Any],
     ) -> TurnOutcome:
         from travel_agent.orchestration.multi_agent.fixed_dispatch import run_fixed_dispatch
 
-        if task_type == TaskType.ITINERARY_REVISION and not ctx.store.latest_id("itinerary"):
+        if task_type == TaskType.ITINERARY_REVISION and not existing_plan_artifact_id:
             return TurnOutcome(
                 status=STATUS_CLARIFICATION_REQUIRED,
                 reply="当前会话没有可修改的既有行程，请先生成或提供一份行程。",
@@ -310,7 +348,9 @@ class MultiAgentEngine:
             request_id,
             task_type,
             task_brief=task_brief,
-            inputs=_fixed_turn_inputs(ctx, task_type),
+            inputs=_fixed_turn_inputs(
+                task_type, existing_plan_artifact_id, turn_inputs
+            ),
         )
         if status == STATUS_CLARIFICATION_REQUIRED:
             return TurnOutcome(
@@ -332,17 +372,38 @@ class MultiAgentEngine:
         user_message: str,
         task_brief: str,
         task_type: TaskType | None,
+        history: list[tuple[str, str]],
+        existing_plan_artifact_id: str | None,
+        turn_inputs: dict[str, Any],
     ) -> TurnOutcome:
         from travel_agent.orchestration.multi_agent.orchestrator_agent import run_orchestrator
 
-        orch = run_orchestrator(
-            ctx,
-            settings,
-            user_message,
-            request_id,
-            runner=runner,
-            model=self._orchestrator_model,
-        )
+        import inspect
+
+        if "history" in inspect.signature(run_orchestrator).parameters:
+            orch = run_orchestrator(
+                ctx,
+                settings,
+                user_message,
+                request_id,
+                runner=runner,
+                model=self._orchestrator_model,
+                history=history,
+                task_type=task_type,
+                turn_inputs=_fixed_turn_inputs(
+                    task_type, existing_plan_artifact_id, turn_inputs
+                ),
+            )
+        else:
+            # Compatibility for injected legacy adapters.
+            orch = run_orchestrator(
+                ctx,
+                settings,
+                user_message,
+                request_id,
+                runner=runner,
+                model=self._orchestrator_model,
+            )
         results = [_dict_to_result(item) for item in orch.get("results", [])]
         if orch.get("clarification"):
             return TurnOutcome(
@@ -382,7 +443,14 @@ class MultiAgentEngine:
         if requires_semantic_review(self.capabilities, task_type):
             delivery = self._run_review_cycle(ctx, settings, outcome, task_brief, request_id)
 
-        render = render_plan_outcome(ctx, outcome.plan_artifact_id, delivery)
+        allowed_agents = (
+            frozenset({"single_agent"})
+            if self.capabilities.mode == "single"
+            else frozenset({"planner"})
+        )
+        render = render_plan_outcome(
+            ctx, outcome.plan_artifact_id, delivery, allowed_agents=allowed_agents
+        )
         outcome.cards = render.get("cards") or []
         outcome.map_payload = render.get("map_payload")
         outcome.gate_status = render.get("gate_status") or "skipped"
@@ -572,11 +640,19 @@ def _plan_required_for_turn(dispatch: str, task_type: TaskType | None) -> bool:
     return task_type in REVIEW_REQUIRED_TASK_TYPES or dispatch == "dynamic"
 
 
-def _fixed_turn_inputs(ctx: Any, task_type: TaskType | None) -> dict[str, Any]:
-    if task_type != TaskType.ITINERARY_REVISION:
-        return {}
-    existing_id = ctx.store.latest_id("itinerary")
-    return {"artifact_ids": [existing_id]} if existing_id else {}
+def _fixed_turn_inputs(
+    task_type: TaskType | None,
+    existing_plan_artifact_id: str | None,
+    turn_inputs: dict[str, Any],
+) -> dict[str, Any]:
+    inputs = dict(turn_inputs)
+    if task_type == TaskType.ITINERARY_REVISION and existing_plan_artifact_id:
+        ids = [str(item) for item in (inputs.get("artifact_ids") or []) if item]
+        if existing_plan_artifact_id not in ids:
+            ids.insert(0, existing_plan_artifact_id)
+        inputs["artifact_ids"] = ids
+        inputs["plan_artifact_id"] = existing_plan_artifact_id
+    return inputs
 
 
 def _plan_artifact_id_from_results(

@@ -32,6 +32,8 @@ def render_plan_outcome(
     ctx: Any,
     plan_artifact_id: str | None,
     delivery_status: str,
+    *,
+    allowed_agents: frozenset[str] = frozenset({"planner"}),
 ) -> dict[str, Any]:
     """按交付状态经 Gate 渲染行程与地图；返回渲染结果包。
 
@@ -58,7 +60,10 @@ def render_plan_outcome(
 
     mark_incomplete = delivery_status == STATUS_INCOMPLETE
     itinerary_result = toolkit.gated_render_itinerary(
-        ctx, plan_artifact_id, mark_incomplete=mark_incomplete
+        ctx,
+        plan_artifact_id,
+        mark_incomplete=mark_incomplete,
+        allowed_agents=allowed_agents,
     )
     if itinerary_result.get("isError"):
         outcome["reason"] = str(itinerary_result.get("summary") or "渲染被 Gate 拒绝")
@@ -66,7 +71,10 @@ def render_plan_outcome(
         return outcome
 
     map_result = toolkit.gated_render_map(
-        ctx, plan_artifact_id, mark_incomplete=mark_incomplete
+        ctx,
+        plan_artifact_id,
+        mark_incomplete=mark_incomplete,
+        allowed_agents=allowed_agents,
     )
     outcome.update(
         {

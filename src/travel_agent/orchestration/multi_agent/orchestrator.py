@@ -16,6 +16,8 @@ StructuredTool 注册与 Orchestrator ReAct agent 构建在 Step 3 接入。
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from travel_agent.orchestration.multi_agent.runner import SubagentRunner
@@ -78,7 +80,58 @@ def filter_orchestrator_tools(all_tools: list[Any]) -> list[Any]:
 DispatchFn = Callable[[str, str, dict | None, list | None], str]
 
 
-def build_dispatch_tool(runner: SubagentRunner, request_id: str | None = None) -> DispatchFn:
+@dataclass
+class DispatchLedger:
+    """Turn-scoped hard limits and dependency state for dynamic dispatch."""
+
+    max_total: int = 8
+    per_agent_limits: dict[str, int] = field(
+        default_factory=lambda: {
+            "attraction": 2,
+            "hotel": 2,
+            "restaurant": 2,
+            "transport": 2,
+            "planner": 1,
+        }
+    )
+    attempts: int = 0
+    counts: dict[str, int] = field(default_factory=dict)
+    objectives: set[str] = field(default_factory=set)
+    results_by_task: dict[str, SubagentResult] = field(default_factory=dict)
+    terminal: bool = False
+
+    def authorize(self, agent: str, instruction: str) -> str | None:
+        if self.terminal:
+            return "dispatch terminal: planner already completed"
+        objective = _normalize_objective(agent, instruction)
+        if objective in self.objectives:
+            return "duplicate objective rejected"
+        if self.attempts >= self.max_total:
+            return f"global dispatch limit exhausted: {self.max_total}"
+        limit = self.per_agent_limits.get(agent, 0)
+        if self.counts.get(agent, 0) >= limit:
+            return f"per-agent dispatch limit exhausted: {agent}={limit}"
+        self.attempts += 1
+        self.counts[agent] = self.counts.get(agent, 0) + 1
+        self.objectives.add(objective)
+        return None
+
+    def record(self, result: SubagentResult) -> None:
+        self.results_by_task[result.task_id] = result
+        if result.agent == "planner" and result.status in {
+            STATUS_COMPLETED,
+            STATUS_COMPLETED_WITH_WARNINGS,
+        }:
+            self.terminal = True
+
+
+def build_dispatch_tool(
+    runner: SubagentRunner,
+    request_id: str | None = None,
+    *,
+    ledger: DispatchLedger | None = None,
+    base_inputs: dict[str, Any] | None = None,
+) -> DispatchFn:
     """构建 ``dispatch_subagent`` 的执行闭包（Step 3 包装为 StructuredTool）。
 
     参数语义：``agent``（subagent 类型）、``instruction``（任务描述）、
@@ -91,7 +144,7 @@ def build_dispatch_tool(runner: SubagentRunner, request_id: str | None = None) -
     短暂持有（Step 2 用死锁测试验证）。
     """
     rid = request_id or new_request_id()
-    results_by_task: dict[str, SubagentResult] = {}
+    turn_ledger = ledger or DispatchLedger()
 
     def dispatch_subagent(
         agent: str,
@@ -100,11 +153,22 @@ def build_dispatch_tool(runner: SubagentRunner, request_id: str | None = None) -
         depends_on: list | None = None,
     ) -> str:
         task_id = new_task_id(agent)
-        merged_inputs = dict(inputs or {})
+        merged_inputs = dict(base_inputs or {})
+        merged_inputs.update(inputs or {})
+        base_artifact_ids = [
+            str(item) for item in ((base_inputs or {}).get("artifact_ids") or []) if item
+        ]
+        supplied_artifact_ids = [
+            str(item) for item in ((inputs or {}).get("artifact_ids") or []) if item
+        ]
+        if base_artifact_ids or supplied_artifact_ids:
+            merged_inputs["artifact_ids"] = list(
+                dict.fromkeys(base_artifact_ids + supplied_artifact_ids)
+            )
         dependency_ids: list[str] = []
         unresolved: list[str] = []
         for dependency_task_id in depends_on or []:
-            dependency = results_by_task.get(str(dependency_task_id))
+            dependency = turn_ledger.results_by_task.get(str(dependency_task_id))
             if dependency is None or dependency.status not in {
                 STATUS_COMPLETED,
                 STATUS_COMPLETED_WITH_WARNINGS,
@@ -122,6 +186,7 @@ def build_dispatch_tool(runner: SubagentRunner, request_id: str | None = None) -
         if explicit_ids:
             merged_inputs["artifact_ids"] = explicit_ids
 
+        limit_error = None if unresolved else turn_ledger.authorize(agent, instruction)
         task = SubagentTask(
             request_id=rid,
             task_id=task_id,
@@ -130,21 +195,28 @@ def build_dispatch_tool(runner: SubagentRunner, request_id: str | None = None) -
             inputs=merged_inputs,
             depends_on=list(depends_on or []),
         )
-        if unresolved:
+        if unresolved or limit_error:
+            error = limit_error or f"unresolved dependencies: {unresolved}"
             result = SubagentResult(
                 request_id=rid,
                 task_id=task_id,
                 agent=agent,
                 status=STATUS_FAILED,
-                error=f"unresolved dependencies: {unresolved}",
+                error=error,
                 unresolved=[f"dependency:{item}" for item in unresolved],
             )
         else:
             result = runner.run_subagent(task)
-        results_by_task[result.task_id] = result
+        turn_ledger.record(result)
         return json.dumps(result.to_dict(), ensure_ascii=False, default=str)
 
+    setattr(dispatch_subagent, "ledger", turn_ledger)
     return dispatch_subagent
+
+
+def _normalize_objective(agent: str, instruction: str) -> str:
+    normalized = re.sub(r"\s+", " ", instruction).strip().casefold()
+    return f"{agent.strip().casefold()}:{normalized}"
 
 
 def _evidence_artifact_ids(result: SubagentResult) -> list[str]:

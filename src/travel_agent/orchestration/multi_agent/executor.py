@@ -12,11 +12,11 @@ Orchestrator / fixed dispatch 的编排在 engine 层。
 
 from __future__ import annotations
 
-import json
 from functools import wraps
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langgraph.errors import GraphBubbleUp
 from langgraph.prebuilt import create_react_agent
 
 from travel_agent.orchestration.multi_agent.registry import SubagentDefinition
@@ -26,26 +26,30 @@ from travel_agent.orchestration.multi_agent.schemas import (
     SubagentTask,
 )
 
-_BUDGET_SENTINEL = "__SUBAGENT_TOOL_BUDGET_EXHAUSTED__"
+_BUDGET_SENTINEL = "__SUBAGENT_TOOL_BUDGET_EXHAUSTED__"  # backward-compatible audit marker
+
+
+class ToolCallBudgetExceeded(GraphBubbleUp):
+    """Stop the graph before a tool call that would exceed the hard budget."""
 
 
 def _budget_guard(tool: Any, max_calls: int, counter: dict[str, int]):
-    """工具调用计数守卫：超限后返回哨兵错误，不再真正执行工具。"""
+    """工具调用计数守卫：在执行下一次超额调用前立即终止。"""
     original_coroutine = getattr(tool, "coroutine", None)
 
-    def _exceeded() -> bool:
+    def _claim_call() -> None:
+        if counter["n"] >= max_calls:
+            raise ToolCallBudgetExceeded(
+                f"max_tool_calls exhausted before call {counter['n'] + 1}"
+            )
         counter["n"] += 1
-        return counter["n"] > max_calls
 
     if tool.func is not None:
         original_fn = tool.func
 
         @wraps(original_fn)
         def guarded(*args, **kwargs):
-            if _exceeded():
-                return json.dumps(
-                    {"isError": True, "summary": _BUDGET_SENTINEL}, ensure_ascii=False
-                )
+            _claim_call()
             return original_fn(*args, **kwargs)
 
         tool.func = guarded
@@ -54,10 +58,7 @@ def _budget_guard(tool: Any, max_calls: int, counter: dict[str, int]):
 
         @wraps(original_coroutine)
         async def guarded_async(*args, **kwargs):
-            if _exceeded():
-                return json.dumps(
-                    {"isError": True, "summary": _BUDGET_SENTINEL}, ensure_ascii=False
-                )
+            _claim_call()
             return await original_coroutine(*args, **kwargs)
 
         tool.coroutine = guarded_async
@@ -117,13 +118,32 @@ def build_subagent_executor(settings: Any, model: Any | None = None):
                 )
             ]
 
-        state = agent.invoke(
-            {"messages": messages},
-            config={
-                "recursion_limit": max(definition.max_steps * 2, 8),
-                "callbacks": callbacks,
-            },
-        )
+        try:
+            state = agent.invoke(
+                {"messages": messages},
+                config={
+                    # LangGraph's recursion counter is the graph-step budget.  Do
+                    # not silently widen it: max_steps is a hard upper bound.
+                    "recursion_limit": definition.max_steps,
+                    "callbacks": callbacks,
+                },
+            )
+        except ToolCallBudgetExceeded as exc:
+            return {
+                "status": STATUS_BUDGET_EXHAUSTED,
+                "summary": str(exc),
+                "warnings": ["工具调用次数达到 max_tool_calls 硬上限"],
+                "tool_trace": [],
+            }
+        except Exception as exc:
+            if type(exc).__name__ in {"GraphRecursionError", "RecursionError"}:
+                return {
+                    "status": STATUS_BUDGET_EXHAUSTED,
+                    "summary": f"max_steps exhausted: {definition.max_steps}",
+                    "warnings": ["执行步骤达到 max_steps 硬上限"],
+                    "tool_trace": [],
+                }
+            raise
         return _extract(definition, state, local_trace)
 
     return executor
@@ -137,10 +157,6 @@ def _extract(definition: SubagentDefinition, state: dict, trace: list[dict]) -> 
         if isinstance(msg, AIMessage)
         for call in (getattr(msg, "tool_calls", None) or [])
     ]
-    budget_exhausted = any(
-        isinstance(msg, ToolMessage) and _BUDGET_SENTINEL in str(msg.content)
-        for msg in out_messages
-    )
     summary = ""
     for msg in reversed(out_messages):
         if isinstance(msg, AIMessage) and isinstance(msg.content, str) and msg.content.strip():
@@ -154,11 +170,9 @@ def _extract(definition: SubagentDefinition, state: dict, trace: list[dict]) -> 
             total_tokens += int(usage["total_tokens"])
 
     result: dict[str, Any] = {
-        "status": STATUS_BUDGET_EXHAUSTED if budget_exhausted else STATUS_COMPLETED,
+        "status": STATUS_COMPLETED,
         "summary": summary,
         "tool_trace": tool_trace,
         "token_usage": {"total_tokens": total_tokens} if total_tokens else {},
     }
-    if budget_exhausted:
-        result["warnings"] = ["工具调用次数达到上限，后续调用被拒绝"]
     return result

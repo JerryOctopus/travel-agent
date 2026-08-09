@@ -71,6 +71,7 @@ class TurnAnalysis:
     task_type: TaskType
     patches: dict[str, SlotPatch] = field(default_factory=dict)
     source: str = "rule"  # rule | llm
+    revision_directives: dict[str, Any] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +87,10 @@ _PLAN_REVISION_KEYWORDS: tuple[str, ...] = (
     "改为",
     "修改",
     "调整",
+    "轻松",
+    "别太累",
+    "别换",
+    "不换",
     "替换",
     "对比",
     "比较",
@@ -169,6 +174,34 @@ def build_rule_patches(user_message: str, task_type: TaskType) -> dict[str, Slot
     return patches
 
 
+def extract_revision_directives(user_message: str, task_type: TaskType) -> dict[str, Any]:
+    """Extract deterministic revision controls that are not profile slots."""
+    if task_type != TaskType.ITINERARY_REVISION:
+        return {}
+    directives: dict[str, Any] = {}
+    indoor_match = re.search(
+        r"第\s*([一二三四五六七八九十\d]+)\s*天.{0,12}(?:室内|雨天)",
+        user_message,
+    )
+    if indoor_match:
+        day = _parse_chinese_day(indoor_match.group(1))
+        if day is not None:
+            directives["indoor_days"] = [day]
+    if re.search(r"(?:酒店|住宿).{0,6}(?:别换|不换|保持|保留)", user_message):
+        directives["preserve_hotel"] = True
+    if re.search(r"轻松|悠闲|别太累|少安排", user_message):
+        directives["pace"] = "relaxed"
+    return directives
+
+
+def _parse_chinese_day(value: str) -> int | None:
+    if value.isdigit():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    digits = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    return digits.get(value)
+
+
 # --------------------------------------------------------------------------- #
 # 合并入口：规则优先，ambiguous / 复杂信号时一次 LLM 调用
 # --------------------------------------------------------------------------- #
@@ -194,6 +227,7 @@ def analyze_travel_turn(
         task_type=task_type,
         patches=build_rule_patches(user_message, task_type),
         source="rule",
+        revision_directives=extract_revision_directives(user_message, task_type),
     )
     if kind != MessageKind.AMBIGUOUS and not has_complex_signals(user_message):
         return rule_result
@@ -312,7 +346,13 @@ def _merge_llm_payload(payload: Any, rule_result: TurnAnalysis) -> TurnAnalysis:
             patch = patches.get(name)
             if patch is not None and patch.op == PatchOp.SET:
                 patches.pop(name)
-    return TurnAnalysis(kind=kind, task_type=task_type, patches=patches, source="llm")
+    return TurnAnalysis(
+        kind=kind,
+        task_type=task_type,
+        patches=patches,
+        source="llm",
+        revision_directives=rule_result.revision_directives,
+    )
 
 
 _SLOT_ENUMS = {

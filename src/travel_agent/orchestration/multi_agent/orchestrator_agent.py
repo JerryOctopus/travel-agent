@@ -18,6 +18,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.prebuilt import create_react_agent
 
 from travel_agent.orchestration.multi_agent.orchestrator import (
+    DispatchLedger,
     ORCHESTRATOR_ALLOWED_TOOLS,
     build_dispatch_tool,
     filter_orchestrator_tools,
@@ -55,6 +56,8 @@ def build_orchestrator_tools(
     settings: Any,
     request_id: str,
     results_sink: list | None = None,
+    ledger: DispatchLedger | None = None,
+    base_inputs: dict[str, Any] | None = None,
 ) -> tuple[list[Any], list]:
     """构建 Orchestrator 工具面；返回 (tools, results_sink)。
 
@@ -68,7 +71,12 @@ def build_orchestrator_tools(
     allowed = ORCHESTRATOR_ALLOWED_TOOLS - {"render_itinerary", "render_map"}
     base_tools = [tool for tool in filter_orchestrator_tools(all_tools) if tool.name in allowed]
 
-    dispatch_fn = build_dispatch_tool(runner, request_id=request_id)
+    dispatch_fn = build_dispatch_tool(
+        runner,
+        request_id=request_id,
+        ledger=ledger,
+        base_inputs=base_inputs,
+    )
 
     def _collecting_dispatch(
         agent: str,
@@ -106,6 +114,9 @@ def run_orchestrator(
     runner: SubagentRunner,
     model: Any | None = None,
     results_sink: list | None = None,
+    history: list[tuple[str, str]] | None = None,
+    task_type: Any | None = None,
+    turn_inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """运行动态 Orchestrator 一轮，返回 {reply, tool_trace, results, clarification}。"""
     active_model = model
@@ -116,12 +127,28 @@ def run_orchestrator(
 
         active_model = _build_chat_model(settings)
 
-    tools, sink = build_orchestrator_tools(runner, ctx, settings, request_id, results_sink)
+    ledger = DispatchLedger()
+    tools, sink = build_orchestrator_tools(
+        runner,
+        ctx,
+        settings,
+        request_id,
+        results_sink,
+        ledger=ledger,
+        base_inputs=turn_inputs,
+    )
     agent = create_react_agent(active_model, tools)
-    messages: list[Any] = [
-        SystemMessage(content=build_orchestrator_prompt()),
-        HumanMessage(content=user_message),
-    ]
+    context_lines = [f"本轮任务类型：{getattr(task_type, 'value', task_type) or 'unknown'}"]
+    if turn_inputs:
+        import json
+
+        context_lines.append(
+            "本轮显式输入：" + json.dumps(turn_inputs, ensure_ascii=False, default=str)
+        )
+    messages: list[Any] = [SystemMessage(content=build_orchestrator_prompt())]
+    for role, content in (history or [])[-8:]:
+        messages.append(AIMessage(content=content) if role == "assistant" else HumanMessage(content=content))
+    messages.append(HumanMessage(content="\n".join(context_lines) + "\n当前请求：" + user_message))
     state = agent.invoke(
         {"messages": messages},
         config={"recursion_limit": max(settings.agent.recursion_limit, 24)},
@@ -144,4 +171,5 @@ def run_orchestrator(
         "tool_trace": tool_trace,
         "results": sink,
         "clarification": clarification,
+        "dispatch_ledger": ledger,
     }

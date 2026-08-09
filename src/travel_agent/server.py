@@ -19,6 +19,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from travel_agent.agent.runtime import run_production_turn
+from travel_agent.agent.session import RequestControl, SessionContext
+from travel_agent.orchestration.multi_agent.schemas import new_request_id
 from travel_agent.settings import get_settings
 from travel_agent.storage.session_manager import SessionLifecycleManager
 
@@ -35,6 +37,40 @@ def _build_manager() -> SessionLifecycleManager:
 
 
 MANAGER = _build_manager()
+
+
+async def _run_isolated_request(
+    message: str,
+    ctx: SessionContext,
+    history: list[tuple[str, str]],
+    settings: Any,
+    user_id: str,
+):
+    """Run sync agent work in a private snapshot and publish only on success."""
+    control = RequestControl(new_request_id())
+    snapshot = ctx.clone_isolated(control)
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            run_production_turn,
+            message,
+            snapshot,
+            list(history),
+            settings,
+            user_id,
+        )
+    )
+    try:
+        reply = await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=settings.agent.request_timeout_seconds,
+        )
+        control.check_active()
+        ctx.commit_from(snapshot)
+        return reply
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        control.cancel()
+        task.cancel()
+        raise
 
 
 @app.get("/")
@@ -75,16 +111,8 @@ async def chat(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "status", "message": "正在思考与调用工具…"})
 
             try:
-                reply = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        run_production_turn,
-                        message,
-                        ctx,
-                        list(history),
-                        settings,
-                        user_id,
-                    ),
-                    timeout=settings.agent.request_timeout_seconds,
+                reply = await _run_isolated_request(
+                    message, ctx, list(history), settings, user_id
                 )
             except asyncio.TimeoutError:
                 await websocket.send_json({"type": "error", "message": "请求超时，请重试或简化需求。"})

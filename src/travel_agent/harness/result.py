@@ -22,6 +22,9 @@ class HarnessTurnResult:
     recovery_state: str | None = None
     critical_slots_matched: list[str] = field(default_factory=list)
     failure_reason: str | None = None
+    status: str | None = None
+    plan_artifact_id: str | None = None
+    agent_trace: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

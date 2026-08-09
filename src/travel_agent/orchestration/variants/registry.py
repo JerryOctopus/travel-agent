@@ -85,27 +85,32 @@ def _run_variant_turn(
     user_id: str,
 ) -> AgentReply:
     """薄适配：只依赖已发布 runtime 接口，然后交给同一 Engine。"""
-    from travel_agent.agent.runtime import _reply_from_outcome, _run_fallback
-    from travel_agent.agent.turn_analysis import analyze_travel_turn
+    from travel_agent.agent.runtime import run_architecture_turn
 
-    analysis = analyze_travel_turn(user_message, ctx, settings, history)
-    if not settings.llm.enabled:
-        # 离线：与生产同一条确定性兜底链路。
-        return _run_fallback(user_message, ctx)
-
-    from travel_agent.orchestration.multi_agent import MultiAgentEngine
-
-    engine = MultiAgentEngine(spec.capabilities)
-    outcome = engine.run_turn(
-        ctx,
-        settings,
+    reply = run_architecture_turn(
+        spec.capabilities,
         user_message,
-        task_type=analysis.task_type,
-        task_brief=user_message,
-        history=history,
+        ctx,
+        history,
+        settings,
+        user_id,
     )
-    _record_engine_metrics(ctx, spec, outcome)
-    return _reply_from_outcome(ctx, outcome)
+    _record_reply_metrics(ctx, spec, reply)
+    return reply
+
+
+def _record_reply_metrics(ctx: SessionContext, spec: VariantSpec, reply: AgentReply) -> None:
+    previous = ctx.store.latest("variant_metrics") or {}
+    ctx.store.put(
+        "variant_metrics",
+        {
+            **previous,
+            "variant": spec.name,
+            "mode": spec.capabilities.mode,
+            "dispatch": spec.capabilities.dispatch,
+            "status": getattr(reply, "status", None),
+        },
+    )
 
 
 def _record_engine_metrics(ctx: SessionContext, spec: VariantSpec, outcome: Any) -> None:

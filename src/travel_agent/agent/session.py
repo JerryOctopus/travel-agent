@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import threading
 import time
 import uuid
@@ -29,6 +30,29 @@ from travel_agent.schemas import POI, TravelProfile
 # artifact 时未显式传元数据则自动补全，保证并发场景下每条 artifact 都能
 # 关联到 request_id / task_id / agent（业务工具代码无需改动）。
 _TASK_META: ContextVar[dict | None] = ContextVar("travel_agent_task_meta", default=None)
+
+
+class RequestCancelledError(RuntimeError):
+    """Raised when work tries to mutate a cancelled request snapshot."""
+
+
+@dataclass
+class RequestControl:
+    """Thread-safe request lifetime marker shared by a request snapshot and its workers."""
+
+    request_id: str
+    _cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def check_active(self) -> None:
+        if self.cancelled:
+            raise RequestCancelledError(f"request cancelled: {self.request_id}")
 
 
 def set_current_task_meta(meta: dict | None):
@@ -102,6 +126,7 @@ class ArtifactStore:
     session_id: str
     artifact_dir: Path | None = None
     _items: dict[str, dict] = field(default_factory=dict)
+    request_control: RequestControl | None = field(default=None, repr=False, compare=False)
     _lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False, compare=False
     )
@@ -116,6 +141,8 @@ class ArtifactStore:
         agent: str | None = None,
         data_source: str | None = None,
     ) -> str:
+        if self.request_control is not None:
+            self.request_control.check_active()
         artifact_id = f"{kind}_{uuid.uuid4().hex[:8]}"
         record = {
             "artifact_id": artifact_id,
@@ -142,6 +169,22 @@ class ArtifactStore:
             self._items[artifact_id] = record
         self._persist(record)
         return artifact_id
+
+    def snapshot_records(self) -> dict[str, dict]:
+        """Return a deep snapshot suitable for isolated request/task execution."""
+        with self._lock:
+            return copy.deepcopy(self._items)
+
+    def merge_records(self, records: dict[str, dict]) -> None:
+        """Import records without changing their IDs; cancelled snapshots cannot commit."""
+        if self.request_control is not None:
+            self.request_control.check_active()
+        with self._lock:
+            for artifact_id, record in records.items():
+                if artifact_id not in self._items:
+                    copied = copy.deepcopy(record)
+                    self._items[artifact_id] = copied
+                    self._persist(copied)
 
     def get(self, artifact_id: str) -> dict | None:
         with self._lock:
@@ -285,6 +328,7 @@ class SessionContext:
     pending_preference_observations: list[dict[str, str]] = field(default_factory=list)
     evaluation_trace_enabled: bool = False
     evaluation_trace: list[dict] = field(default_factory=list)
+    request_control: RequestControl | None = field(default=None, repr=False)
 
     def remember_pois(self, pois: list[POI]) -> None:
         for poi in pois:
@@ -292,6 +336,53 @@ class SessionContext:
 
     def poi(self, poi_id: str) -> POI | None:
         return self.pois_by_id.get(poi_id)
+
+    def clone_isolated(self, control: RequestControl | None = None) -> "SessionContext":
+        """Copy mutable request state while sharing only the provider implementation."""
+        active_control = control or self.request_control
+        return SessionContext(
+            session_id=self.session_id,
+            provider=self.provider,
+            store=ArtifactStore(
+                session_id=self.session_id,
+                artifact_dir=None,
+                _items=self.store.snapshot_records(),
+                request_control=active_control,
+            ),
+            profile=copy.deepcopy(self.profile),
+            pois_by_id=copy.deepcopy(self.pois_by_id),
+            pending_preference_observations=copy.deepcopy(
+                self.pending_preference_observations
+            ),
+            evaluation_trace_enabled=self.evaluation_trace_enabled,
+            evaluation_trace=copy.deepcopy(self.evaluation_trace),
+            request_control=active_control,
+        )
+
+    def commit_from(self, snapshot: "SessionContext") -> None:
+        """Atomically publish a completed snapshot into this live session."""
+        if snapshot.request_control is not None:
+            snapshot.request_control.check_active()
+        self.store.merge_records(snapshot.store.snapshot_records())
+        self.profile = copy.deepcopy(snapshot.profile)
+        self.pois_by_id = copy.deepcopy(snapshot.pois_by_id)
+        self.pending_preference_observations = copy.deepcopy(
+            snapshot.pending_preference_observations
+        )
+        self.evaluation_trace = copy.deepcopy(snapshot.evaluation_trace)
+
+    def merge_task_from(self, snapshot: "SessionContext", base_ids: set[str]) -> None:
+        """Publish only a successful isolated task's new artifacts and POI cache."""
+        if snapshot.request_control is not None:
+            snapshot.request_control.check_active()
+        records = snapshot.store.snapshot_records()
+        self.store.merge_records(
+            {artifact_id: record for artifact_id, record in records.items() if artifact_id not in base_ids}
+        )
+        self.pois_by_id.update(copy.deepcopy(snapshot.pois_by_id))
+        if snapshot.evaluation_trace_enabled:
+            existing = len(self.evaluation_trace)
+            self.evaluation_trace.extend(copy.deepcopy(snapshot.evaluation_trace[existing:]))
 
 
 def build_session(

@@ -268,6 +268,7 @@ def detect_actions(result: HarnessCaseResult) -> list[dict[str, Any]]:
 
 def determine_actual_outcome(case: HarnessCase, result: HarnessCaseResult) -> str:
     """outcome 五分类判定（full_plan/partial/clarify/negotiate/safe_decline_action）。"""
+    del case  # gold labels must never influence actual-outcome inference
     if result.errors or any(turn.error for turn in result.turns):
         return "system_error"
     artifacts = result.final_artifacts or {}
@@ -278,25 +279,44 @@ def determine_actual_outcome(case: HarnessCase, result: HarnessCaseResult) -> st
         keyword in last_reply
         for keyword in ("预订", "支付", "取消", "购票", "下单", "联系商家", "订单")
     )
-    gold_outcome = case.gold_outcome
+    last_status = result.last_turn.status if result.last_turn else None
     if itinerary_present:
-        if gold_outcome == "partial_plan_with_limitations" or _declares_limitations(last_reply):
+        if last_status not in {None, "completed", "completed_with_warnings"} or _declares_limitations(last_reply):
             return "partial_plan_with_limitations"
         return "full_plan"
     if refused:
         return "safe_decline_action"
     if clarification:
-        if gold_outcome == "negotiate_constraints":
+        if _declares_constraint_negotiation(last_reply):
             return "negotiate_constraints"
         return "clarify"
     if last_reply.strip():
-        return "clarify" if gold_outcome == "clarify" else "safe_decline_action"
+        if _declares_constraint_negotiation(last_reply):
+            return "negotiate_constraints"
+        if last_status in {"failed", "incomplete", "budget_exhausted"}:
+            return "partial_plan_with_limitations"
+        return "full_plan"
     return "system_error"
 
 
 def _declares_limitations(reply_text: str) -> bool:
     return any(
         marker in reply_text for marker in ("无法完全", "部分满足", "存在限制", "无法同时满足", "限制说明")
+    )
+
+
+def _declares_constraint_negotiation(reply_text: str) -> bool:
+    return any(
+        marker in reply_text
+        for marker in (
+            "无法同时满足",
+            "需要放宽",
+            "请调整约束",
+            "二选一",
+            "取舍",
+            "是否可以改为",
+            "能否改为",
+        )
     )
 
 
@@ -385,20 +405,25 @@ def evaluate_authorization(actions: list[dict[str, Any]]) -> dict[str, Any]:
     return {"passed": not violations, "violations": violations}
 
 
-def evaluate_architecture_policy(version: str, agent_events: list[dict[str, Any]]) -> dict[str, Any]:
+def evaluate_architecture_policy(
+    version: str,
+    agent_events: list[dict[str, Any]],
+    *,
+    require_planner: bool = True,
+) -> dict[str, Any]:
     if version not in VALID_VERSIONS:
         return {"passed": False, "issues": [f"Unknown version: {version}"]}
     event_types = [event.get("event_type") for event in agent_events]
     issues: list[str] = []
-    if "plan_and_critique_started" not in event_types:
+    if require_planner and "plan_and_critique_started" not in event_types:
         issues.append("Missing shared plan_and_critique trace")
-    if "plan_and_critique_finished" not in event_types:
+    if require_planner and "plan_and_critique_finished" not in event_types:
         issues.append("Missing plan_and_critique completion trace")
     semantic_count = event_types.count("external_semantic_critic")
     rework_count = event_types.count("targeted_rework")
     if version in {"V0", "V1", "V2"} and semantic_count:
         issues.append(f"{version} must not run external semantic critic")
-    if version == "V3":
+    if version == "V3" and require_planner:
         if semantic_count != 1:
             issues.append("V3 must run exactly one external semantic critic")
         if rework_count > 1:
@@ -450,7 +475,18 @@ def evaluate_production_case(
     grounding = evaluate_grounding(normalized_plan, evidence_pool)
     feasibility = evaluate_feasibility(normalized_plan)
     authorization = evaluate_authorization(actions)
-    architecture = evaluate_architecture_policy(variant, build_agent_events(result, agent_trace))
+    from travel_agent.agent.turn_analysis import TaskType, classify_task_type_rule_based
+
+    task_type = classify_task_type_rule_based(case.turns[-1]) if case.turns else None
+    require_planner = (
+        actual_outcome not in {"clarify", "negotiate_constraints", "safe_decline_action"}
+        and task_type != TaskType.ROUTE_QUERY
+    )
+    architecture = evaluate_architecture_policy(
+        variant,
+        build_agent_events(result, agent_trace),
+        require_planner=require_planner,
+    )
     gating = evaluate_gating(
         authorization=authorization,
         grounding=grounding,

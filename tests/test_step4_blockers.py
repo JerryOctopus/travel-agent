@@ -293,6 +293,7 @@ def test_v1_revision_binds_existing_itinerary_artifact():
         "修改第二天",
         task_type=TaskType.ITINERARY_REVISION,
         request_id="req_revision",
+        existing_plan_artifact_id=old_plan_id,
     )
 
     assert outcome.status == STATUS_COMPLETED

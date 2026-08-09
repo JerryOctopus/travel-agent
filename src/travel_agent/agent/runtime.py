@@ -31,6 +31,13 @@ class AgentReply:
     used_real_agent: bool = False
     clarification: bool = False
     profile: dict[str, Any] = field(default_factory=dict)
+    planner_status: str | None = None
+    recovery_state: str | None = None
+    critical_slots_matched: list[str] = field(default_factory=list)
+    failure_reason: str | None = None
+    status: str | None = None
+    plan_artifact_id: str | None = None
+    agent_trace: list[dict[str, Any]] = field(default_factory=list)
 
 
 def run_production_turn(
@@ -41,19 +48,30 @@ def run_production_turn(
     user_id: str = "default",
 ) -> AgentReply:
     """生产固定入口：固定使用 Multi-Agent Full（V3），不读取 variant。"""
+    from travel_agent.orchestration.multi_agent import PRODUCTION_CONFIG
+
+    return run_architecture_turn(
+        PRODUCTION_CONFIG, user_message, ctx, history, settings, user_id
+    )
+
+
+def run_architecture_turn(
+    capabilities: Any,
+    user_message: str,
+    ctx: SessionContext | None = None,
+    history: list[tuple[str, str]] | None = None,
+    settings: Settings | None = None,
+    user_id: str = "default",
+) -> AgentReply:
+    """Shared Production/V0--V3 lifecycle; only engine capabilities vary."""
     settings = settings or get_settings()
     ctx = ctx or build_session()
     history = history or []
+    from travel_agent.agent.turn_lifecycle import run_turn_lifecycle
 
-    if settings.llm.enabled:
-        try:
-            analysis = analyze_travel_turn(user_message, ctx, settings, history)
-            return _run_multi_agent(user_message, ctx, history, settings, analysis)
-        except Exception as exc:  # 多 Agent 路径失败时保留原有离线 fallback
-            reply = _run_fallback(user_message, ctx)
-            reply.text = f"（多 Agent 执行失败，已降级到离线兜底：{exc}）\n\n" + reply.text
-            return reply
-    return _run_fallback(user_message, ctx)
+    return run_turn_lifecycle(
+        capabilities, user_message, ctx, settings, history, user_id
+    )
 
 
 def _run_multi_agent(
@@ -80,21 +98,38 @@ def _run_multi_agent(
 
 def _reply_from_outcome(ctx: SessionContext, outcome: Any) -> AgentReply:
     """把 Engine TurnOutcome 转为产品 AgentReply。"""
-    from travel_agent.orchestration.multi_agent.schemas import STATUS_CLARIFICATION_REQUIRED
+    from travel_agent.orchestration.multi_agent.schemas import (
+        STATUS_CLARIFICATION_REQUIRED,
+        STATUS_COMPLETED,
+        STATUS_COMPLETED_WITH_WARNINGS,
+    )
 
     tool_trace = [
         name
         for result in outcome.results
         for name in (getattr(result, "tool_trace", None) or [])
     ]
+    clarification = outcome.status == STATUS_CLARIFICATION_REQUIRED
+    completed = outcome.status in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}
+    trace = (
+        (ctx.store.get(outcome.trace_artifact_id) or {}).get("items") or []
+        if outcome.trace_artifact_id
+        else []
+    )
     return AgentReply(
         text=outcome.reply,
         cards=list(outcome.cards),
         map_payload=outcome.map_payload,
         tool_trace=tool_trace,
         used_real_agent=True,
-        clarification=outcome.status == STATUS_CLARIFICATION_REQUIRED,
+        clarification=clarification,
         profile=toolkit._profile_brief(ctx.profile),
+        planner_status=("clarification" if clarification else "planned" if completed else "planner_failed"),
+        recovery_state="not_applicable",
+        failure_reason=(None if completed else "missing_slot" if clarification else "planner_failed"),
+        status=outcome.status,
+        plan_artifact_id=outcome.plan_artifact_id,
+        agent_trace=list(trace),
     )
 
 

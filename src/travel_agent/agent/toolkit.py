@@ -689,6 +689,13 @@ def plan_and_critique(
         route_estimator=ctx.provider,
         max_iters=max_iters,
     )
+    revision_directives = dict(current_task_meta().get("revision_directives") or {})
+    result = _apply_revision_directives(
+        result,
+        ranked,
+        ctx,
+        revision_directives,
+    )
     itinerary_dict = itinerary_to_dict(result.itinerary)
     original_itinerary_dict = itinerary_to_dict(result.original_itinerary)
     route_faults = _consume_provider_faults(ctx, "estimate_route")
@@ -725,6 +732,7 @@ def plan_and_critique(
             "iterations": result.iterations,
             "source_artifact_ids": [record["artifact_id"] for record in records],
             "domain_inputs": domain_inputs,
+            "revision_directives": revision_directives,
         },
     )
     return _ok(
@@ -739,6 +747,89 @@ def plan_and_critique(
             {"code": i.code, "message": i.message, "severity": i.severity}
             for i in result.critic_result.issues
         ],
+    )
+
+
+def _apply_revision_directives(
+    result: Any,
+    ranked: list[ScoredPOI],
+    ctx: SessionContext,
+    directives: dict[str, Any],
+) -> Any:
+    """Apply deterministic non-profile revisions before the plan artifact is written."""
+    indoor_days = {
+        int(day) for day in (directives.get("indoor_days") or []) if str(day).isdigit()
+    }
+    if not indoor_days:
+        return result
+
+    from dataclasses import replace
+
+    from travel_agent.critic import critique_itinerary
+
+    used_ids = {stop.poi.poi_id for day in result.itinerary.days for stop in day.stops}
+    indoor_pool = [item.poi for item in ranked if item.poi.indoor and item.poi.poi_id not in used_ids]
+    day_stops = [list(day.stops) for day in result.itinerary.days]
+    donors = [
+        (day_index, stop_index)
+        for day_index, day in enumerate(result.itinerary.days)
+        if day.day_index not in indoor_days
+        for stop_index, stop in enumerate(day.stops)
+        if stop.poi.indoor
+    ]
+    changed = False
+    days = []
+    for day_index, day in enumerate(result.itinerary.days):
+        if day.day_index not in indoor_days:
+            continue
+        stops = []
+        for stop in day_stops[day_index]:
+            if stop.poi.indoor:
+                stops.append(stop)
+                continue
+            replacement = indoor_pool.pop(0) if indoor_pool else None
+            if replacement is None and donors:
+                donor_day, donor_index = donors.pop(0)
+                donor_stop = day_stops[donor_day][donor_index]
+                replacement = donor_stop.poi
+                day_stops[donor_day][donor_index] = replace(
+                    donor_stop,
+                    poi=stop.poi,
+                    duration_min=stop.poi.estimated_duration_min,
+                    note="与指定日期的室内活动互换",
+                    route_from_previous=None,
+                )
+            if replacement is None:
+                stops.append(stop)
+                continue
+            stops.append(
+                replace(
+                    stop,
+                    poi=replacement,
+                    duration_min=replacement.estimated_duration_min,
+                    note="按本轮修改要求替换为室内活动",
+                    route_from_previous=None,
+                )
+            )
+            changed = True
+        day_stops[day_index] = stops
+    if not changed:
+        return result
+    for day_index, day in enumerate(result.itinerary.days):
+        days.append(
+            replace(
+                day,
+                stops=day_stops[day_index],
+                theme="室内活动" if day.day_index in indoor_days else day.theme,
+            )
+        )
+    itinerary = replace(result.itinerary, days=days)
+    critic_result = critique_itinerary(itinerary, ctx.profile)
+    return replace(
+        result,
+        itinerary=itinerary,
+        critic_result=critic_result,
+        revision_notes=list(result.revision_notes) + ["按要求将指定日期调整为室内活动"],
     )
 
 
@@ -904,7 +995,11 @@ def render_map(ctx: SessionContext) -> dict[str, Any]:
     )
 
 
-def _validate_plan_gate(ctx: SessionContext, plan_artifact_id: str | None) -> tuple[str, dict | None]:
+def _validate_plan_gate(
+    ctx: SessionContext,
+    plan_artifact_id: str | None,
+    allowed_agents: frozenset[str] = frozenset({"planner"}),
+) -> tuple[str, dict | None]:
     """Renderer Gate 校验：返回 (reason, record)，reason 非空即拒绝渲染。
 
     校验项：1) Artifact 存在；2) 类型为 itinerary；3) 由 planner 产出；
@@ -918,8 +1013,11 @@ def _validate_plan_gate(ctx: SessionContext, plan_artifact_id: str | None) -> tu
         return f"plan artifact 不存在: {plan_artifact_id}", None
     if record.get("kind") != "itinerary":
         return f"plan artifact 类型不是 itinerary: {record.get('kind')}", None
-    if record.get("agent") != "planner":
-        return f"plan artifact 不是 planner 产出: agent={record.get('agent')}", None
+    if record.get("agent") not in allowed_agents:
+        return (
+            "plan artifact 产出者无权渲染: "
+            f"agent={record.get('agent')}, allowed={sorted(allowed_agents)}"
+        ), None
     payload = record.get("payload") or {}
     if not isinstance(payload.get("itinerary"), dict):
         return "plan payload 缺少 itinerary，状态异常（failed）", None
@@ -931,13 +1029,14 @@ def gated_render_itinerary(
     plan_artifact_id: str | None,
     *,
     mark_incomplete: bool = False,
+    allowed_agents: frozenset[str] = frozenset({"planner"}),
 ) -> dict[str, Any]:
     """经 Renderer Gate 的行程渲染：必须绑定 planner 产出的 plan_artifact_id。
 
     ``mark_incomplete=True``（critic 未通过或存在未解决 critical 问题）时
     只能渲染 incomplete 状态，不得标记为成功行程。
     """
-    reason, record = _validate_plan_gate(ctx, plan_artifact_id)
+    reason, record = _validate_plan_gate(ctx, plan_artifact_id, allowed_agents)
     if reason:
         return _err(reason, gate_status="rejected", plan_artifact_id=plan_artifact_id)
     payload = record["payload"]
@@ -1019,9 +1118,10 @@ def gated_render_map(
     plan_artifact_id: str | None,
     *,
     mark_incomplete: bool = False,
+    allowed_agents: frozenset[str] = frozenset({"planner"}),
 ) -> dict[str, Any]:
     """经 Renderer Gate 的地图渲染：依赖完整计划时绑定同一 plan_artifact_id。"""
-    reason, record = _validate_plan_gate(ctx, plan_artifact_id)
+    reason, record = _validate_plan_gate(ctx, plan_artifact_id, allowed_agents)
     if reason:
         return _err(reason, gate_status="rejected", plan_artifact_id=plan_artifact_id)
     payload = record["payload"]

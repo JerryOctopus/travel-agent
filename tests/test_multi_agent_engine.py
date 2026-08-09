@@ -38,6 +38,7 @@ from travel_agent.orchestration.multi_agent.executor import (
     _BUDGET_SENTINEL,
     _budget_guard,
     build_subagent_executor,
+    ToolCallBudgetExceeded,
 )
 from travel_agent.orchestration.multi_agent.registry import SUBAGENT_REGISTRY
 from travel_agent.orchestration.multi_agent.review import (
@@ -445,8 +446,8 @@ def test_budget_guard_blocks_calls_over_limit():
     tool = StructuredTool.from_function(ping, name="ping", description="")
     guarded = _budget_guard(tool, max_calls=1, counter={"n": 0})
     assert guarded.func() == "ok"
-    blocked = json.loads(guarded.func())
-    assert blocked["isError"] is True and blocked["summary"] == _BUDGET_SENTINEL
+    with pytest.raises(ToolCallBudgetExceeded):
+        guarded.func()
 
 
 def _task_for(agent: str):
