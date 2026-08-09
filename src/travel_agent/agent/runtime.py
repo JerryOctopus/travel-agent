@@ -167,7 +167,6 @@ def _run_react(
 
     from travel_agent.agent.prompts import build_system_prompt
     from travel_agent.agent.tool_source import resolve_tools_async
-    from travel_agent.skills.loader import load_skills, skills_prompt_section
     from travel_agent.storage.memory_framework import MemoryFramework
     from travel_agent.storage.user_profile import UserProfileStore
 
@@ -175,8 +174,8 @@ def _run_react(
         ctx, history, user_id, settings.memory, settings.llm.enabled
     )
     skills_section = ""
-    if settings.skills.enabled:
-        skills_section = skills_prompt_section(load_skills(settings.skills.skills_dir))
+    # Architecture ablations share the stable logical ToolSource contract.
+    # Do not advertise optional skill tools that are intentionally filtered out.
 
     tools, _ = asyncio.run(resolve_tools_async(ctx, settings, user_id=user_id))
     model = _build_chat_model(settings)
