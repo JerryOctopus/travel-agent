@@ -7,6 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 from langchain_core.tools import StructuredTool
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
 from travel_agent.agent.session import ArtifactStore, RequestControl, build_session
 from travel_agent.agent.tool_source import (
@@ -20,6 +23,7 @@ from travel_agent.orchestration.meter import (
     TurnMeter,
     current_turn_meter,
     turn_meter_scope,
+    meter_callbacks,
 )
 from travel_agent.orchestration.multi_agent.engine import MultiAgentEngine
 from travel_agent.orchestration.multi_agent.schemas import (
@@ -78,6 +82,53 @@ def test_turn_meter_blocks_before_call_and_charges_missing_usage_conservatively(
     with pytest.raises(TurnBudgetExhausted):
         tool_meter.begin_tool("worker:hotel")
     assert tool_meter.snapshot()["totals"]["tool_calls"] == 1
+
+
+def test_langchain_callbacks_count_roles_and_block_provider_before_generate() -> None:
+    class UsageModel(BaseChatModel):
+        generated: int = 0
+
+        @property
+        def _llm_type(self) -> str:
+            return "usage-test"
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            self.generated += 1
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="ok",
+                            usage_metadata={
+                                "input_tokens": 4,
+                                "output_tokens": 2,
+                                "total_tokens": 6,
+                            },
+                        )
+                    )
+                ]
+            )
+
+    model = UsageModel()
+    meter = TurnMeter("req-callback")
+    with turn_meter_scope(meter):
+        for role in ("v0_main", "orchestrator", "worker:hotel", "planner", "reviewer"):
+            model.invoke([HumanMessage(content="x")], config={"callbacks": meter_callbacks(role)})
+    assert model.generated == 5
+    assert meter.snapshot()["totals"]["total_tokens"] == 30
+    assert all(
+        meter.snapshot()["roles"][role]["llm_calls"] == 1
+        for role in ("v0_main", "orchestrator", "worker:hotel", "planner", "reviewer")
+    )
+
+    blocked = UsageModel()
+    hard = TurnMeter("req-hard", token_budget=1)
+    with turn_meter_scope(hard), pytest.raises(TurnBudgetExhausted):
+        blocked.invoke(
+            [HumanMessage(content="this input is definitely larger than one token")],
+            config={"callbacks": meter_callbacks("v0_main")},
+        )
+    assert blocked.generated == 0
 
 
 def test_artifact_store_never_exposes_or_accepts_mutable_aliases() -> None:
