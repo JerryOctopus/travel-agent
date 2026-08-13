@@ -25,6 +25,11 @@ from travel_agent.harness.product import (
     wilson_interval,
     write_product_run,
 )
+from travel_agent.harness.long_horizon import (
+    DEFAULT_LONG_HORIZON_CASES,
+    run_long_horizon_suite,
+    validate_long_horizon_dataset,
+)
 
 __all__ = [
     "AgentHarness",
@@ -48,4 +53,7 @@ __all__ = [
     "validate_product_dataset",
     "wilson_interval",
     "write_product_run",
+    "DEFAULT_LONG_HORIZON_CASES",
+    "run_long_horizon_suite",
+    "validate_long_horizon_dataset",
 ]

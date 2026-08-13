@@ -4,8 +4,22 @@ from typing import Any
 
 from travel_agent.evaluation.plan_eval import evaluate_plan_artifact
 from travel_agent.harness.cases import HarnessCase
-from travel_agent.harness.production_evaluators import evaluate_production_case
+from travel_agent.harness.production_evaluators import (
+    build_structured_state,
+    evaluate_constraints_tree,
+    evaluate_production_case,
+)
 from travel_agent.harness.result import HarnessCaseResult
+
+
+_TOOL_NAME_ALIASES = {
+    "poi_search": "search_poi",
+    "route_planning": "plan_route",
+}
+
+
+def _canonical_tool_name(name: str) -> str:
+    return _TOOL_NAME_ALIASES.get(name, name)
 
 
 def validate_case_result(
@@ -25,14 +39,23 @@ def validate_case_result(
         supporting_artifacts=final_artifacts,
     )
     tool_trace = last.tool_trace if last else []
-    all_tool_trace = [name for turn in result.turns for name in turn.tool_trace]
+    all_tool_trace = [
+        _canonical_tool_name(name) for turn in result.turns for name in turn.tool_trace
+    ]
     all_tool_calls = [call for turn in result.turns for call in turn.tool_calls]
-    expected_tools = list(dict.fromkeys(case.required_tools or case.expected_tools))
+    expected_tools = list(
+        dict.fromkeys(
+            _canonical_tool_name(name)
+            for name in (case.required_tools or case.expected_tools)
+        )
+    )
     required_hits = sum(tool in all_tool_trace for tool in expected_tools)
-    forbidden_hits = sum(tool in all_tool_trace for tool in case.forbidden_tools)
+    forbidden_tools = {_canonical_tool_name(name) for name in case.forbidden_tools}
+    forbidden_hits = sum(tool in all_tool_trace for tool in forbidden_tools)
     selected = set(all_tool_trace)
-    allowed = set(case.allowed_tools) | set(expected_tools)
-    unexpected = selected - allowed if allowed else set()
+    allowed = {_canonical_tool_name(name) for name in case.allowed_tools} | set(expected_tools)
+    # required_tools is a minimum coverage contract, not an exhaustive allowlist.
+    unexpected = selected - allowed if case.allowed_tools else set()
     argument_results = [
         _validate_tool_argument(assertion, all_tool_calls)
         for assertion in case.tool_argument_assertions
@@ -41,20 +64,25 @@ def validate_case_result(
         _validate_memory_assertion(assertion, result)
         for assertion in case.expected_memory
     ]
+    turn_state_results = _validate_turn_expectations(case, result)
     reply_text = last.reply_text if last else ""
+    # Production-v1 behaviors are semantic rubric descriptions, not literal
+    # answer substrings.  Dedicated production evaluators below score those
+    # contracts; keep the legacy substring check only for legacy cases.
     required_behaviors_ok = (
         None
-        if not case.required_behaviors
+        if not case.required_behaviors or case.gold_outcome
         else all(text in reply_text for text in case.required_behaviors)
     )
+    structured_state = build_structured_state(result)
     hard_annotation_results = [
-        _matches_annotation(result.final_profile.get(field), expected)
+        _matches_annotation(structured_state.get(field), expected)
         for field, expected in case.hard_constraints.items()
     ]
     soft_annotation_results = [
-        _matches_annotation(result.final_profile.get(field), expected)
+        _matches_annotation(structured_state.get(field), expected)
         for field, expected in case.soft_preferences.items()
-        if field in result.final_profile
+        if field in structured_state
     ]
     metrics = {
         "city_ok": _opt_eq(result.final_profile.get("destination"), case.expected_city),
@@ -84,10 +112,22 @@ def validate_case_result(
         "required_behaviors_ok": required_behaviors_ok,
         "forbidden_behaviors_ok": (
             None
-            if not case.forbidden_behaviors
+            if not case.forbidden_behaviors or case.gold_outcome
             else all(text not in reply_text for text in case.forbidden_behaviors)
         ),
         "memory_ok": None if not memory_results else all(memory_results),
+        "turn_state_ok": (
+            None if not turn_state_results else all(item["passed"] for item in turn_state_results)
+        ),
+        "turn_state_accuracy": (
+            None
+            if not turn_state_results
+            else round(
+                sum(item["score"] for item in turn_state_results) / len(turn_state_results),
+                4,
+            )
+        ),
+        "turn_state_results": turn_state_results,
         "hard_constraints_annotation_ok": (
             None if not hard_annotation_results else all(hard_annotation_results)
         ),
@@ -160,9 +200,11 @@ def _validate_tool_argument(
     assertion: dict[str, Any],
     calls: list[dict[str, Any]],
 ) -> bool:
-    tool = assertion.get("tool")
+    tool = _canonical_tool_name(str(assertion.get("tool") or ""))
     argument = assertion.get("argument") or assertion.get("arg")
-    candidates = [call for call in calls if call.get("name") == tool]
+    candidates = [
+        call for call in calls if _canonical_tool_name(str(call.get("name") or "")) == tool
+    ]
     if not candidates or not argument:
         return False
     expected = assertion.get("value")
@@ -208,6 +250,52 @@ def _validate_memory_assertion(
     if operation == "count_lte":
         return isinstance(target, list) and len(target) <= int(expected)
     return False
+
+
+def _validate_turn_expectations(
+    case: HarnessCase,
+    result: HarnessCaseResult,
+) -> list[dict[str, Any]]:
+    """Score partial constraint trees against the state captured after each turn."""
+    scored: list[dict[str, Any]] = []
+    for item in case.turn_expectations:
+        turn_number = int(item.get("turn") or 0)
+        constraints = dict(item.get("constraints") or {})
+        if turn_number < 1 or turn_number > len(result.turns) or not constraints:
+            scored.append(
+                {
+                    "turn": turn_number,
+                    "passed": False,
+                    "score": 0.0,
+                    "missing_or_mismatched": [
+                        {"path": "", "expected": constraints, "actual": None}
+                    ],
+                }
+            )
+            continue
+        turn = result.turns[turn_number - 1]
+        prefix_result = HarnessCaseResult(
+            case_id=result.case_id,
+            turns=result.turns[:turn_number],
+            final_profile=turn.profile,
+            final_artifacts=turn.artifacts,
+        )
+        checkpoint_case = HarnessCase(
+            case_id=f"{case.case_id}__turn_{turn_number}",
+            turns=case.turns[:turn_number],
+            gold_constraints_tree=constraints,
+        )
+        state = build_structured_state(prefix_result)
+        evaluation = evaluate_constraints_tree(checkpoint_case, state)
+        scored.append(
+            {
+                "turn": turn_number,
+                "passed": evaluation["score"] == 1.0,
+                "score": evaluation["score"],
+                "missing_or_mismatched": evaluation["missing_or_mismatched"],
+            }
+        )
+    return scored
 
 
 def _matches_annotation(actual: Any, expected: Any) -> bool:

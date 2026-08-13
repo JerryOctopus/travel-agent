@@ -38,5 +38,34 @@
     "id": "missing_city_and_days",
     "query": "我想轻松一点，喜欢自然和美食",
     "expected_clarification": true
+  },
+  {
+    "id": "greeting_no_plan",
+    "query": "你好",
+    "expected_clarification": false,
+    "expect_no_itinerary": true
+  },
+  {
+    "id": "destination_only_asks_days",
+    "query": "我想去日本",
+    "expected_city": "日本",
+    "expected_clarification": true,
+    "expect_no_itinerary": true
+  },
+  {
+    "id": "destination_days_asks_preferences",
+    "query": "帮我规划杭州三天",
+    "expected_city": "杭州",
+    "expected_days": 3,
+    "expected_clarification": true,
+    "expected_tool": "request_preference_guide",
+    "expect_no_itinerary": true
+  },
+  {
+    "id": "skip_preferences_plans",
+    "query": "杭州三天随便",
+    "expected_city": "杭州",
+    "expected_days": 3,
+    "expected_clarification": false
   }
 ]

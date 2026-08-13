@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 
 BudgetLevel = Literal["low", "mid", "high"]
@@ -24,6 +24,9 @@ class POI:
     price_level: str  # 价格等级
     indoor: bool = False  # 是否室内
     opening_hours: str | None = None  # 开放时间
+    address: str | None = None  # 工具返回的地址（未返回时保持未知）
+    average_cost: float | None = None  # 工具返回的人均消费
+    parking_type: str | None = None  # 工具返回的停车信息
     source: str = "seed"  # 数据来源
 
 
@@ -43,6 +46,10 @@ class TravelProfile:
     must_visit: list[str] = field(default_factory=list)  # 必去地点
     avoid: list[str] = field(default_factory=list)  # 避开地点或偏好
     transport_mode: TransportMode = "public_transport"  # 交通方式
+    # Open, structured constraint state for requirements that do not fit the
+    # compact recommendation profile (deadlines, accessibility, fixed events,
+    # route scope, per-day limits, and similar product constraints).
+    constraint_state: dict[str, Any] = field(default_factory=dict)
 
     def missing_required_fields(self) -> list[str]:
         missing = []
@@ -121,6 +128,7 @@ class RouteInfo:
     duration_min: int  # 预计通勤时间（分钟）
     mode: TransportMode  # 交通方式
     source: str = "haversine_estimate"  # 来源
+    walking_distance_km: float | None = None  # 公交方案内/步行路线的步行距离
 
 
 @dataclass(frozen=True)

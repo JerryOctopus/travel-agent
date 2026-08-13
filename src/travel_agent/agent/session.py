@@ -346,6 +346,7 @@ class SessionContext:
     pending_preference_observations: list[dict[str, str]] = field(default_factory=list)
     evaluation_trace_enabled: bool = False
     evaluation_trace: list[dict] = field(default_factory=list)
+    reference_datetime: str | None = None
     request_control: RequestControl | None = field(default=None, repr=False)
     _state_lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False, compare=False
@@ -379,6 +380,7 @@ class SessionContext:
             ),
             evaluation_trace_enabled=self.evaluation_trace_enabled,
             evaluation_trace=copy.deepcopy(self.evaluation_trace),
+            reference_datetime=self.reference_datetime,
             request_control=active_control,
         )
 

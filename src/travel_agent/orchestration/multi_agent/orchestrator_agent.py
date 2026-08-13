@@ -1,21 +1,17 @@
-"""V2/V3 动态 Main Orchestrator（Step 3）。
-
-- Orchestrator 是 ReAct agent，工具面只有 ``ORCHESTRATOR_ALLOWED_TOOLS``
-  中的编排/交互工具 + ``dispatch_subagent``（业务重工具物理不可见）；
-- ``dispatch_subagent`` 不加 session 锁（Step 2 锁隔离机制自动生效）；
-- 每次派工的结构化 ``SubagentResult`` 由闭包收集，Engine 聚合消费
-  payload / evidence，而非只拼接 summary；
-- 渲染不在 Orchestrator 内发生：由 Engine 在 Reviewer 之后经 Renderer
-  Gate 统一执行（见 render_gate.py）。
-"""
+"""Bounded, one-call-per-wave dynamic Router for V2/V3."""
 
 from __future__ import annotations
 
+import contextvars
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import asdict, dataclass, field
+import hashlib
+import json
+import re
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import StructuredTool
-from langgraph.prebuilt import create_react_agent
 
 from travel_agent.orchestration.multi_agent.orchestrator import (
     DispatchLedger,
@@ -24,85 +20,358 @@ from travel_agent.orchestration.multi_agent.orchestrator import (
     filter_orchestrator_tools,
 )
 from travel_agent.orchestration.multi_agent.registry import list_subagents
-from travel_agent.orchestration.multi_agent.runner import SubagentRunner
+from travel_agent.orchestration.multi_agent.schemas import SubagentResult
 
-_ORCHESTRATOR_PROMPT_TEMPLATE = """你是旅行规划 Main Orchestrator，只做编排，不做具体调研与规划。
-职责：需求澄清、任务拆分、动态派工、聚合结构化结果、给出最终回复。
+DOMAIN_AGENTS = frozenset({"attraction", "hotel", "restaurant", "transport"})
+ROUTER_MAX_OUTPUT_TOKENS = 768
 
-可用 Subagent（通过 dispatch_subagent 派工）：
+_ROUTER_PROMPT_TEMPLATE = """你是旅行规划 Router。你每次只决定一个执行 wave，不做调研、不写行程。
+
+可派发领域：
 {subagents}
 
-派工纪律：
-1. 路线问题 → transport；餐厅问题 → restaurant；酒店区域比较 → hotel + transport；
-   完整行程 → 先派必要领域 Subagent，再派 planner；不要派不需要的 Subagent；
-2. 有依赖的任务等上游返回后再派，并在 inputs.artifact_ids 里带上上游证据的 artifact_id；
-3. 信息不足（目的地/天数缺失）时调用 request_travel_info 向用户追问，不要猜测派工；
-4. 消费 Subagent 返回的 payload / evidence / warnings / unresolved 做决策，
-   不要只依赖自然语言 summary；
-5. planner 成功返回后直接总结回复；渲染由系统自动完成，不要描述卡片细节。
-禁止：编造景点/酒店/路线事实；跳过 planner 直接给出完整行程。"""
+规则：
+1. 只能派 attraction、hotel、restaurant、transport；绝不能派 planner/reviewer/repair。
+2. tasks 必须是当前 wave 可并行启动的任务；依赖既有结果时填写 depends_on task_id。
+   完整行程的 transport 若需要景点候选 poi_id，不能与 attraction 在同一 wave 猜测执行，
+   应等待候选 artifact 后作为后续 delta task；只有起终点已明确时才可独立并行。
+3. 不重复 attempted_objectives 中已完成的目标；已有 evidence 足够时返回 ready=true、tasks=[]。
+4. Wave 1 最多四个独立任务；后续 wave 只返回缺失 hard evidence 所需的 delta tasks。
+5. 信息不足以安全派工时 clarification=true，不猜测目的地或天数。
+6. 只输出 JSON，不输出 markdown。格式：
+{{"ready": false, "clarification": false, "reply": "", "missing_evidence": [],
+  "reason": "", "tasks": [{{"agent": "attraction", "instruction": "...",
+  "objective": "...", "depends_on": []}}]}}
+"""
+
+
+@dataclass(frozen=True)
+class RoutingTask:
+    agent: str
+    instruction: str
+    objective: str
+    depends_on: tuple[str, ...] = ()
+
+    @property
+    def objective_key(self) -> str:
+        normalized = re.sub(r"\s+", " ", self.objective or self.instruction).strip().casefold()
+        return f"{self.agent}:{normalized}"
+
+
+@dataclass(frozen=True)
+class RoutingDecision:
+    tasks: tuple[RoutingTask, ...] = ()
+    ready: bool = False
+    clarification: bool = False
+    missing_evidence: tuple[str, ...] = ()
+    reason: str = ""
+    reply: str = ""
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "tasks": [asdict(task) for task in self.tasks],
+        }
 
 
 def build_orchestrator_prompt() -> str:
     lines = "\n".join(
-        f"- {definition.name}: {definition.description}" for definition in list_subagents()
+        f"- {definition.name}: {definition.description}"
+        for definition in list_subagents()
+        if definition.name in DOMAIN_AGENTS
     )
-    return _ORCHESTRATOR_PROMPT_TEMPLATE.format(subagents=lines)
+    return _ROUTER_PROMPT_TEMPLATE.format(subagents=lines)
 
 
+def routing_policy_hash(settings: Any) -> str:
+    llm = getattr(settings, "llm", None)
+    orch = getattr(settings, "orchestration", None)
+    policy = {
+        "prompt": build_orchestrator_prompt(),
+        "schema": {
+            "agents": sorted(DOMAIN_AGENTS),
+            "response_format": "json_object",
+            "max_output_tokens": ROUTER_MAX_OUTPUT_TOKENS,
+            "fields": [
+                "ready",
+                "clarification",
+                "reply",
+                "missing_evidence",
+                "reason",
+                "tasks.agent",
+                "tasks.instruction",
+                "tasks.objective",
+                "tasks.depends_on",
+            ],
+        },
+        "model": {
+            "provider": getattr(llm, "provider", ""),
+            "model": getattr(llm, "model", ""),
+            "temperature": getattr(llm, "temperature", None),
+            "thinking_enabled": getattr(llm, "thinking_enabled", None),
+        },
+        "budgets": {
+            name: getattr(orch, name, None)
+            for name in (
+                "variant_token_budget",
+                "variant_llm_call_budget",
+                "variant_tool_call_budget",
+                "base_timeout_seconds",
+                "planner_reserve_seconds",
+                "reviewer_reserve_seconds",
+                "router_timeout_seconds",
+                "router_useful_seconds",
+                "worker_timeout_seconds",
+                "planner_timeout_seconds",
+                "worker_max_output_tokens",
+                "planner_max_output_tokens",
+                "reviewer_max_output_tokens",
+                "recovery_worker_useful_seconds",
+                "admission_guard_seconds",
+                "routing_max_waves",
+                "routing_max_calls",
+                "routing_max_dispatches",
+                "routing_wave1_max_tasks",
+            )
+        },
+    }
+    encoded = json.dumps(policy, ensure_ascii=False, sort_keys=True, default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()[:20]
+
+
+def route_wave(
+    ctx: Any,
+    settings: Any,
+    user_message: str,
+    request_id: str,
+    *,
+    wave: int,
+    model: Any | None = None,
+    history: list[tuple[str, str]] | None = None,
+    task_type: Any | None = None,
+    turn_inputs: dict[str, Any] | None = None,
+    compact_results: list[dict[str, Any]] | None = None,
+    attempted_objectives: list[str] | None = None,
+    missing_evidence: list[str] | None = None,
+    timeout_seconds: float,
+    max_tasks: int,
+) -> RoutingDecision:
+    """Make exactly one bounded model call and return a validated wave decision."""
+    del request_id  # identity remains in trace; Router receives no mutable store handle
+    if timeout_seconds <= 0:
+        return RoutingDecision(error="router admission denied: no usable pre-planner time")
+
+    active_model = model
+    if active_model is None:
+        llm = getattr(settings, "llm", None)
+        if llm is None or not getattr(llm, "enabled", False):
+            return RoutingDecision(error="LLM disabled: router unavailable")
+        from travel_agent.agent.runtime import _build_chat_model
+
+        active_model = _build_chat_model(
+            settings,
+            timeout_seconds=timeout_seconds,
+            max_retries=0,
+        )
+
+    snapshot = {
+        "wave": wave,
+        "task_type": getattr(task_type, "value", task_type) or "unknown",
+        "request": user_message,
+        "turn_inputs": turn_inputs or {},
+        "history": list(history or [])[-4:],
+        "compact_results": compact_results or [],
+        "attempted_objectives": attempted_objectives or [],
+        "engine_missing_hard_evidence": missing_evidence or [],
+        "max_tasks": max_tasks,
+    }
+    messages = [
+        SystemMessage(content=build_orchestrator_prompt()),
+        HumanMessage(
+            content="本轮 Router snapshot（JSON）：\n"
+            + json.dumps(snapshot, ensure_ascii=False, default=str)
+        ),
+    ]
+    from travel_agent.orchestration.meter import meter_callbacks
+
+    def invoke() -> Any:
+        bounded = active_model.bind(
+            max_tokens=ROUTER_MAX_OUTPUT_TOKENS,
+            response_format={"type": "json_object"},
+        )
+        callbacks = meter_callbacks("orchestrator")
+        if ctx is not None and getattr(ctx, "evaluation_trace_enabled", False):
+            from travel_agent.agent.evaluation_trace import EvaluationTraceCallback
+
+            callbacks.append(
+                EvaluationTraceCallback(
+                    ctx.evaluation_trace,
+                    model=getattr(settings.llm, "model", ""),
+                    phase=f"router_wave_{wave}",
+                )
+            )
+        return bounded.invoke(messages, config={"callbacks": callbacks})
+
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"router-wave-{wave}")
+    future = pool.submit(contextvars.copy_context().run, invoke)
+    try:
+        response = future.result(timeout=timeout_seconds)
+    except FutureTimeoutError:
+        future.cancel()
+        from travel_agent.orchestration.meter import current_turn_meter
+
+        meter = current_turn_meter()
+        if meter is not None:
+            meter.fail_pending_llm(
+                "orchestrator", f"router timeout after {timeout_seconds:g}s"
+            )
+        return RoutingDecision(error=f"router timeout after {timeout_seconds:g}s")
+    except Exception as exc:  # noqa: BLE001
+        return RoutingDecision(error=f"{type(exc).__name__}: {exc}")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    raw = _response_payload(response)
+    return _parse_decision(raw, max_tasks=max_tasks)
+
+
+def _response_payload(response: Any) -> dict[str, Any]:
+    content = getattr(response, "content", "")
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, list):
+        content = "".join(
+            str(item.get("text") or "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    parsed = _extract_json(str(content or ""))
+    if parsed:
+        return parsed
+    # Compatibility with scripted tool-call fakes: consume only this single
+    # response; never enter a ReAct loop.
+    tool_calls = getattr(response, "tool_calls", None) or []
+    tasks = []
+    clarification = False
+    for call in tool_calls:
+        if call.get("name") == "request_travel_info":
+            clarification = True
+            continue
+        if call.get("name") != "dispatch_subagent":
+            continue
+        args = call.get("args") or {}
+        tasks.append(
+            {
+                "agent": args.get("agent"),
+                "instruction": args.get("instruction"),
+                "objective": args.get("objective") or args.get("instruction"),
+                "depends_on": args.get("depends_on") or [],
+            }
+        )
+    return {"tasks": tasks, "clarification": clarification, "ready": not tasks}
+
+
+def _extract_json(text: str) -> dict[str, Any]:
+    candidate = text.strip()
+    if "```" in candidate:
+        for part in candidate.split("```"):
+            stripped = part.strip()
+            if stripped.startswith("json"):
+                stripped = stripped[4:].strip()
+            if stripped.startswith("{"):
+                candidate = stripped
+                break
+    start, end = candidate.find("{"), candidate.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        parsed = json.loads(candidate[start : end + 1])
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _parse_decision(raw: dict[str, Any], *, max_tasks: int) -> RoutingDecision:
+    if not raw:
+        return RoutingDecision(error="router returned no JSON decision")
+    tasks: list[RoutingTask] = []
+    seen: set[str] = set()
+    for item in raw.get("tasks") or []:
+        if not isinstance(item, dict):
+            continue
+        agent = str(item.get("agent") or "").strip().lower()
+        instruction = str(item.get("instruction") or "").strip()
+        objective = str(item.get("objective") or instruction).strip()
+        if agent not in DOMAIN_AGENTS or not instruction or not objective:
+            continue
+        task = RoutingTask(
+            agent=agent,
+            instruction=instruction,
+            objective=objective,
+            depends_on=tuple(str(value) for value in (item.get("depends_on") or []) if value),
+        )
+        if task.objective_key in seen:
+            continue
+        seen.add(task.objective_key)
+        tasks.append(task)
+        if len(tasks) >= max(0, max_tasks):
+            break
+    return RoutingDecision(
+        tasks=tuple(tasks),
+        ready=bool(raw.get("ready")),
+        clarification=bool(raw.get("clarification")),
+        missing_evidence=tuple(str(value) for value in (raw.get("missing_evidence") or []) if value),
+        reason=str(raw.get("reason") or ""),
+        reply=str(raw.get("reply") or ""),
+    )
+
+
+# Compatibility helpers for local unit tests and external imports. Production
+# dynamic execution uses route_wave + Engine-owned wave execution.
 def build_orchestrator_tools(
-    runner: SubagentRunner,
+    runner: Any,
     ctx: Any,
     settings: Any,
     request_id: str,
     results_sink: list | None = None,
     ledger: DispatchLedger | None = None,
     base_inputs: dict[str, Any] | None = None,
+    task_type: Any | None = None,
 ) -> tuple[list[Any], list]:
-    """构建 Orchestrator 工具面；返回 (tools, results_sink)。
-
-    results_sink 收集每次 dispatch 的 SubagentResult，供 Engine 聚合。
-    """
     from travel_agent.agent.tool_source import resolve_tools
 
+    del task_type
     sink = results_sink if results_sink is not None else []
     all_tools, _source = resolve_tools(ctx, settings)
-    # render 工具不暴露给 Orchestrator：渲染必须经 Engine 的 Renderer Gate。
     allowed = ORCHESTRATOR_ALLOWED_TOOLS - {"render_itinerary", "render_map"}
     base_tools = [tool for tool in filter_orchestrator_tools(all_tools) if tool.name in allowed]
-
-    dispatch_fn = build_dispatch_tool(
+    dispatch = build_dispatch_tool(
         runner,
         request_id=request_id,
         ledger=ledger,
         base_inputs=base_inputs,
     )
 
-    def _collecting_dispatch(
-        agent: str,
-        instruction: str,
-        inputs: dict | None = None,
-        depends_on: list | None = None,
-    ) -> str:
-        raw = dispatch_fn(agent, instruction, inputs, depends_on)
-        import json
+    def collect(agent: str, instruction: str, inputs=None, depends_on=None) -> str:
+        parsed = json.loads(dispatch(agent, instruction, inputs, depends_on))
+        sink.append(parsed)
+        compact = {
+            key: parsed.get(key)
+            for key in (
+                "request_id", "task_id", "agent", "status", "attempt", "summary",
+                "evidence", "warnings", "unresolved", "error",
+            )
+            if parsed.get(key) not in (None, "", [], {})
+        }
+        return json.dumps(compact, ensure_ascii=False, default=str)
 
-        try:
-            sink.append(json.loads(raw))
-        except json.JSONDecodeError:
-            pass
-        return raw
-
-    dispatch_tool = StructuredTool.from_function(
-        _collecting_dispatch,
-        name="dispatch_subagent",
-        description=(
-            "派工给领域 Subagent。参数：agent（attraction|hotel|restaurant|transport|planner）、"
-            "instruction（任务描述）、inputs（可选，含 artifact_ids 上游证据）、"
-            "depends_on（可选上游 task_id 列表）。返回结构化 JSON 结果。"
-        ),
-    )
-    return base_tools + [dispatch_tool], sink
+    return base_tools + [
+        StructuredTool.from_function(
+            collect,
+            name="dispatch_subagent",
+            description="Compatibility one-shot domain dispatch tool.",
+        )
+    ], sink
 
 
 def run_orchestrator(
@@ -111,70 +380,52 @@ def run_orchestrator(
     user_message: str,
     request_id: str,
     *,
-    runner: SubagentRunner,
+    runner: Any,
     model: Any | None = None,
     results_sink: list | None = None,
     history: list[tuple[str, str]] | None = None,
     task_type: Any | None = None,
     turn_inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """运行动态 Orchestrator 一轮，返回 {reply, tool_trace, results, clarification}。"""
-    active_model = model
-    if active_model is None:
-        if not settings.llm.enabled:
-            raise RuntimeError("LLM disabled: orchestrator unavailable")
-        from travel_agent.agent.runtime import _build_chat_model
-
-        active_model = _build_chat_model(settings)
-
-    ledger = DispatchLedger()
-    tools, sink = build_orchestrator_tools(
-        runner,
+    """Deprecated one-wave adapter; it never performs iterative routing."""
+    timeout = float(getattr(getattr(settings, "orchestration", None), "router_timeout_seconds", 20) or 20)
+    decision = route_wave(
         ctx,
         settings,
+        user_message,
         request_id,
-        results_sink,
-        ledger=ledger,
-        base_inputs=turn_inputs,
+        wave=1,
+        model=model,
+        history=history,
+        task_type=task_type,
+        turn_inputs=turn_inputs,
+        timeout_seconds=timeout,
+        max_tasks=4,
     )
-    agent = create_react_agent(active_model, tools)
-    context_lines = [f"本轮任务类型：{getattr(task_type, 'value', task_type) or 'unknown'}"]
-    if turn_inputs:
-        import json
-
-        context_lines.append(
-            "本轮显式输入：" + json.dumps(turn_inputs, ensure_ascii=False, default=str)
+    sink = results_sink if results_sink is not None else []
+    ledger = DispatchLedger()
+    if decision.tasks:
+        dispatch = build_dispatch_tool(
+            runner, request_id=request_id, ledger=ledger, base_inputs=turn_inputs
         )
-    messages: list[Any] = [SystemMessage(content=build_orchestrator_prompt())]
-    for role, content in (history or [])[-8:]:
-        messages.append(AIMessage(content=content) if role == "assistant" else HumanMessage(content=content))
-    messages.append(HumanMessage(content="\n".join(context_lines) + "\n当前请求：" + user_message))
-    from travel_agent.orchestration.meter import meter_callbacks
-
-    state = agent.invoke(
-        {"messages": messages},
-        config={
-            "recursion_limit": max(settings.agent.recursion_limit, 24),
-            "callbacks": meter_callbacks("orchestrator"),
-        },
-    )
-    out_messages = state.get("messages", [])
-    tool_trace = [
-        call["name"]
-        for msg in out_messages
-        if isinstance(msg, AIMessage)
-        for call in (getattr(msg, "tool_calls", None) or [])
-    ]
-    reply = ""
-    for msg in reversed(out_messages):
-        if isinstance(msg, AIMessage) and isinstance(msg.content, str) and msg.content.strip():
-            reply = msg.content.strip()
-            break
-    clarification = "request_travel_info" in tool_trace
+        with ThreadPoolExecutor(max_workers=len(decision.tasks)) as pool:
+            futures = [
+                pool.submit(
+                    contextvars.copy_context().run,
+                    dispatch,
+                    task.agent,
+                    task.instruction,
+                    None,
+                    list(task.depends_on),
+                )
+                for task in decision.tasks
+            ]
+            sink.extend(json.loads(future.result()) for future in futures)
     return {
-        "reply": reply,
-        "tool_trace": tool_trace,
+        "reply": decision.reply or ("领域调研已完成。" if sink else ""),
+        "tool_trace": ["dispatch_subagent"] if sink else [],
         "results": sink,
-        "clarification": clarification,
+        "clarification": decision.clarification,
         "dispatch_ledger": ledger,
+        "routing_decision": decision.to_dict(),
     }

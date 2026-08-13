@@ -1,7 +1,7 @@
 """V0–V3 架构消融评测：同一模型/工具/数据/测试集/预算边界下对比四种架构。
 
 实验设计见 docs/ABLATION_V0_V3.md；数据集与三阶段执行规程见
-docs/EVALUATION_PRODUCT.md（production_v1 180 条）。本脚本：
+docs/EVALUATION_PRODUCT.md（production_v1.1 192 条）。本脚本：
 
 1. 对每个 variant（默认 v0,v1,v2,v3）用同一模型与同一 production_v1 split
    各跑一遍（复用 harness.product 的评测机器，主指标 strict_task_success）；
@@ -16,9 +16,9 @@ docs/EVALUATION_PRODUCT.md（production_v1 180 条）。本脚本：
    （Pass@1、Pass³、硬约束稳定满足率、工具轨迹稳定性、输出波动）。
 
 用法示例：
-    # 开发调优（默认 dev 30 条，可反复跑；冒烟加 --limit 3）
+    # 开发调优（默认 dev 34 条，可反复跑；冒烟加 --limit 3）
     python scripts/eval_ablation.py --variants v0,v1,v2,v3 --product-split dev
-    # 阶段一：四版本正式对比（core_frozen 与 challenge_frozen 各跑一次，合计 480 次）
+    # 阶段一：四版本正式对比（core_frozen 与 challenge_frozen 合计 512 次）
     python scripts/eval_ablation.py --product-split core_frozen
     python scripts/eval_ablation.py --product-split challenge_frozen
     # 阶段二：最终版本跑影子集（单 variant 才允许，30 次）
@@ -59,12 +59,12 @@ SPLIT_CHOICES = ["dev", "core_frozen", "challenge_frozen", "shadow_frozen", "all
 CORE_TRACE_STEPS = ("search_poi", "plan_route", "estimate_budget", "plan_and_critique")
 # 三阶段执行计划（正常环境总执行次数口径）。
 EXECUTION_PLAN = {
-    "stage1_four_versions": "120 cases (core 90 + challenge 30) x 4 versions = 480",
+    "stage1_four_versions": "128 cases (core 94 + challenge 34) x 4 versions = 512",
     "stage2_shadow": "30 shadow cases x 1 final version = 30",
     "stage3_stability": "60 cases x 2 extra repeats = 120 (first pass included in stage 1)",
-    "total_normal_runs": 630,
-    "final_version_runs": 270,
-    "independent_frozen_tasks": 150,
+    "total_normal_runs": 662,
+    "final_version_runs": 278,
+    "independent_frozen_tasks": 158,
 }
 
 
@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="dev",
         choices=SPLIT_CHOICES,
         help=(
-            "dev=30条调优集（可反复跑）；core/challenge_frozen=定版集（禁止回流调优）；"
+            "dev=34条调优集（可反复跑）；core/challenge_frozen=定版集（禁止回流调优）；"
             "shadow_frozen=影子集，仅允许单 variant（不参与版本选择）。"
         ),
     )

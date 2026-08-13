@@ -2,7 +2,7 @@
 
 这是本项目的四版本对照实验模块。唯一自变量是 Agent 编排架构（由
 ``EngineCapabilities`` 表达）；主模型、工具集、工具数据、测试集
-（production_v1 180 条）、Token 硬上限与基础业务规则在四个版本间完全共享。
+（production_v1.1 192 条）、Token 硬上限与基础业务规则在四个版本间完全共享。
 完整实验设计见 ``docs/ABLATION_V0_V3.md``。
 
 四个版本共用同一个 ``MultiAgentEngine``（见 ``orchestration.multi_agent``）：

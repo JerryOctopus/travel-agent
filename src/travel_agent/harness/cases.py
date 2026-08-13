@@ -34,6 +34,8 @@ class HarnessCase:
     hard_constraints: dict[str, Any] = field(default_factory=dict)
     soft_preferences: dict[str, Any] = field(default_factory=dict)
     expected_memory: list[dict[str, Any]] = field(default_factory=list)
+    # Partial state assertions evaluated after specific user turns.
+    turn_expectations: list[dict[str, Any]] = field(default_factory=list)
     required_behaviors: list[str] = field(default_factory=list)
     forbidden_behaviors: list[str] = field(default_factory=list)
     failure_injection: dict[str, Any] = field(default_factory=dict)
@@ -89,6 +91,7 @@ class HarnessCase:
             required_behaviors=list(gold.get("required_behaviors") or []),
             forbidden_behaviors=list(gold.get("forbidden_behaviors") or []),
             hard_constraints=dict(constraints_tree),
+            turn_expectations=list(data.get("turn_expectations") or []),
             snapshot_date=str(data.get("reference_datetime") or "") or None,
             metadata={key: value for key, value in metadata.items() if value is not None},
             gold_outcome=str(gold.get("expected_outcome") or "") or None,
@@ -140,6 +143,7 @@ class HarnessCase:
             "hard_constraints",
             "soft_preferences",
             "expected_memory",
+            "turn_expectations",
             "required_behaviors",
             "forbidden_behaviors",
             "failure_injection",
@@ -170,6 +174,7 @@ class HarnessCase:
             hard_constraints=dict(data.get("hard_constraints") or {}),
             soft_preferences=dict(data.get("soft_preferences") or {}),
             expected_memory=list(data.get("expected_memory") or []),
+            turn_expectations=list(data.get("turn_expectations") or []),
             required_behaviors=list(data.get("required_behaviors") or []),
             forbidden_behaviors=list(data.get("forbidden_behaviors") or []),
             failure_injection=dict(data.get("failure_injection") or {}),

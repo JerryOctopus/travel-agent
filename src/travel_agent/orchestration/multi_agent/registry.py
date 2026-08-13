@@ -21,7 +21,7 @@ class SubagentDefinition:
     description: str  # 给 Orchestrator 派工决策看的职责说明
     system_prompt: str
     tool_names: tuple[str, ...]  # 工具白名单（与 lc_tools 注册名一致）
-    max_steps: int = 8  # create_react_agent recursion_limit
+    max_steps: int = 8  # create_agent recursion_limit
     max_tool_calls: int = 4  # 单次执行内工具调用上限（超限时结果带 warning）
     timeout_seconds: float = 90.0  # Step 2 起生效的执行超时预算
 
@@ -57,9 +57,9 @@ _RESTAURANT_PROMPT = """你是 restaurant 领域 Subagent，只负责餐饮调�
 
 _TRANSPORT_PROMPT = """你是 transport 领域 Subagent，只负责交通调研。
 职责：市内与城际路线、换乘与步行、耗时估算、返程时间提醒。
-可用工具仅限：plan_route、estimate_budget。
+可用工具仅限：search_poi、plan_route、estimate_budget。
 纪律：
-1. 只对任务给定的 POI 对调用 plan_route（poi_id 必须来自任务输入或已检索结果）；
+1. plan_route 的 poi_id 必须来自任务输入；若只有地点名称，先用 search_poi 分别解析起终点，禁止把名称冒充 poi_id；
 2. 多段路线逐段估算，给出总耗时与换乘建议；
 3. 输出结构化结论：路线段、耗时、方式、返程/截止时间风险提示、未解决事项。
 禁止：调用白名单以外的工具、编造班次时刻。"""
@@ -102,11 +102,11 @@ SUBAGENT_REGISTRY: dict[str, SubagentDefinition] = {
     ),
     "transport": SubagentDefinition(
         name="transport",
-        description="市内与城际交通、换乘、步行、耗时与返程截止；工具：plan_route、estimate_budget。",
+        description="市内与城际交通、换乘、步行、耗时与返程截止；工具：search_poi、plan_route、estimate_budget。",
         system_prompt=_TRANSPORT_PROMPT,
-        tool_names=("plan_route", "estimate_budget"),
-        max_steps=6,
-        max_tool_calls=4,
+        tool_names=("search_poi", "plan_route", "estimate_budget"),
+        max_steps=10,
+        max_tool_calls=6,
     ),
     "planner": SubagentDefinition(
         name="planner",
@@ -114,7 +114,10 @@ SUBAGENT_REGISTRY: dict[str, SubagentDefinition] = {
         "工具：build_constraints、recommend_candidates、plan_and_critique。",
         system_prompt=_PLANNER_PROMPT,
         tool_names=("build_constraints", "recommend_candidates", "plan_and_critique"),
-        max_steps=8,
+        # Three required tools commonly need AI -> tool graph transitions plus
+        # a final answer.  Eight graph steps could terminate after the second
+        # tool even though max_tool_calls had not been reached.
+        max_steps=12,
         max_tool_calls=4,
         timeout_seconds=120.0,
     ),

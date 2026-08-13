@@ -12,7 +12,12 @@ from typing import Any
 from travel_agent.agent.serde import poi_from_dict, poi_to_dict
 from travel_agent.agent.session import DEFAULT_ARTIFACT_DIR, SessionContext, build_session
 from travel_agent.schemas import TravelProfile
-from travel_agent.storage.user_profile import UserProfileStore, _profile_from_dict, _profile_to_dict
+from travel_agent.storage.user_memory import (
+    JsonUserMemoryRepository,
+    UserMemoryService,
+    get_user_memory_service,
+)
+from travel_agent.storage.user_profile import _profile_from_dict, _profile_to_dict
 
 SESSION_STATE_FILE = "session_state.json"
 
@@ -22,10 +27,18 @@ class SessionLifecycleManager:
         self,
         artifact_dir: Path | str = DEFAULT_ARTIFACT_DIR,
         profile_dir: Path | str | None = None,
+        memory_settings=None,
     ) -> None:
         self.artifact_dir = Path(artifact_dir)
         self._sessions: dict[str, dict[str, Any]] = {}
-        self._profile_store = UserProfileStore(profile_dir) if profile_dir else UserProfileStore()
+        if memory_settings is not None:
+            self._memory_service = get_user_memory_service(memory_settings)
+        else:
+            from travel_agent.storage.user_profile import DEFAULT_PROFILE_DIR
+
+            self._memory_service = UserMemoryService(
+                JsonUserMemoryRepository(profile_dir or DEFAULT_PROFILE_DIR)
+            )
 
     def get_or_create(
         self,
@@ -44,9 +57,8 @@ class SessionLifecycleManager:
             return sid, ctx, history
 
         ctx = build_session(session_id=sid, persist=True)
-        l3 = self._profile_store.load(user_id)
-        if l3.destination or l3.interests or l3.budget_level:
-            ctx.profile = _merge_profiles(l3, ctx.profile)
+        l3 = self._memory_service.load_stable_profile(user_id)
+        ctx.profile = _merge_l3_preferences(ctx.profile, l3)
         history: list[tuple[str, str]] = []
         self._sessions[sid] = {"ctx": ctx, "history": history, "user_id": user_id}
         return sid, ctx, history
@@ -60,7 +72,6 @@ class SessionLifecycleManager:
     ) -> None:
         if session_id in self._sessions:
             self._sessions[session_id]["history"] = history
-        self._profile_store.merge_and_save(user_id, ctx.profile)
         self._save_session_state(session_id, ctx, history, user_id)
 
     def reset(self, session_id: str) -> None:
@@ -92,8 +103,8 @@ class SessionLifecycleManager:
             poi = poi_from_dict(poi_data)
             ctx.pois_by_id[poi.poi_id] = poi
         history = [tuple(pair) for pair in data.get("history", [])]
-        l3 = self._profile_store.load(user_id)
-        ctx.profile = _merge_profiles(l3, ctx.profile)
+        l3 = self._memory_service.load_stable_profile(user_id)
+        ctx.profile = _merge_l3_preferences(ctx.profile, l3)
         return ctx, history
 
     def _try_restore_from_artifacts_only(
@@ -108,8 +119,8 @@ class SessionLifecycleManager:
         count = ctx.store.load_from_disk()
         if count == 0:
             return None
-        l3 = self._profile_store.load(user_id)
-        ctx.profile = _merge_profiles(l3, ctx.profile)
+        l3 = self._memory_service.load_stable_profile(user_id)
+        ctx.profile = _merge_l3_preferences(ctx.profile, l3)
         return ctx, []
 
     def _save_session_state(
@@ -133,7 +144,7 @@ class SessionLifecycleManager:
         path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _merge_profiles(base: TravelProfile, update: TravelProfile) -> TravelProfile:
-    from travel_agent.workflow import merge_profile
+def _merge_l3_preferences(base: TravelProfile, l3: TravelProfile) -> TravelProfile:
+    from travel_agent.workflow import merge_l3_preferences
 
-    return merge_profile(base, update)
+    return merge_l3_preferences(base, l3)

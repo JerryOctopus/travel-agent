@@ -11,6 +11,11 @@ run_production_turn 是同步的（可能调用 LLM），这里放到线程池�
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -23,17 +28,68 @@ from travel_agent.agent.session import RequestControl, SessionContext
 from travel_agent.orchestration.multi_agent.schemas import new_request_id
 from travel_agent.settings import get_settings
 from travel_agent.storage.session_manager import SessionLifecycleManager
+from travel_agent.storage.user_memory import close_user_memory_services
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
+DEV34_REPORT_FILE = (
+    Path(__file__).resolve().parents[2]
+    / "data/eval/product/runs/dev34_frozen_full_20260813a/dev34_case_report.html"
+)
+_SRC = Path(__file__).resolve().parents[1]
 
-app = FastAPI(title="Personalized Travel Planning Agent")
+_mcp_process: subprocess.Popen[bytes] | None = None
+
+
+def _wait_mcp_port(host: str, port: int, timeout: float = 15.0) -> bool:
+    import socket
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            if sock.connect_ex((host, port)) == 0:
+                return True
+        time.sleep(0.2)
+    return False
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    global _mcp_process
+    settings = get_settings()
+    if settings.mcp.auto_start:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(_SRC) + os.pathsep + env.get("PYTHONPATH", "")
+        env["TRAVEL_AGENT_MCP_HOST"] = settings.mcp.host
+        env["TRAVEL_AGENT_MCP_PORT"] = str(settings.mcp.port)
+        _mcp_process = subprocess.Popen(
+            [sys.executable, "-m", "travel_agent.mcp_server"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        _wait_mcp_port(settings.mcp.host, settings.mcp.port)
+    try:
+        yield
+    finally:
+        close_user_memory_services()
+        if _mcp_process is not None:
+            _mcp_process.terminate()
+            try:
+                _mcp_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _mcp_process.kill()
+            _mcp_process = None
+
+
+app = FastAPI(title="Personalized Travel Planning Agent", lifespan=_lifespan)
 
 if (WEB_DIR / "static").exists():
     app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 
 def _build_manager() -> SessionLifecycleManager:
     settings = get_settings()
-    return SessionLifecycleManager(profile_dir=settings.memory.profile_dir)
+    return SessionLifecycleManager(memory_settings=settings.memory)
 
 
 MANAGER = _build_manager()
@@ -78,6 +134,11 @@ async def index() -> FileResponse:
     return FileResponse(str(WEB_DIR / "index.html"))
 
 
+@app.get("/dev34-report")
+async def dev34_report() -> FileResponse:
+    return FileResponse(str(DEV34_REPORT_FILE), media_type="text/html")
+
+
 @app.get("/config")
 async def config() -> JSONResponse:
     settings = get_settings()
@@ -87,6 +148,8 @@ async def config() -> JSONResponse:
             "amap_js_security_key": settings.amap.js_security_key or "",
             "real_agent_enabled": settings.llm.enabled,
             "amap_rest_enabled": settings.amap.rest_enabled,
+            "mcp_use_tools": settings.mcp.use_mcp_tools,
+            "mcp_auto_start": settings.mcp.auto_start,
             "skills_enabled": settings.skills.enabled,
         }
     )

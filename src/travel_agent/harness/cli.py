@@ -17,6 +17,10 @@ from travel_agent.harness.live_tools import (
     build_live_tools_report,
     write_live_tools_summary,
 )
+from travel_agent.harness.long_horizon import (
+    DEFAULT_LONG_HORIZON_CASES,
+    run_long_horizon_suite,
+)
 from travel_agent.harness.reporting import (
     build_release_report,
     evaluate_release_gates,
@@ -42,6 +46,7 @@ def main() -> None:
             "agent-nl",
             "agent-real",
             "agent-product",
+            "agent-long-horizon",
             "chinatravel-mini",
             "chinatravel-human154",
             "chinatravel-human1000",
@@ -63,6 +68,12 @@ def main() -> None:
     parser.add_argument("--continue-on-llm-error", action="store_true")
     parser.add_argument("--cases", default=str(ROOT / "eval" / "cases.json"))
     parser.add_argument("--product-cases", default=str(DEFAULT_PRODUCT_CASES))
+    parser.add_argument("--long-horizon-cases", default=str(DEFAULT_LONG_HORIZON_CASES))
+    parser.add_argument(
+        "--long-horizon-split",
+        choices=["dev", "frozen", "all"],
+        default="dev",
+    )
     parser.add_argument(
         "--product-split",
         choices=["dev", "core_frozen", "challenge_frozen", "shadow_frozen", "all"],
@@ -105,6 +116,8 @@ def run_harness_cli(args: argparse.Namespace) -> dict[str, Any]:
             results[suite] = _run_agent_real(args)
         elif suite == "agent-product":
             results[suite] = _run_agent_product(args)
+        elif suite == "agent-long-horizon":
+            results[suite] = _run_agent_long_horizon(args)
         elif suite.startswith("chinatravel-"):
             results[suite] = _run_chinatravel(args, suite)
         elif suite == "live-tools-shadow":
@@ -151,13 +164,45 @@ def _run_agent_product(args: argparse.Namespace) -> dict[str, Any]:
     if args.write_report:
         output_root = ROOT / "data" / "eval" / "product"
         summary = write_product_run(result, output_root)
-        (ROOT / "docs" / "EVALUATION_PRODUCT.md").write_text(
+        # 运行报告落独立文件；docs/EVALUATION_PRODUCT.md 是 production_v1 静态文档，不被覆盖。
+        (ROOT / "docs" / "EVALUATION_PRODUCT_RUN.md").write_text(
             build_product_report(result)
             + f"\n## Saved outputs\n\n- run: `{summary['artifacts']['run_dir']}`\n"
             + f"- per-case outputs: `{summary['artifacts']['case_output_dir']}`\n",
             encoding="utf-8",
         )
     return summary
+
+
+def _run_agent_long_horizon(args: argparse.Namespace) -> dict[str, Any]:
+    settings = load_settings()
+    if args.env == "real_agent" and not settings.llm.enabled:
+        raise RuntimeError("long_horizon_v1 requires a configured LLM in real_agent mode.")
+    settings = replace(
+        settings,
+        memory=replace(
+            settings.memory,
+            backend="json",
+            database_url=None,
+            profile_dir=Path(tempfile.mkdtemp(prefix="long_horizon_eval_profile_")),
+        ),
+    )
+    environment = HarnessEnvironment(
+        mode="real_agent" if args.env == "real_agent" else "offline",
+        persist=False,
+        user_id="long_horizon_eval",
+    )
+    result = run_long_horizon_suite(
+        AgentHarness(settings=settings, environment=environment),
+        case_path=args.long_horizon_cases,
+        split=args.long_horizon_split,
+        limit=args.limit,
+    )
+    return {
+        "metrics": result.metrics,
+        "artifacts": result.artifacts,
+        "rows": result.rows,
+    }
 
 
 def _run_agent_nl(args: argparse.Namespace) -> dict[str, Any]:

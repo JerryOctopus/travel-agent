@@ -84,6 +84,24 @@ def test_turn_meter_blocks_before_call_and_charges_missing_usage_conservatively(
     assert tool_meter.snapshot()["totals"]["tool_calls"] == 1
 
 
+def test_turn_meter_closes_outer_timed_out_call_once() -> None:
+    meter = TurnMeter("req-outer-timeout")
+    call = meter.begin_llm("orchestrator", 7)
+
+    assert meter.fail_pending_llm("orchestrator", "router timeout") == 1
+    # A late provider callback must not mutate the already-final snapshot.
+    meter.finish_llm(
+        call,
+        input_tokens=100,
+        output_tokens=100,
+        total_tokens=200,
+    )
+    snapshot = meter.snapshot()["roles"]["orchestrator"]
+    assert snapshot["llm_calls"] == 1
+    assert snapshot["total_tokens"] == 7
+    assert snapshot["failures"] == 1
+
+
 def test_langchain_callbacks_count_roles_and_block_provider_before_generate() -> None:
     class UsageModel(BaseChatModel):
         generated: int = 0

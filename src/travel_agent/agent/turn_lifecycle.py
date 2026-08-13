@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 from travel_agent.agent import toolkit
@@ -29,6 +30,156 @@ class PreparedTurn:
     early_reply: Any | None = None
 
 
+def _merge_constraint_state(current: dict[str, Any], update: dict[str, Any]) -> None:
+    """Merge multi-turn open constraints without dropping earlier list requirements."""
+    normalized_update = dict(update)
+    incoming_removed = [str(item) for item in normalized_update.get("removed") or []]
+    if incoming_removed:
+        known_entities = [
+            str(item)
+            for key in ("must_visit", "candidate_attractions")
+            for item in (current.get(key) or [])
+        ]
+        normalized_update["removed"] = [
+            next(
+                (
+                    known
+                    for known in known_entities
+                    if term in known or known in term
+                ),
+                term,
+            )
+            for term in incoming_removed
+        ]
+    merge_lists = {
+        "must_visit",
+        "avoid",
+        "interests",
+        "candidate_attractions",
+        "removed",
+        "optional_remove",
+        "exclude",
+    }
+    for key, value in normalized_update.items():
+        if key in merge_lists and isinstance(value, list):
+            existing = list(current.get(key) or [])
+            current[key] = list(dict.fromkeys(existing + value))
+        else:
+            current[key] = value
+    if "budget_max_cny" in normalized_update:
+        # Canonical budget changes replace the older total-budget alias.
+        current.pop("budget_total_cny", None)
+    removed = [str(item) for item in current.get("removed") or []]
+    if removed:
+        for key in ("must_visit", "candidate_attractions"):
+            current[key] = [
+                item
+                for item in (current.get(key) or [])
+                if not any(term in str(item) or str(item) in term for term in removed)
+            ]
+            if not current[key]:
+                current.pop(key, None)
+
+
+_GENERIC_INTEREST_REQUIREMENTS = {
+    "海边",
+    "园林",
+    "咖啡店",
+    "历史景点",
+    "主要历史景点",
+    "自然风光",
+    "历史文化",
+    "自由活动",
+}
+
+
+def _is_named_poi_requirement(value: Any) -> bool:
+    text = str(value or "").strip()
+    if len(text) < 2 or text in _GENERIC_INTEREST_REQUIREMENTS:
+        return False
+    if re.search(r"\d{4}年|(?:\d+|[一二两三四五六七])天(?:行程|游)", text):
+        return False
+    if any(term in text for term in ("预算", "冲突", "步行以内", "露天路段")):
+        return False
+    if text.endswith(("行程", "项目", "要求")) or text in {"午餐", "晚餐", "三天行程"}:
+        return False
+    return True
+
+
+def _sync_profile_constraints(profile: Any) -> None:
+    """Keep compact profile fields and the explicit constraint tree coherent."""
+    from travel_agent.workflow_rules import normalize_interests
+
+    state = profile.constraint_state or {}
+    removed = [str(item) for item in state.get("removed") or [] if str(item).strip()]
+    fixed_locations = [
+        str(event.get("location") or "").strip()
+        for event in (state.get("fixed_events") or [])
+        if isinstance(event, dict) and str(event.get("location") or "").strip()
+    ]
+    state_avoid_terms = [
+        str(item).strip()
+        for item in list(state.get("avoid") or [])
+        if str(item).strip()
+    ]
+    avoid_terms = [
+        str(item).strip()
+        for item in [*list(profile.avoid or []), *state_avoid_terms]
+        if str(item).strip()
+    ]
+    requested = [
+        *list(profile.must_visit or []),
+        *list(state.get("must_visit") or []),
+        *fixed_locations,
+    ]
+    profile.must_visit = list(
+        dict.fromkeys(
+            value
+            for value in (str(item).strip() for item in requested)
+            if _is_named_poi_requirement(value)
+            and not any(term in value or value in term for term in removed)
+            # Only trip-scoped/current state avoidance can override a current
+            # must-visit. Stable-profile dislikes from an older trip must not
+            # erase an explicit requirement made earlier in this conversation.
+            and not any(term in value or value in term for term in state_avoid_terms)
+        )
+    )
+    if isinstance(state.get("must_visit"), list):
+        state["must_visit"] = [
+            value
+            for value in (str(item).strip() for item in state["must_visit"])
+            if _is_named_poi_requirement(value)
+            and not any(term in value or value in term for term in removed)
+            and not any(term in value or value in term for term in state_avoid_terms)
+        ]
+    profile.interests = normalize_interests(
+        list(dict.fromkeys([*list(profile.interests or []), *list(state.get("interests") or [])]))
+    )
+    raw_dietary = state.get("dietary") or []
+    dietary = [str(raw_dietary)] if isinstance(raw_dietary, str) else [
+        str(item) for item in raw_dietary
+    ]
+    excluded_foods = {
+        cuisine
+        for cuisine in ("海鲜", "辣", "清真")
+        if any(re.search(rf"(?:不吃|不能吃|不要吃|忌).{{0,2}}{cuisine}", item) for item in dietary)
+    }
+    if excluded_foods:
+        profile.food_preference = [
+            item for item in profile.food_preference if str(item) not in excluded_foods
+        ]
+    if state.get("lodging_area"):
+        profile.hotel_area = str(state["lodging_area"])
+    if state.get("budget_max_cny") is not None:
+        profile.budget_limit = float(state["budget_max_cny"])
+        people = int(profile.party_size or state.get("traveler_count") or 1)
+        days = int(profile.days or state.get("duration_days") or 1)
+        if float(state["budget_max_cny"]) / max(1, people * days) < 600:
+            profile.budget_level = "low"
+    if avoid_terms or removed:
+        profile.avoid = list(dict.fromkeys([*avoid_terms, *removed]))
+
+
 def prepare_turn(
     user_message: str,
     ctx: SessionContext,
@@ -37,6 +188,11 @@ def prepare_turn(
 ) -> PreparedTurn:
     """Run the one shared preflight and freeze all context passed to the engine."""
     normalized_history = list(history or [])
+    """
+    kind: 4 种 (TRAVEL, AMBIGUOUS, GREETING, OUT_OF_SCOPE)
+    task_type: 6 种（UNKNOWN + 5 种受支持的旅行任务）
+    source: 2 种（"rule" 或 "llm"）
+    """
     analysis = analyze_travel_turn(
         user_message,
         ctx,
@@ -48,11 +204,14 @@ def prepare_turn(
 
     contextual_followup = bool(ctx.store.latest_id("itinerary")) and (
         user_skips_preference_prompt(user_message)
-        or turn_expresses_preferences(user_message)
+        or turn_expresses_preferences(
+            user_message,
+            patches=analysis.patches,
+        ) # 包含偏好信号
     )
     if (
         analysis.kind != MessageKind.TRAVEL
-        and analysis.task_type == TaskType.FULL_TRIP_PLAN
+        and analysis.task_type in {TaskType.UNKNOWN, TaskType.FULL_TRIP_PLAN}
         and not contextual_followup
     ):
         return PreparedTurn(
@@ -72,7 +231,33 @@ def prepare_turn(
             ),
         )
 
+    if analysis.task_type == TaskType.UNKNOWN:
+        return PreparedTurn(
+            analysis=analysis,
+            history=normalized_history,
+            existing_plan_artifact_id=None,
+            turn_inputs={},
+            early_reply=AgentReply(
+                text=(
+                    "我还不能确定要执行哪类旅行任务。当前支持完整行程规划、路线查询、"
+                    "地点/酒店/餐厅建议、单日建议和既有行程修改；请把目标说具体一些。"
+                ),
+                clarification=True,
+                profile=toolkit._profile_brief(ctx.profile),
+                status=STATUS_CLARIFICATION_REQUIRED,
+                failure_reason="unknown_task_type",
+            ),
+        )
+
     toolkit.apply_profile_patches(ctx, patches=patches_to_payload(analysis.patches))
+    if analysis.constraint_state:
+        _merge_constraint_state(ctx.profile.constraint_state, analysis.constraint_state)
+        if (
+            analysis.constraint_state.get("self_driving_allowed") is False
+            or analysis.constraint_state.get("public_transport_required") is True
+        ):
+            ctx.profile.transport_mode = "public_transport"
+    _sync_profile_constraints(ctx.profile)
     if analysis.revision_directives.get("pace") == "relaxed":
         toolkit.update_travel_profile(ctx, pace="relaxed")
 
@@ -176,6 +361,7 @@ def run_turn_lifecycle(
     reply: Any
     try:
         with turn_meter_scope(meter):
+            # 前置规则判断
             prepared = prepare_turn(user_message, ctx, settings, history)
             if prepared.early_reply is not None:
                 reply = prepared.early_reply

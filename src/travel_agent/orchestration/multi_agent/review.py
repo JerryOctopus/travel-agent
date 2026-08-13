@@ -23,6 +23,8 @@ Mock 可注入的 ``run_semantic_review`` 骨架与修复周期判定函数。
 
 from __future__ import annotations
 
+import contextvars
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import json
 import time
 from dataclasses import dataclass, field
@@ -45,7 +47,6 @@ from travel_agent.orchestration.multi_agent.schemas import (
     SubagentResult,
 )
 
-
 @dataclass
 class ReviewContext:
     """Engine 组装给 Reviewer 的只读输入快照（不含任何工具句柄）。"""
@@ -58,17 +59,33 @@ class ReviewContext:
 
     def to_prompt_text(self) -> str:
         """渲染为 Reviewer prompt 的上下文段（纯文本，无工具）。"""
+        plan = {
+            key: self.plan.get(key)
+            for key in (
+                "itinerary",
+                "critic",
+                "revision_notes",
+                "final_issue_count",
+                "source_artifact_ids",
+                "revision_directives",
+            )
+            if key in self.plan
+        }
+        if isinstance(plan.get("itinerary"), dict):
+            plan["itinerary"] = _compact_itinerary(plan["itinerary"])
         payload = {
             "request_id": self.request_id,
             "task_brief": self.task_brief,
             "profile": self.profile_brief,
-            "plan": self.plan,
+            # Do not duplicate original_itinerary or full domain payloads.  The
+            # reviewer needs the final plan plus evidence identities, and some
+            # providers enforce a ~30k input-character boundary.
+            "plan": plan,
             "subagent_results": [
                 {
                     "task_id": result.task_id,
                     "agent": result.agent,
                     "status": result.status,
-                    "payload": result.payload,
                     "evidence": result.evidence,
                     "warnings": result.warnings,
                     "unresolved": result.unresolved,
@@ -81,19 +98,39 @@ class ReviewContext:
 
 # Mock/真实调用统一签名：接收 ReviewContext，返回 ReviewResult 的 dict 形式。
 ReviewCallable = Callable[[ReviewContext], dict[str, Any]]
+REVIEWER_MAX_OUTPUT_TOKENS = 1024
+REVIEWER_TIMEOUT_SECONDS = 90
 
 _REVIEWER_INSTRUCTION = """你是行程语义复核者（Semantic Reviewer）。你不拥有任何工具，也不重新生成计划。
 只基于给定的 TravelPlan、用户画像与领域调研证据，检查：软偏好匹配、行程节奏、
 适老性/无障碍、跨领域一致性（交通耗时与景点安排、预算与档位等）。
 对每个问题输出 JSON：issue_type / severity(critical|recoverable|noncritical) /
 description / evidence / repair_target(attraction|hotel|restaurant|transport|planner) /
-repair_instruction。整体给出 verdict：pass | rework | failed。"""
+repair_instruction。严重度必须遵循：
+- critical：计划中存在有明确证据的硬约束冲突或安全风险，且一次有界修复无法可靠解决；verdict 必须为 failed；
+- recoverable：计划或证据有具体缺口，能由一次定向领域补充或 Planner 重排解决；verdict 为 rework；
+- noncritical：实时开放、无障碍设施、班次等工具证据未覆盖而需出发前/现场复核，或仅是优化建议；不得标成 critical；
+- 不要求无关领域都提供结果；确定性 critic 已通过的项目不要在没有相反证据时判为冲突；
+- profile.constraint_state.candidate_attractions 是待核验/比较的候选集合，不等同 must_visit；
+  候选闭馆或证据不支持时，计划省略并明确说明限制是有效处理，不得按“遗漏必去”判 critical；
+- transport_modes 或 taxi_backup 表示允许/备选方式，不要求每种方式都必须出现在最终路线；
+  已满足 public_transport_required 且未使用禁用方式时，缺少 taxi 实际路段最多是优化建议；
+- 轻松节奏中的空档、相邻地点重复、未提供无障碍/实时班次信息等，如无明确硬约束或安全证据，
+  只能判 noncritical；不得把“可能”“疑似”或常识猜测作为 critical/recoverable 的相反证据；
+- 只以 profile 中的显式约束判定硬冲突，不要把 task_brief 的自然语言候选或领域缺席自行升级为硬约束；
+- 饮食限制约束的是已安排餐饮必须合规；某天没有餐厅/餐饮 stop 本身不代表吃了不合规食物，
+  最多是行程完整性优化。只有计划明确安排了与 dietary 冲突的餐厅或菜系，才能判硬冲突；
+- 住宿由 hotel 领域 evidence、住宿区域与补充卡片承载，不要求把酒店塞进 itinerary.days[].stops；
+  酒店没有作为每日游玩停靠点本身不是缺失，也不得据此要求 Planner 添加酒店 stop；
+- verdict=pass 时 issues 必须为空；verdict=rework 时不得含 critical；存在 critical 时 verdict=failed。
+整体给出 verdict：pass | rework | failed。"""
 
 
 def run_semantic_review(
     review_ctx: ReviewContext,
     *,
     review_callable: ReviewCallable | None = None,
+    timeout_seconds: float | None = None,
 ) -> ReviewResult:
     """Engine 直调的一次无工具 Review。
 
@@ -107,15 +144,43 @@ def run_semantic_review(
             error="no review callable configured (real LLM path lands in Step 3)",
             duration_ms=_elapsed_ms(start),
         )
+    pool = None
     try:
-        raw = review_callable(review_ctx)
+        if timeout_seconds is None:
+            raw = review_callable(review_ctx)
+        else:
+            if timeout_seconds <= 0:
+                raise TimeoutError("reviewer admission denied")
+            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="semantic-review")
+            future = pool.submit(
+                contextvars.copy_context().run,
+                review_callable,
+                review_ctx,
+            )
+            try:
+                raw = future.result(timeout=timeout_seconds)
+            except FutureTimeoutError as exc:
+                future.cancel()
+                from travel_agent.orchestration.meter import current_turn_meter
+
+                meter = current_turn_meter()
+                if meter is not None:
+                    meter.fail_pending_llm(
+                        "reviewer", f"reviewer timeout after {timeout_seconds:g}s"
+                    )
+                raise TimeoutError(
+                    f"reviewer timeout after {timeout_seconds:g}s"
+                ) from exc
     except Exception as exc:  # noqa: BLE001 — 包装为 failed，不上抛
         return ReviewResult(
             verdict=VERDICT_FAILED,
             error=f"{type(exc).__name__}: {exc}",
             duration_ms=_elapsed_ms(start),
         )
-    return _build_review_result(raw, start)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+    return _calibrate_review_result(_build_review_result(raw, start), review_ctx)
 
 
 def reviewer_prompt(review_ctx: ReviewContext) -> str:
@@ -146,12 +211,20 @@ def extract_json_payload(text: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def build_review_callable(settings: Any, model: Any | None = None) -> ReviewCallable | None:
+def build_review_callable(
+    settings: Any,
+    model: Any | None = None,
+    *,
+    timeout_seconds: float | None = None,
+    evaluation_trace: list[dict[str, Any]] | None = None,
+) -> ReviewCallable | None:
     """构建真实的单层无工具 LLM Review 调用；LLM 不可用时返回 None。
 
-    返回的 callable 只读 ReviewContext，直接调用模型一次，不挂载任何工具。
+    返回的 callable 只读 ReviewContext，不挂载任何工具。仅当首次响应为空或
+    缺少合法 verdict/issues 时，允许一次格式纠正重试；有效业务 verdict 不重试。
     """
-    if model is None and not settings.llm.enabled:
+    llm = getattr(settings, "llm", None)
+    if model is None and (llm is None or not getattr(llm, "enabled", False)):
         return None
 
     def review_callable(review_ctx: ReviewContext) -> dict[str, Any]:
@@ -159,19 +232,147 @@ def build_review_callable(settings: Any, model: Any | None = None) -> ReviewCall
         if active_model is None:
             from travel_agent.agent.runtime import _build_chat_model
 
-            active_model = _build_chat_model(settings)
+            # Give one complete generation window, but do not turn one loaded
+            # provider failure into ChatOpenAI's implicit three-attempt wait.
+            active_model = _build_chat_model(
+                settings,
+                timeout_seconds=(
+                    REVIEWER_TIMEOUT_SECONDS
+                    if timeout_seconds is None
+                    else timeout_seconds
+                ),
+                max_retries=0,
+            )
         from langchain_core.messages import HumanMessage
 
         from travel_agent.orchestration.meter import meter_callbacks
 
-        response = active_model.invoke(
-            [HumanMessage(content=reviewer_prompt(review_ctx))],
-            config={"callbacks": meter_callbacks("reviewer")},
+        # Reviewer emits a small JSON verdict. Bounding the output prevents a
+        # provider from spending the full timeout on verbose reasoning while
+        # preserving the review rubric and fail-closed delivery gate.
+        max_output_tokens = int(
+            getattr(
+                getattr(settings, "orchestration", None),
+                "reviewer_max_output_tokens",
+                REVIEWER_MAX_OUTPUT_TOKENS,
+            )
+            or REVIEWER_MAX_OUTPUT_TOKENS
         )
-        content = response.content if isinstance(response.content, str) else str(response.content)
-        return extract_json_payload(content)
+        bounded_model = active_model.bind(max_tokens=max_output_tokens)
+        callbacks = meter_callbacks("reviewer")
+        if evaluation_trace is not None:
+            from travel_agent.agent.evaluation_trace import EvaluationTraceCallback
+
+            callbacks.append(
+                EvaluationTraceCallback(
+                    evaluation_trace,
+                    model=getattr(settings.llm, "model", ""),
+                    phase="reviewer",
+                )
+            )
+        prompt = reviewer_prompt(review_ctx)
+        for attempt in range(2):
+            if attempt:
+                prompt = (
+                    reviewer_prompt(review_ctx)
+                    + "\n\n上一次响应为空或 JSON 结构非法。请仅返回一个 JSON object，"
+                    "必须包含合法 verdict 与 issues 数组，不要输出解释文字。"
+                )
+            response = bounded_model.invoke(
+                [HumanMessage(content=prompt)],
+                config={"callbacks": callbacks},
+            )
+            content = response.content if isinstance(response.content, str) else str(response.content)
+            parsed = extract_json_payload(content)
+            if _review_contract_shape_valid(parsed):
+                return parsed
+        return parsed
 
     return review_callable
+
+
+def _review_contract_shape_valid(raw: Any) -> bool:
+    """Cheap preflight so one malformed business verdict gets the format retry."""
+    if not isinstance(raw, dict):
+        return False
+    verdict = raw.get("verdict")
+    issues = raw.get("issues")
+    if verdict not in {VERDICT_PASS, VERDICT_REWORK, VERDICT_FAILED} or not isinstance(issues, list):
+        return False
+    if verdict == VERDICT_PASS:
+        return not issues
+    severities = {
+        str(item.get("severity") or "")
+        for item in issues
+        if isinstance(item, dict)
+    }
+    if verdict == VERDICT_REWORK:
+        return SEVERITY_RECOVERABLE in severities and SEVERITY_CRITICAL not in severities
+    return SEVERITY_CRITICAL in severities
+
+
+def _compact_itinerary(itinerary: dict[str, Any]) -> dict[str, Any]:
+    """Keep reviewer-relevant semantics without repeating bulky map fields."""
+    compact_days: list[dict[str, Any]] = []
+    for raw_day in itinerary.get("days") or []:
+        if not isinstance(raw_day, dict):
+            continue
+        stops: list[dict[str, Any]] = []
+        for raw_stop in raw_day.get("stops") or []:
+            if not isinstance(raw_stop, dict):
+                continue
+            poi = raw_stop.get("poi") if isinstance(raw_stop.get("poi"), dict) else {}
+            route = (
+                raw_stop.get("route_from_previous")
+                if isinstance(raw_stop.get("route_from_previous"), dict)
+                else None
+            )
+            stop = {
+                key: raw_stop.get(key)
+                for key in ("start_time", "duration_min", "note")
+                if raw_stop.get(key) is not None
+            }
+            stop["poi"] = {
+                key: poi.get(key)
+                for key in (
+                    "name",
+                    "city",
+                    "category",
+                    "tags",
+                    "indoor",
+                    "opening_hours",
+                    "average_cost",
+                    "address",
+                    "source",
+                )
+                if poi.get(key) is not None
+            }
+            if route is not None:
+                stop["route_from_previous"] = {
+                    key: route.get(key)
+                    for key in (
+                        "duration_min",
+                        "distance_km",
+                        "walking_distance_km",
+                        "mode",
+                        "source",
+                    )
+                    if route.get(key) is not None
+                }
+            stops.append(stop)
+        compact_days.append(
+            {
+                key: raw_day.get(key)
+                for key in ("day_index", "theme")
+                if raw_day.get(key) is not None
+            }
+            | {"stops": stops}
+        )
+    return {
+        key: itinerary.get(key)
+        for key in ("city", "summary")
+        if itinerary.get(key) is not None
+    } | {"days": compact_days}
 
 
 def resolve_delivery_status(
@@ -249,8 +450,12 @@ def _build_review_result(raw: Any, start: float) -> ReviewResult:
         repair_instruction = str(item.get("repair_instruction") or "").strip()
         if not issue_type or not description:
             return _invalid_review(f"issues[{index}] 缺少 issue_type/description", start)
-        if not isinstance(evidence, list):
-            return _invalid_review(f"issues[{index}] evidence 必须是 list", start)
+        if evidence is None:
+            evidence = []
+        elif not isinstance(evidence, list):
+            evidence = [evidence]
+        if repair_target.lower() in {"none", "null", "n/a", "无"}:
+            repair_target = ""
         if repair_target and repair_target not in {
             "attraction",
             "hotel",
@@ -281,6 +486,90 @@ def _build_review_result(raw: Any, start: float) -> ReviewResult:
         token_usage=dict(raw.get("token_usage") or {}),
         duration_ms=_elapsed_ms(start),
     )
+
+
+def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) -> ReviewResult:
+    """Downgrade unsupported semantic guesses before they reach the fail-closed gate.
+
+    The semantic reviewer may notice useful quality concerns, but phrases such as
+    “可能/疑似/常识” are not evidence for an automatic repair or a hard failure.
+    Likewise, omission of a verification candidate is not omission of a must-visit.
+    Deterministic Critic remains authoritative for actual hard-plan violations.
+    """
+    if review.error:
+        return review
+    profile = review_ctx.profile_brief or {}
+    state = profile.get("constraint_state") if isinstance(profile.get("constraint_state"), dict) else {}
+    candidates = [
+        str(item).strip()
+        for item in (state.get("candidate_attractions") or [])
+        if str(item).strip()
+    ]
+    must_visit = [
+        str(item).strip()
+        for item in [*list(profile.get("must_visit") or []), *list(state.get("must_visit") or [])]
+        if str(item).strip()
+    ]
+    uncertainty_markers = (
+        "可能",
+        "疑似",
+        "根据领域常识",
+        "根据常识",
+        "推断",
+        "缺乏明确证据",
+        "未指定",
+        "需考虑",
+    )
+    omission_markers = ("未包含", "未安排", "遗漏", "缺失", "未提供替代")
+    fixed_events = [
+        event for event in (state.get("fixed_events") or []) if isinstance(event, dict)
+    ]
+    for issue in review.issues:
+        combined = " ".join([issue.description, *issue.evidence])
+        unsupported_guess = any(marker in combined for marker in uncertainty_markers)
+        omitted_candidate_only = (
+            any(candidate in combined for candidate in candidates)
+            and not any(required in combined for required in must_visit)
+            and any(marker in combined for marker in omission_markers)
+        )
+        fixed_event_claim = (
+            bool(fixed_events)
+            and any(term in combined for term in ("预约", "固定事件", "晚饭", "晚餐", "午饭", "午餐"))
+            and any(marker in combined for marker in omission_markers)
+        )
+        soft_gap_claim = "空档" in combined or "时间浪费" in combined
+        missing_meal_only = any(
+            marker in combined
+            for marker in (
+                "未安排午餐",
+                "未安排晚餐",
+                "未安排任何餐饮",
+                "没有安排任何餐厅",
+                "没有包含任何餐厅",
+                "没有任何清真餐厅",
+                "缺少餐厅",
+            )
+        ) and not any(
+            marker in combined
+            for marker in ("安排了非清真", "安排非清真", "与饮食限制冲突的餐厅")
+        )
+        if issue.severity != SEVERITY_NONCRITICAL and (
+            unsupported_guess
+            or omitted_candidate_only
+            or fixed_event_claim
+            or soft_gap_claim
+            or missing_meal_only
+        ):
+            issue.severity = SEVERITY_NONCRITICAL
+            issue.repair_target = ""
+            issue.repair_instruction = ""
+    if any(issue.severity == SEVERITY_CRITICAL for issue in review.issues):
+        review.verdict = VERDICT_FAILED
+    elif any(issue.severity == SEVERITY_RECOVERABLE for issue in review.issues):
+        review.verdict = VERDICT_REWORK
+    else:
+        review.verdict = VERDICT_PASS
+    return review
 
 
 def _invalid_review(reason: str, start: float) -> ReviewResult:

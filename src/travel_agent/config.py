@@ -33,7 +33,10 @@ def load_llm_config() -> LLMConfig:
     provider = os.getenv("TRAVEL_AGENT_LLM_PROVIDER", "rule").strip().lower()
     return LLMConfig(
         provider=provider,
-        api_key=_empty_to_none(os.getenv("TRAVEL_AGENT_LLM_API_KEY")),
+        api_key=(
+            _empty_to_none(os.getenv("TRAVEL_AGENT_LLM_API_KEY"))
+            or _provider_api_key(provider)
+        ),
         base_url=_env_or_default("TRAVEL_AGENT_LLM_BASE_URL", _default_base_url(provider)).rstrip("/"),
         model=_env_or_default("TRAVEL_AGENT_LLM_MODEL", _default_model(provider)),
         timeout_seconds=_int_env("TRAVEL_AGENT_LLM_TIMEOUT_SECONDS", 20),
@@ -59,6 +62,20 @@ def _empty_to_none(value: str | None) -> str | None:
     return value or None
 
 
+def _provider_api_key(provider: str) -> str | None:
+    if provider in {"google", "gemini", "google-gemini"}:
+        names = ("TRAVEL_AGENT_GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+    elif provider in {"siliconflow", "silicon-flow", "silicon_flow"}:
+        names = ("TRAVEL_AGENT_SILICONFLOW_API_KEY", "SILICONFLOW_API_KEY")
+    else:
+        names = (f"TRAVEL_AGENT_{provider.upper().replace('-', '_')}_API_KEY",)
+    for name in names:
+        value = _empty_to_none(os.getenv(name))
+        if value:
+            return value
+    return None
+
+
 def _env_or_default(name: str, default: str) -> str:
     value = os.getenv(name)
     if value is None or not value.strip():
@@ -78,16 +95,41 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _default_base_url(provider: str) -> str:
+    if provider in {"freellmapi", "free_llm_api", "free-llm-api"}:
+        return "http://localhost:31415/v1"
+    if provider in {"freellmapi-docker", "freellmapi_server", "freellmapi-server"}:
+        return "http://localhost:3001/v1"
     if provider in {"qwen", "dashscope", "aliyun"}:
         return "https://dashscope.aliyuncs.com/compatible-mode/v1"
     if provider == "deepseek":
         return "https://api.deepseek.com/v1"
+    if provider in {"zhipu", "glm", "zai"}:
+        return "https://open.bigmodel.cn/api/paas/v4"
+    if provider in {"google", "gemini", "google-gemini"}:
+        return "https://generativelanguage.googleapis.com/v1beta/openai"
+    if provider in {"siliconflow", "silicon-flow", "silicon_flow"}:
+        return "https://api.siliconflow.cn/v1"
     return "https://api.openai.com/v1"
 
 
 def _default_model(provider: str) -> str:
+    if provider in {
+        "freellmapi",
+        "free_llm_api",
+        "free-llm-api",
+        "freellmapi-docker",
+        "freellmapi_server",
+        "freellmapi-server",
+    }:
+        return "auto"
     if provider in {"qwen", "dashscope", "aliyun"}:
         return "qwen-plus"
     if provider == "deepseek":
         return "deepseek-chat"
+    if provider in {"zhipu", "glm", "zai"}:
+        return "glm-4.7-flash"
+    if provider in {"google", "gemini", "google-gemini"}:
+        return "gemini-2.5-flash"
+    if provider in {"siliconflow", "silicon-flow", "silicon_flow"}:
+        return "deepseek-ai/DeepSeek-V4-Flash"
     return "gpt-4o-mini"

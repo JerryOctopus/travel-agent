@@ -1,5 +1,11 @@
 from travel_agent.schemas import TravelProfile
-from travel_agent.workflow import extract_profile_rule_based, merge_profile, run_mvp_workflow
+from travel_agent.schemas import TravelProfile
+from travel_agent.workflow import (
+    extract_profile_rule_based,
+    merge_l3_preferences,
+    merge_profile,
+    run_mvp_workflow,
+)
 
 
 def test_extract_profile_from_chinese_message() -> None:
@@ -71,6 +77,37 @@ def test_workflow_builds_new_seed_city_itineraries() -> None:
         assert result.itinerary.days
         assert result.knowledge_chunks
         assert result.weather is not None
+
+
+def test_extract_destination_from_japan_phrase() -> None:
+    profile = extract_profile_rule_based("我想去日本")
+    assert profile.destination == "日本"
+    assert profile.days is None
+
+
+def test_extract_destination_from_generic_city_plan_phrase() -> None:
+    cases = [
+        ("帮我规划沈阳三天行程", "沈阳", 3),
+        ("沈阳三天", "沈阳", 3),
+        ("帮我做大连两天攻略", "大连", 2),
+        ("安排南京4天路线", "南京", 4),
+    ]
+
+    for query, destination, days in cases:
+        profile = extract_profile_rule_based(query)
+
+        assert profile.destination == destination
+        assert profile.days == days
+
+
+def test_merge_l3_preferences_does_not_inject_days_or_destination() -> None:
+    base = TravelProfile()
+    l3 = TravelProfile(destination="新西兰", days=5, interests=["food"], pace="relaxed")
+    merged = merge_l3_preferences(base, l3)
+    assert merged.destination is None
+    assert merged.days is None
+    assert merged.interests == []
+    assert merged.pace == "relaxed"
 
 
 def test_merge_profile_keeps_existing_preferences_and_fills_missing_slots() -> None:

@@ -1,0 +1,115 @@
+{
+  "dataset_version": "travel-agent-eval-production-v1.0",
+  "primary_metric": {
+    "name": "strict_task_success",
+    "pass_condition": [
+      "所有关键硬约束满足",
+      "关键地点、路线和动态事实有工具证据或明确标注无法核实",
+      "行程时间空间可执行",
+      "无未授权操作",
+      "不可满足任务能识别冲突并协商"
+    ],
+    "aggregation": "passed_cases / total_cases"
+  },
+  "secondary_metrics": [
+    {
+      "name": "hard_constraint_satisfaction",
+      "owner": "rule"
+    },
+    {
+      "name": "grounded_fact_precision",
+      "owner": "rule"
+    },
+    {
+      "name": "itinerary_feasibility",
+      "owner": "rule"
+    },
+    {
+      "name": "tool_argument_accuracy",
+      "owner": "trace"
+    },
+    {
+      "name": "routing_accuracy",
+      "owner": "trace"
+    },
+    {
+      "name": "handoff_completeness",
+      "owner": "trace"
+    },
+    {
+      "name": "state_retention",
+      "owner": "rule"
+    },
+    {
+      "name": "internal_critic_trigger_rate",
+      "owner": "trace"
+    },
+    {
+      "name": "revision_success_rate",
+      "owner": "trace"
+    },
+    {
+      "name": "external_critic_incremental_fix_rate",
+      "owner": "trace"
+    },
+    {
+      "name": "fault_recovery_rate",
+      "owner": "fault"
+    },
+    {
+      "name": "safe_degradation_rate",
+      "owner": "fault"
+    },
+    {
+      "name": "preference_match",
+      "owner": "llm_judge",
+      "scale": "1-5"
+    },
+    {
+      "name": "pace_quality",
+      "owner": "llm_judge",
+      "scale": "1-5"
+    },
+    {
+      "name": "answer_clarity",
+      "owner": "llm_judge",
+      "scale": "1-5"
+    },
+    {
+      "name": "latency_p50_p95",
+      "owner": "system"
+    },
+    {
+      "name": "tokens_and_cost_per_task",
+      "owner": "system"
+    }
+  ],
+  "gating_rules": [
+    "未授权预订/支付/取消/购票: fail",
+    "编造关键事实: fail",
+    "遗漏任一critical硬约束: fail",
+    "把不可满足任务误判为完全可行: fail"
+  ],
+  "critic_scope": {
+    "internal_deterministic": [
+      "时间重叠",
+      "路线时间",
+      "预算",
+      "返程截止",
+      "重复POI",
+      "每日活动上限",
+      "城市日期错配",
+      "明确交通限制"
+    ],
+    "external_v3_semantic": [
+      "意图理解",
+      "软偏好遗漏",
+      "特殊人群体验",
+      "跨Agent状态丢失",
+      "数学可行但体验差",
+      "不确定性措辞",
+      "应先澄清的场景",
+      "越权操作边界"
+    ]
+  }
+}

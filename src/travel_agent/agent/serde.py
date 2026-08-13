@@ -37,12 +37,24 @@ def poi_from_dict(data: dict[str, Any]) -> POI:
         price_level=str(data.get("price_level", "mid")),
         indoor=bool(data.get("indoor", False)),
         opening_hours=data.get("opening_hours"),
+        address=data.get("address"),
+        average_cost=(
+            float(data["average_cost"])
+            if data.get("average_cost") not in (None, "")
+            else None
+        ),
+        parking_type=data.get("parking_type"),
         source=str(data.get("source", "seed")),
     )
 
 
 def poi_brief(poi: POI) -> dict[str, Any]:
     """给 LLM 看的紧凑摘要，省略经纬度等无关字段以节省 token。"""
+    def compact(value: str | None, limit: int) -> str | None:
+        if value is None or len(value) <= limit:
+            return value
+        return value[: limit - 1].rstrip() + "…"
+
     return {
         "poi_id": poi.poi_id,
         "name": poi.name,
@@ -51,6 +63,10 @@ def poi_brief(poi: POI) -> dict[str, Any]:
         "tags": poi.tags,
         "indoor": poi.indoor,
         "duration_min": poi.estimated_duration_min,
+        "opening_hours": compact(poi.opening_hours, 240),
+        "address": compact(poi.address, 120),
+        "average_cost": poi.average_cost,
+        "parking_type": poi.parking_type,
         "source": poi.source,
     }
 

@@ -6,6 +6,9 @@ const state = {
   map: null,
   amapReady: false,
   overlays: [],
+  handoff: null,
+  editedHandoff: null,
+  handoffConfirmed: false,
 };
 
 const els = {
@@ -51,12 +54,21 @@ async function init() {
 }
 
 function bindUI() {
+  // 中文/日文等 IME：组合输入期间回车用于上屏，不能当作发送
+  let composing = false;
+  els.input.addEventListener("compositionstart", () => {
+    composing = true;
+  });
+  els.input.addEventListener("compositionend", () => {
+    composing = false;
+  });
+
   els.send.addEventListener("click", sendMessage);
   els.input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
+    if (e.key !== "Enter" || e.shiftKey) return;
+    if (e.isComposing || composing || e.keyCode === 229) return;
+    e.preventDefault();
+    sendMessage();
   });
   document.querySelectorAll(".example").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -114,10 +126,93 @@ function handleEvent(event) {
   }
 }
 
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function inlineMarkdown(text) {
+  let html = escapeHtml(text);
+  // 先处理加粗，避免单星号正则破坏 ** 语法
+  html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>");
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  return html;
+}
+
+/** 轻量 Markdown 渲染（仅助手消息；不执行 HTML，防 XSS） */
+function renderMarkdown(text) {
+  const lines = text.split("\n");
+  const chunks = [];
+  let inList = false;
+
+  const closeList = () => {
+    if (inList) {
+      chunks.push("</ul>");
+      inList = false;
+    }
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      closeList();
+      continue;
+    }
+
+    if (/^#{1,3}\s+/.test(trimmed)) {
+      closeList();
+      const level = trimmed.match(/^#+/)[0].length;
+      const content = trimmed.replace(/^#+\s+/, "");
+      const tag = level <= 2 ? "h3" : "h4";
+      chunks.push(`<${tag}>${inlineMarkdown(content)}</${tag}>`);
+      continue;
+    }
+
+    if (trimmed.startsWith("> ")) {
+      closeList();
+      chunks.push(
+        `<blockquote>${inlineMarkdown(trimmed.slice(2))}</blockquote>`
+      );
+      continue;
+    }
+
+    if (/^[-*•·]\s*/.test(trimmed) || /^✅\s*/.test(trimmed)) {
+      if (!inList) {
+        chunks.push('<ul class="md-list">');
+        inList = true;
+      }
+      const item = trimmed
+        .replace(/^[-*•·]\s*/, "")
+        .replace(/^✅\s*/, "✅ ");
+      chunks.push(`<li>${inlineMarkdown(item)}</li>`);
+      continue;
+    }
+
+    closeList();
+    chunks.push(`<p>${inlineMarkdown(trimmed)}</p>`);
+  }
+
+  closeList();
+  return chunks.join("") || `<p>${inlineMarkdown(text)}</p>`;
+}
+
 function addMessage(role, text) {
   const div = document.createElement("div");
   div.className = `msg ${role}`;
-  div.textContent = text;
+  if (role === "assistant") {
+    const body = document.createElement("div");
+    body.className = "md-body";
+    body.innerHTML = renderMarkdown(text);
+    div.appendChild(body);
+  } else {
+    div.textContent = text;
+  }
   els.messages.appendChild(div);
   scrollMessages();
 }
@@ -143,8 +238,9 @@ function renderTrace(event) {
   const wrap = document.createElement("div");
   wrap.className = "trace";
   const mode = document.createElement("span");
-  mode.className = "tag " + (event.used_real_agent ? "real" : "fallback");
-  mode.textContent = event.used_real_agent ? "ReAct 自主调用" : "离线兜底";
+  const modeInfo = traceMode(event);
+  mode.className = "tag " + modeInfo.className;
+  mode.textContent = modeInfo.text;
   wrap.appendChild(mode);
   (event.tool_trace || []).forEach((name) => {
     const tag = document.createElement("span");
@@ -154,6 +250,20 @@ function renderTrace(event) {
   });
   els.messages.appendChild(wrap);
   scrollMessages();
+}
+
+function traceMode(event) {
+  const tools = event.tool_trace || [];
+  if (event.used_real_agent) {
+    return { className: "real", text: "ReAct 自主调用" };
+  }
+  if (event.clarification) {
+    return { className: "fallback", text: "信息补全/追问" };
+  }
+  if (tools.includes("plan_and_critique")) {
+    return { className: "fallback", text: "离线规划兜底" };
+  }
+  return { className: "fallback", text: "本地规则处理" };
 }
 
 function scrollMessages() {
@@ -200,9 +310,180 @@ function renderCard(card) {
         <div class="note">${s.note || ""}</div></div>`;
     });
     el.innerHTML = html;
+  } else if (card.type === "restaurants") {
+    let html = `<h3>餐厅候选</h3>
+      <div class="meta">${escapeHtml(card.city || "")}${
+        card.cuisine ? " · " + escapeHtml(card.cuisine) : ""
+      }${card.area ? " · " + escapeHtml(card.area) : ""}</div>`;
+    (card.items || []).forEach((item) => {
+      const tags = (item.tags || []).filter(Boolean).slice(0, 3).join(" / ");
+      html += `<div class="compact-item">
+        <div><strong>${escapeHtml(item.name || "")}</strong>
+        <span class="meta"> · ${escapeHtml(item.price_level || "")}${
+        item.rating ? " · " + escapeHtml(String(item.rating)) + "分" : ""
+      }</span></div>
+        <div class="meta">${escapeHtml(tags || item.source || "")}</div>
+      </div>`;
+    });
+    el.innerHTML = html;
+  } else if (card.type === "hotels") {
+    let html = `<h3>住宿候选</h3>
+      <div class="meta">${escapeHtml(card.city || "")} · ${escapeHtml(card.area || "")} · ${escapeHtml(card.budget_level || "")}</div>`;
+    (card.items || []).forEach((item) => {
+      html += `<div class="compact-item">
+        <div><strong>${escapeHtml(item.name || "")}</strong>
+        <span class="meta">${
+          item.rating ? " · " + escapeHtml(String(item.rating)) + "分" : ""
+        }</span></div>
+        <div class="meta">约 ${escapeHtml(String(item.price_per_night || ""))} 元/晚 · ${escapeHtml(item.source || "")}</div>
+      </div>`;
+    });
+    el.innerHTML = html;
+  } else if (card.type === "budget") {
+    let html = `<h3>预算估算</h3>
+      <div class="budget-total">${escapeHtml(String(card.total_low || ""))} - ${escapeHtml(String(card.total_high || ""))} 元</div>
+      <div class="meta">${escapeHtml(card.city || "")} · ${escapeHtml(String(card.days || ""))} 天 · ${escapeHtml(String(card.companions || ""))} 人</div>
+      <div class="budget-grid">`;
+    Object.entries(card.breakdown || {}).forEach(([label, value]) => {
+      html += `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(String(value || 0))}</strong></div>`;
+    });
+    html += "</div>";
+    el.innerHTML = html;
+  } else if (card.type === "handoff") {
+    state.handoff = cloneRoadbook(card.roadbook || null);
+    state.editedHandoff = cloneRoadbook(card.roadbook || null);
+    state.handoffConfirmed = false;
+    el.classList.add("handoff-card");
+    el.innerHTML = `<h3>${escapeHtml(card.title || "人工确认后导出")}</h3>
+      <div class="meta">${escapeHtml(card.summary || "")}</div>
+      ${renderHandoffEditor(state.editedHandoff)}
+      <div class="handoff-actions">
+        <button class="handoff-confirm" type="button">确认修改</button>
+        <button class="handoff-regenerate" type="button">按修改重新生成</button>
+        <button class="handoff-export" type="button" disabled>导出高德路书草稿</button>
+      </div>
+      <div class="handoff-status meta">请先确认路线；不会自动下单、不会自动支付，导出动作由用户确认触发。</div>`;
+    bindHandoffEditor(el);
   }
   els.cards.appendChild(el);
 }
+
+function cloneRoadbook(roadbook) {
+  if (!roadbook) return null;
+  return JSON.parse(JSON.stringify(roadbook));
+}
+
+function renderHandoffEditor(roadbook) {
+  if (!roadbook || !Array.isArray(roadbook.days)) {
+    return '<div class="meta">暂无可导出的路书草稿。</div>';
+  }
+  let html = '<div class="roadbook-editor">';
+  roadbook.days.forEach((day, dayIndex) => {
+    html += `<div class="roadbook-day" data-day-index="${dayIndex}">
+      <div class="roadbook-day-title">第 ${escapeHtml(String(day.day || dayIndex + 1))} 天</div>`;
+    (day.stops || []).forEach((stop, stopIndex) => {
+      html += `<div class="roadbook-stop" data-stop-index="${stopIndex}">
+        <input class="roadbook-time" type="time" value="${escapeHtml(normalizeTime(stop.start_time))}" aria-label="开始时间" />
+        <input class="roadbook-name" type="text" value="${escapeHtml(stop.name || "")}" aria-label="POI 名称" />
+      </div>`;
+    });
+    html += "</div>";
+  });
+  html += "</div>";
+  return html;
+}
+
+function normalizeTime(value) {
+  const text = String(value || "");
+  const match = text.match(/^(\d{1,2}):(\d{2})/);
+  if (!match) return "";
+  return `${match[1].padStart(2, "0")}:${match[2]}`;
+}
+
+function bindHandoffEditor(cardEl) {
+  const confirm = cardEl.querySelector(".handoff-confirm");
+  const regenerate = cardEl.querySelector(".handoff-regenerate");
+  const exportBtn = cardEl.querySelector(".handoff-export");
+  const status = cardEl.querySelector(".handoff-status");
+  const inputs = cardEl.querySelectorAll(".roadbook-editor input");
+
+  inputs.forEach((input) => {
+    input.addEventListener("input", () => {
+      state.handoffConfirmed = false;
+      exportBtn.disabled = true;
+      status.textContent = "有未确认修改；请确认后再导出。";
+    });
+  });
+
+  confirm.addEventListener("click", () => {
+    state.editedHandoff = collectEditedHandoff(cardEl);
+    state.handoffConfirmed = true;
+    exportBtn.disabled = false;
+    status.textContent = "已确认修改，可以导出高德路书草稿。";
+  });
+
+  regenerate.addEventListener("click", () => {
+    state.editedHandoff = collectEditedHandoff(cardEl);
+    requestRegeneration(state.editedHandoff);
+  });
+
+  exportBtn.addEventListener("click", exportHandoff);
+}
+
+function collectEditedHandoff(cardEl) {
+  const roadbook = cloneRoadbook(state.editedHandoff || state.handoff);
+  if (!roadbook) return null;
+  cardEl.querySelectorAll(".roadbook-day").forEach((dayEl) => {
+    const dayIndex = Number(dayEl.dataset.dayIndex);
+    const day = roadbook.days && roadbook.days[dayIndex];
+    if (!day) return;
+    dayEl.querySelectorAll(".roadbook-stop").forEach((stopEl) => {
+      const stopIndex = Number(stopEl.dataset.stopIndex);
+      const stop = day.stops && day.stops[stopIndex];
+      if (!stop) return;
+      stop.start_time = stopEl.querySelector(".roadbook-time").value || stop.start_time;
+      stop.name = stopEl.querySelector(".roadbook-name").value.trim() || stop.name;
+      stop.user_edited = true;
+    });
+  });
+  roadbook.user_confirmed = state.handoffConfirmed;
+  roadbook.edited_at = new Date().toISOString();
+  return roadbook;
+}
+
+function exportHandoff() {
+  if (!state.editedHandoff || !state.handoffConfirmed) return;
+  state.editedHandoff.user_confirmed = true;
+  const blob = new Blob([JSON.stringify(state.editedHandoff, null, 2)], {
+    type: "application/json;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "amap-roadbook-draft.json";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function requestRegeneration(roadbook) {
+  if (!roadbook || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  const compact = (roadbook.days || [])
+    .map((day) => {
+      const stops = (day.stops || [])
+        .map((stop) => `${stop.start_time || ""} ${stop.name || ""}`.trim())
+        .filter(Boolean)
+        .join("，");
+      return `第${day.day}天：${stops}`;
+    })
+    .join("；");
+  const message = `请基于我刚才人工修改后的路线重新生成并检查可行性：${compact}`;
+  addMessage("user", message);
+  els.send.disabled = true;
+  state.ws.send(JSON.stringify({ message, session_id: state.sessionId }));
+}
+
 
 // ---- map ----
 function loadAmap(key, securityKey) {

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Personalized Travel Planning Agent</title>
-    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/style.css?v=2" />
   </head>
   <body>
     <header class="topbar">
@@ -16,6 +16,9 @@
         </div>
       </div>
       <div class="status-pills">
+        <a class="report-link" href="/dev34-report" target="_blank" rel="noopener">
+          Dev34 评测报告
+        </a>
         <span id="agent-mode" class="pill pill-muted">连接中…</span>
         <span id="amap-mode" class="pill pill-muted">地图未配置</span>
       </div>
@@ -28,14 +31,14 @@
           <textarea
             id="input"
             rows="2"
-            placeholder="例如：帮我规划杭州三天，喜欢自然和美食，轻松一点"
+            placeholder="例如：杭州三天，喜欢美食和自然风光，节奏轻松一点"
           ></textarea>
           <button id="send">发送</button>
         </div>
         <div class="examples">
-          <button class="example">帮我规划杭州三天，喜欢自然和美食，轻松一点</button>
-          <button class="example">北京两天，历史和美食，不要太累</button>
-          <button class="example">我想去旅行</button>
+          <button class="example">帮我规划杭州三天</button>
+          <button class="example">北京两天，历史+美食，轻松慢游</button>
+          <button class="example">日本五天，自然风光，特种兵打卡</button>
         </div>
       </section>
 
@@ -45,6 +48,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=2"></script>
   </body>
 </html>

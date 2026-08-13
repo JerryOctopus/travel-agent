@@ -18,7 +18,10 @@ from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
 from travel_agent.critic import critique_itinerary
-from travel_agent.planning import build_simple_itinerary
+from travel_agent.planning import (
+    apply_structured_schedule_constraints,
+    build_simple_itinerary,
+)
 from travel_agent.reviser import revise_itinerary
 from travel_agent.schemas import (
     CriticResult,
@@ -36,6 +39,17 @@ except Exception:  # pragma: no cover - 依赖未安装时回退为纯函数实�
 
 
 DEFAULT_MAX_ITERS = 3
+_ACTIONABLE_REVISER_ISSUES = {
+    "avoid_term_included",
+    "dietary_constraint_violated",
+    "must_visit_missing",
+    "interest_not_covered",
+    "route_too_long",
+    "daily_route_too_long",
+    "walking_distance_exceeded",
+    "daily_activity_sparse",
+    "daily_meal_missing",
+}
 
 
 class PlanState(TypedDict, total=False):
@@ -48,6 +62,7 @@ class PlanState(TypedDict, total=False):
     revision_notes: list[str]
     iteration: int
     max_iters: int
+    revision_changed: bool
 
 
 @dataclass(frozen=True)
@@ -73,6 +88,7 @@ def _plan_node(state: PlanState) -> PlanState:
         ranked_pois=state["ranked_pois"],
         profile=state["profile"],
         route_estimator=state.get("route_estimator"),
+        preserve_must_visit_capacity=True,
     )
     return {"itinerary": itinerary, "original_itinerary": itinerary, "iteration": 0}
 
@@ -89,18 +105,37 @@ def _revise_node(state: PlanState) -> PlanState:
         profile=state["profile"],
         critic_result=state["critic_result"],
     )
+    constrained_days = apply_structured_schedule_constraints(
+        list(revised.days),
+        state["ranked_pois"],
+        state["profile"],
+        state.get("route_estimator"),
+    )
+    revised = Itinerary(
+        city=revised.city,
+        days=constrained_days,
+        summary=revised.summary,
+    )
+    result = critique_itinerary(revised, state["profile"])
     accumulated = list(state.get("revision_notes", [])) + notes
     return {
         "itinerary": revised,
         "critic_result": result,
         "revision_notes": accumulated,
         "iteration": state.get("iteration", 0) + 1,
+        "revision_changed": bool(notes),
     }
 
 
 def _should_revise(state: PlanState) -> str:
     critic_result = state.get("critic_result")
-    if critic_result is not None and critic_result.passed:
+    if critic_result is not None and not critic_result.issues:
+        return "done"
+    if critic_result is not None and not any(
+        issue.code in _ACTIONABLE_REVISER_ISSUES for issue in critic_result.issues
+    ):
+        return "done"
+    if state.get("iteration", 0) > 0 and state.get("revision_changed") is False:
         return "done"
     if state.get("iteration", 0) >= state.get("max_iters", DEFAULT_MAX_ITERS):
         return "done"

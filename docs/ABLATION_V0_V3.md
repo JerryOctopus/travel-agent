@@ -44,7 +44,7 @@ V3:  V2 + Reviewer（无工具单次 LLM 语义审查）；
 | 主模型 | 四版本统一用 `settings.llm`（同一 provider/model）；评测不提供逐版本换模型入口 |
 | 工具 | 同一份 toolkit；每个 Subagent 只暴露 `SUBAGENT_REGISTRY` 白名单内的工具子集，Orchestrator 不持有渲染/派工外重工具，工具实现零分叉 |
 | 工具数据 | 同一 harness snapshot（`data/eval/live_tools/`） |
-| 测试集 | production_v1 180 条（dev 30 调优 / core+challenge 120 定版 / shadow 30 仅最终版，`data/eval/production_v1/`，详见 docs/EVALUATION_PRODUCT.md） |
+| 测试集 | production_v1.1 192 条（dev 34 调优 / core+challenge 128 定版 / shadow 30 仅最终版，`data/eval/production_v1/`，详见 docs/EVALUATION_PRODUCT.md） |
 | 预算边界 | 同一 Token 硬上限（`--token-budget` / `variant_token_budget`），四版本同样"硬" |
 | 业务规则 | Orchestrator / Subagent / Reviewer 的 prompt 由同一套构建函数生成，共享业务规则；V0 基线复用生产 `_run_react` 全工具链路，行为不变 |
 | Subagent 实现 | V1–V3 复用同一份 `SUBAGENT_REGISTRY` 定义与 executor ReAct 循环，零分叉 |
@@ -87,7 +87,7 @@ Reviewer 不属于 `SUBAGENT_REGISTRY`，是 Engine 直接控制的**无工具�
 # dev 集调优（30 条，可反复跑）
 .venv/bin/python scripts/eval_ablation.py --product-split dev
 
-# 阶段一：定版集正式对比（core 90 + challenge 30，禁止用于调优）
+# 阶段一：定版集正式对比（core 94 + challenge 34，禁止用于调优）
 .venv/bin/python scripts/eval_ablation.py --product-split core_frozen
 .venv/bin/python scripts/eval_ablation.py --product-split challenge_frozen
 

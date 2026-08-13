@@ -179,7 +179,9 @@ def test_fixed_dispatch_map_covers_all_task_types_without_full_fallback():
     assert resolve_task_batches(TaskType.ROUTE_QUERY) == (("transport",),)
     assert resolve_task_batches(TaskType.DAY_ADVICE) == (("attraction",),)
     assert resolve_task_batches(None) is None
+    assert resolve_task_batches(TaskType.UNKNOWN) is None
     assert needs_clarification(None)
+    assert needs_clarification(TaskType.UNKNOWN)
     full = resolve_task_batches(TaskType.FULL_TRIP_PLAN)
     assert full == (("attraction", "hotel", "restaurant"), ("transport",), ("planner",))
 
@@ -412,6 +414,104 @@ def test_reviewer_prompt_contains_context_and_no_tools():
     text = reviewer_prompt(ctx)
     assert "req_r" in text and "杭州两日" in text
     assert "不拥有任何工具" in text
+    assert "不要求把酒店塞进 itinerary.days[].stops" in text
+    assert "candidate_attractions 是待核验/比较的候选集合" in text
+    assert "不要求每种方式都必须出现在最终路线" in text
+
+
+def test_reviewer_downgrades_unsupported_candidate_omission():
+    ctx = ReviewContext(
+        request_id="req_candidate",
+        plan={"critic": {"passed": True}},
+        profile_brief={
+            "must_visit": [],
+            "constraint_state": {"candidate_attractions": ["甲博物馆"]},
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "failed",
+            "issues": [{
+                "issue_type": "candidate_missing",
+                "severity": "critical",
+                "description": "候选甲博物馆未安排，可能体验不完整。",
+                "evidence": ["缺乏明确证据"],
+                "repair_target": "planner",
+                "repair_instruction": "加入候选",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+    assert resolve_delivery_status(
+        review, reviewer_enabled=True, max_rework=1, rework_used=0
+    ) == ("completed_with_warnings", False)
+
+
+def test_reviewer_downgrades_inferred_weekday_and_preserved_fixed_event_claims():
+    ctx = ReviewContext(
+        request_id="req_fixed",
+        plan={"critic": {"passed": True}},
+        profile_brief={
+            "constraint_state": {
+                "fixed_events": [{"day": 2, "start": "18:00", "end": "20:00", "location": "陆家嘴"}],
+            },
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "failed",
+            "issues": [
+                {
+                    "issue_type": "weekday_guess",
+                    "severity": "critical",
+                    "description": "根据第二天活动推断第一天为周二。",
+                    "evidence": ["推断的星期"],
+                    "repair_target": "planner",
+                    "repair_instruction": "换日",
+                },
+                {
+                    "issue_type": "appointment_missing",
+                    "severity": "recoverable",
+                    "description": "晚饭预约未安排。",
+                    "evidence": ["未包含晚饭预约"],
+                    "repair_target": "planner",
+                    "repair_instruction": "补预约",
+                },
+            ],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert {issue.severity for issue in review.issues} == {"noncritical"}
+
+
+def test_reviewer_does_not_treat_missing_meal_as_dietary_violation():
+    ctx = ReviewContext(
+        request_id="req_dietary",
+        plan={"critic": {"passed": True}},
+        profile_brief={"constraint_state": {"dietary": ["仅清真餐厅"]}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "failed",
+            "issues": [{
+                "issue_type": "dietary",
+                "severity": "critical",
+                "description": "第三天未安排任何餐饮，没有任何清真餐厅。",
+                "evidence": ["当天没有包含任何餐厅"],
+                "repair_target": "planner",
+                "repair_instruction": "补餐厅",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
 
 
 # --- Reviewer 触发判定 ----------------------------------------------------------- #

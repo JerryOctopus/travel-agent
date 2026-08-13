@@ -106,6 +106,29 @@ class TurnMeter:
             if self.token_budget > 0 and self.total_tokens >= self.token_budget:
                 self.budget_exhausted = True
 
+    def fail_pending_llm(self, role: str, error: str) -> int:
+        """Finalize calls abandoned by an outer wall-clock timeout.
+
+        A provider callback may finish later on a background thread. Closing
+        its shared pending record here keeps the persisted turn snapshot final;
+        the late callback then becomes a harmless no-op.
+        """
+        with self._lock:
+            call_ids = [
+                call_id
+                for call_id, (pending_role, _reserve, _started) in self._pending.items()
+                if pending_role == role
+            ]
+        for call_id in call_ids:
+            self.finish_llm(
+                call_id,
+                input_tokens=None,
+                output_tokens=None,
+                total_tokens=None,
+                error=error,
+            )
+        return len(call_ids)
+
     def begin_tool(self, role: str) -> float:
         with self._lock:
             tool_calls = sum(item.tool_calls for item in self._roles.values())
@@ -148,6 +171,10 @@ class TurnMeter:
         with self._lock:
             if self._finished_at is None:
                 self._finished_at = time.time()
+
+    @property
+    def started_monotonic(self) -> float:
+        return self._started_monotonic
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:

@@ -79,7 +79,7 @@ def evaluate_plan_artifact(
     profile = profile or {}
     issues: list[str] = []
 
-    poi_city_valid = _check_poi_city_valid(itinerary, issues)
+    poi_city_valid = _check_poi_city_valid(itinerary, profile, issues)
     meal_time_valid = _check_meal_time_valid(itinerary, issues)
     daily_load_valid = _check_daily_load_valid(itinerary, profile, issues)
     route_feasible = _check_route_feasible(itinerary, profile, issues)
@@ -109,19 +109,48 @@ def evaluate_plan_artifact(
     )
 
 
-def _check_poi_city_valid(itinerary: dict[str, Any], issues: list[str]) -> bool:
+def _check_poi_city_valid(
+    itinerary: dict[str, Any], profile: dict[str, Any], issues: list[str]
+) -> bool:
     target_city = itinerary.get("city")
+    state = profile.get("constraint_state") or {}
+    explicit_cross_city_terms = [str(item) for item in (profile.get("must_visit") or [])]
+    explicit_cross_city_terms.extend(
+        str(event.get("location") or "")
+        for event in (state.get("fixed_events") or [])
+        if isinstance(event, dict)
+    )
+    allowed_cities = {str(item) for item in (state.get("destinations") or []) if item}
     ok = True
     for stop in _iter_stops(itinerary):
         poi = stop.get("poi") or {}
         city = poi.get("city")
-        if target_city and city and city != target_city:
+        name = str(poi.get("name") or "")
+        explicitly_required = any(
+            term and (term in name or name in term) for term in explicit_cross_city_terms
+        )
+        if (
+            target_city
+            and city
+            and _normalize_city(city) != _normalize_city(target_city)
+            and _normalize_city(city)
+            not in {_normalize_city(item) for item in allowed_cities}
+            and not explicitly_required
+        ):
             issues.append(f"poi_city_mismatch:{poi.get('name')}:{city}!={target_city}")
             ok = False
         if not _valid_coordinate(poi.get("lat"), poi.get("lng")):
             issues.append(f"invalid_coordinate:{poi.get('name')}")
             ok = False
     return ok
+
+
+def _normalize_city(value: Any) -> str:
+    text = str(value or "").strip()
+    for suffix in ("特别行政区", "自治州", "地区", "盟", "市"):
+        if text.endswith(suffix) and len(text) > len(suffix):
+            return text[: -len(suffix)]
+    return text
 
 
 def _check_meal_time_valid(itinerary: dict[str, Any], issues: list[str]) -> bool:
@@ -161,15 +190,29 @@ def _check_route_feasible(
     pace = str(profile.get("pace") or "standard")
     max_single = PACE_MAX_SINGLE_ROUTE_MIN.get(pace, PACE_MAX_SINGLE_ROUTE_MIN["standard"])
     max_daily = PACE_MAX_DAILY_ROUTE_MIN.get(pace, PACE_MAX_DAILY_ROUTE_MIN["standard"])
+    state = profile.get("constraint_state") or {}
+    try:
+        walking_limit = (
+            float(state.get("max_walking_km_per_day"))
+            if state.get("max_walking_km_per_day") is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        walking_limit = None
     ok = True
     for day in itinerary.get("days", []):
         total = 0
+        walking_total = 0.0
         for stop in day.get("stops", []):
             route = stop.get("route_from_previous")
             if not route:
                 continue
             duration = int(route.get("duration_min") or 0)
             total += duration
+            if route.get("walking_distance_km") is not None:
+                walking_total += float(route.get("walking_distance_km") or 0)
+            elif route.get("mode") == "walk":
+                walking_total += float(route.get("distance_km") or 0)
             if duration > max_single:
                 issues.append(
                     f"route_too_long:day{day.get('day_index')}:{duration}>{max_single}"
@@ -178,6 +221,12 @@ def _check_route_feasible(
         if total > max_daily:
             issues.append(
                 f"daily_route_too_long:day{day.get('day_index')}:{total}>{max_daily}"
+            )
+            ok = False
+        if walking_limit is not None and walking_total > walking_limit:
+            issues.append(
+                f"walking_distance_exceeded:day{day.get('day_index')}:"
+                f"{walking_total:.1f}>{walking_limit:g}"
             )
             ok = False
     return ok

@@ -23,8 +23,14 @@ def isolate_settings(monkeypatch, tmp_path):
     monkeypatch.delenv("TRAVEL_AGENT_LLM_API_KEY", raising=False)
     monkeypatch.delenv("TRAVEL_AGENT_AMAP_WEB_KEY", raising=False)
     monkeypatch.delenv("TRAVEL_AGENT_AMAP_JS_KEY", raising=False)
-    monkeypatch.setenv("TRAVEL_AGENT_LAYERED_ENABLED", "false")
+    monkeypatch.setenv("TRAVEL_AGENT_MEMORY_BACKEND", "json")
+    monkeypatch.delenv("TRAVEL_AGENT_DATABASE_URL", raising=False)
+    monkeypatch.setenv("TRAVEL_AGENT_PROFILE_DIR", str(profiles))
+    monkeypatch.setenv("TRAVEL_AGENT_ARTIFACT_DIR", str(artifacts))
     get_settings.cache_clear()
+    from travel_agent.storage.user_memory import close_user_memory_services
+
+    close_user_memory_services()
 
     import travel_agent.server as server_module
 
@@ -34,6 +40,7 @@ def isolate_settings(monkeypatch, tmp_path):
     )
 
     yield
+    close_user_memory_services()
     get_settings.cache_clear()
 
 

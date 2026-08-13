@@ -2,9 +2,97 @@
 
 > ⚠️ **状态更新（Step 4）**：本文档主体是项目初期的工作流设计记录。
 > 现行生产链路已收敛为多 Agent 架构：`run_production_turn` 固定调用
-> `MultiAgentEngine`（Main Orchestrator + 五个领域 Subagent + Reviewer +
+> `MultiAgentEngine`（Main Orchestrator + 四个领域调研 Subagent + Planner
+> Subagent + Reviewer +
 > Renderer Gate，即 Multi-Agent Full = V3）；V0–V3 消融见
 > [ABLATION_V0_V3.md](ABLATION_V0_V3.md)，可观测性统一为 agent_trace。
+
+## 现行生产多 Agent 链路
+
+生产请求的主调用链是：
+
+```text
+run_production_turn()        生产对外入口，固定使用 PRODUCTION_CONFIG
+  -> run_architecture_turn() 准备会话与用户记忆
+  -> run_turn_lifecycle()    单轮生命周期：预检、预算、降级和结果转换
+  -> prepare_turn()          识别任务、更新画像、构造 turn_inputs
+  -> MultiAgentEngine.run_turn()
+  -> MultiAgentEngine._run_turn()
+  -> run_dynamic_base()      V2/V3 动态路由与领域执行
+```
+
+`run_turn_lifecycle()` 是每轮请求的公共上层入口，
+`MultiAgentEngine.run_turn()` 是多 Agent Engine 入口，`run_dynamic_base()`
+才是生产 V3 动态路由的具体执行入口。如果预检需要追问，或
+`settings.llm.enabled == false`，请求不会进入动态路由。
+
+### 轮次结构化输入
+
+`prepare_turn()` 使用“确定性规则优先、LLM 可选增强、失败回退规则”的方式
+分析当前消息。结果会更新 `ctx.profile`，并构造所有 Subagent
+共享的 `turn_inputs`（在派工时作为 `base_inputs`）：
+
+```python
+{
+    "artifact_ids": artifact_ids,
+    "plan_artifact_id": existing_plan_id,
+    "revision_directives": dict(analysis.revision_directives),
+    "profile": toolkit._profile_brief(ctx.profile),
+}
+```
+
+- `profile`：当前结构化旅行画像，可包含历史轮次累积的有效偏好；
+- `revision_directives`：本轮对旧行程的确定性修改指令；
+- `artifact_ids`：允许本轮使用的产物引用，不是产物正文摘要；
+- `plan_artifact_id`：行程修改场景中的旧行程 ID。
+
+每次派工的专属 `inputs` 会覆盖同名的 `base_inputs` 普通字段；
+`artifact_ids` 例外，两边会合并去重。
+
+### 动态 Router 和 wave 预算
+
+生产配置是 `mode="orchestrated"`、`dispatch="dynamic"`，因此进入
+`run_dynamic_base()`。一个 wave 是一轮完整的“检查证据 → 调用 Router →
+派工 → 收集结果”，不只是一次检查。
+
+- `routing_max_waves`：最多允许的执行 wave 数，代码将其限制在 1–3；
+- `routing_max_calls`：Router 模型的最多调用数，代码将其限制在 1–3；
+- `routing_max_dispatches`：所有 wave 累计最多派发的领域任务数，默认 6；
+- `routing_wave1_max_tasks`：首个 wave 最多的并行任务数，限制在 1–4；
+- 后续 wave 每轮最多派发 2 个补充任务。
+
+当前实现是“每个 wave 恰好调用一次 Router”，所以可执行的路由轮数
+实际同时受 `min(routing_max_waves, routing_max_calls)` 约束。两个配置分别表达
+编排深度与模型调用成本，但在当前 one-call-per-wave 实现中作用接近。
+
+### Subagent 分层与职责
+
+`SUBAGENT_REGISTRY` 一共注册 5 个执行型 Subagent，但动态 Router 只能从
+4 个领域调研 Subagent 中按需选择：
+
+| Subagent | 职责 | 工具白名单 | 调用方式 |
+|---|---|---|---|
+| `attraction` | 景点搜索、兴趣匹配、天气适配、适老与无障碍提示 | `search_poi`, `check_weather` | Router 动态派发 |
+| `hotel` | 酒店候选、住宿区域、价格档位与商圈比较 | `search_hotel` | Router 动态派发 |
+| `restaurant` | 餐厅搜索、口味与饮食限制、人均预算 | `search_restaurant`, `estimate_budget` | Router 动态派发 |
+| `transport` | 市内/城际路线、换乘、步行、耗时和返程截止风险 | `search_poi`, `plan_route`, `estimate_budget` | Router 动态派发 |
+| `planner` | 读取明确的领域 Artifact，聚合约束与证据，生成完整 `TravelPlan` | `build_constraints`, `recommend_candidates`, `plan_and_critique` | Engine 在证据阶段后确定性调用 |
+
+Router 通过 Registry 中的 `description` 知道每个领域 Subagent 的职责和工具边界，
+再根据用户请求与已有证据动态生成每次任务的 `instruction`、`objective`
+和 `depends_on`。Router 不能派发 `planner`、Reviewer 或 repair；Planner 由 Engine
+在领域证据就绪后调用，避免无证据规划或跳过规划阶段。
+
+Reviewer 不在 `SUBAGENT_REGISTRY` 中，也不经过 `SubagentRunner`。它是 Engine
+在 Planner 完成后直接发起的一次无工具 LLM 调用；生产 V3 最多允许一次
+“定向重派领域 Subagent → Planner 重规划 → Reviewer 复审”修复周期。
+
+因此数量口径是：
+
+- Router 可动态派发的 Subagent：4 个；
+- Registry 中的执行型 Subagent：5 个（上述 4 个 + `planner`）；
+- 整个多 Agent 链路的独立角色：Main Router + 5 个执行型 Subagent +
+  Reviewer；Renderer Gate 是确定性交付门禁，不是 Subagent。
 
 ## 系统形态
 

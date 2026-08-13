@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from travel_agent.orchestration.multi_agent.dispatch_rules import (
@@ -35,6 +37,7 @@ def run_fixed_dispatch(
     task_brief: str,
     inputs: dict | None = None,
     constraints: dict | None = None,
+    deadline: Any | None = None,
 ) -> tuple[str, list[SubagentResult]]:
     """执行 V1 固定派工，返回 ``(status, results)``。
 
@@ -53,50 +56,114 @@ def run_fixed_dispatch(
 
     tasks: list[SubagentTask] = tasks_or_sentinel  # type: ignore[assignment]
     results_by_id: dict[str, SubagentResult] = {}
-    ordered: list[SubagentResult] = []
-    for task in tasks:
-        from travel_agent.orchestration.meter import current_turn_meter
+    pending = list(tasks)
+    while pending:
+        ready = [task for task in pending if all(dep in results_by_id for dep in task.depends_on)]
+        if not ready:  # malformed fixed DAG; fail closed without spinning
+            for task in pending:
+                results_by_id[task.task_id] = _dependency_failure(
+                    task,
+                    [dep for dep in task.depends_on if dep not in results_by_id],
+                )
+            break
 
-        meter = current_turn_meter()
-        if meter is not None:
-            meter.record_dispatch(task.agent)
-        upstream_artifacts: list[str] = []
-        unresolved_dependencies: list[str] = []
-        for dep_id in task.depends_on:
-            dep_result = results_by_id.get(dep_id)
-            if dep_result is None or dep_result.status not in {
-                STATUS_COMPLETED,
-                STATUS_COMPLETED_WITH_WARNINGS,
-            }:
-                unresolved_dependencies.append(dep_id)
+        executable: list[SubagentTask] = []
+        for task in ready:
+            upstream_artifacts: list[str] = []
+            unresolved_dependencies: list[str] = []
+            for dep_id in task.depends_on:
+                dep_result = results_by_id[dep_id]
+                if dep_result.status not in {
+                    STATUS_COMPLETED,
+                    STATUS_COMPLETED_WITH_WARNINGS,
+                }:
+                    unresolved_dependencies.append(dep_id)
+                    continue
+                artifact_ids = _evidence_artifact_ids(dep_result)
+                if not artifact_ids:
+                    unresolved_dependencies.append(dep_id)
+                    continue
+                upstream_artifacts.extend(artifact_ids)
+            if unresolved_dependencies:
+                results_by_id[task.task_id] = _dependency_failure(
+                    task, unresolved_dependencies
+                )
                 continue
-            artifact_ids = _evidence_artifact_ids(dep_result)
-            if not artifact_ids:
-                unresolved_dependencies.append(dep_id)
-                continue
-            upstream_artifacts.extend(artifact_ids)
-        if unresolved_dependencies:
-            result = SubagentResult(
-                request_id=request_id,
-                task_id=task.task_id,
-                agent=task.agent,
-                status=STATUS_FAILED,
-                error=f"unresolved dependencies: {unresolved_dependencies}",
-                unresolved=[f"dependency:{item}" for item in unresolved_dependencies],
-            )
-            results_by_id[task.task_id] = result
-            ordered.append(result)
-            continue
-        if upstream_artifacts:
-            merged = list(task.inputs.get("artifact_ids") or [])
-            for aid in upstream_artifacts:
-                if aid not in merged:
-                    merged.append(aid)
-            task.inputs["artifact_ids"] = merged
-        result = runner.run_subagent(task)
-        results_by_id[task.task_id] = result
-        ordered.append(result)
-    return STATUS_COMPLETED, ordered
+            if upstream_artifacts:
+                task.inputs["artifact_ids"] = list(
+                    dict.fromkeys(
+                        list(task.inputs.get("artifact_ids") or []) + upstream_artifacts
+                    )
+                )
+            executable.append(task)
+
+        if executable:
+            timeout = _fixed_batch_timeout(executable, deadline)
+            with ThreadPoolExecutor(
+                max_workers=len(executable), thread_name_prefix="fixed-wave"
+            ) as pool:
+                futures = {}
+                for task in executable:
+                    from travel_agent.orchestration.meter import current_turn_meter
+
+                    meter = current_turn_meter()
+                    if meter is not None:
+                        meter.record_dispatch(task.agent)
+                    context = contextvars.copy_context()
+                    futures[task.task_id] = pool.submit(
+                        context.run,
+                        _run_with_optional_timeout,
+                        runner,
+                        task,
+                        timeout,
+                    )
+                for task in executable:
+                    results_by_id[task.task_id] = futures[task.task_id].result()
+
+        ready_ids = {task.task_id for task in ready}
+        pending = [task for task in pending if task.task_id not in ready_ids]
+
+    return STATUS_COMPLETED, [results_by_id[task.task_id] for task in tasks]
+
+
+def _fixed_batch_timeout(tasks: list[SubagentTask], deadline: Any | None) -> float | None:
+    if deadline is None:
+        return None
+    if any(task.agent == "planner" for task in tasks):
+        from travel_agent.orchestration.multi_agent.registry import SUBAGENT_REGISTRY
+
+        component = max(SUBAGENT_REGISTRY[task.agent].timeout_seconds for task in tasks)
+        return deadline.planner_timeout(component)
+    from travel_agent.orchestration.multi_agent.registry import SUBAGENT_REGISTRY
+
+    component = max(SUBAGENT_REGISTRY[task.agent].timeout_seconds for task in tasks)
+    return deadline.effective_preplanner_timeout(component)
+
+
+def _run_with_optional_timeout(
+    runner: Any,
+    task: SubagentTask,
+    timeout: float | None,
+) -> SubagentResult:
+    if timeout is None:
+        return runner.run_subagent(task)
+    try:
+        return runner.run_subagent(task, timeout_seconds=timeout)
+    except TypeError as exc:
+        if "timeout_seconds" not in str(exc):
+            raise
+        return runner.run_subagent(task)
+
+
+def _dependency_failure(task: SubagentTask, unresolved: list[str]) -> SubagentResult:
+    return SubagentResult(
+        request_id=task.request_id,
+        task_id=task.task_id,
+        agent=task.agent,
+        status=STATUS_FAILED,
+        error=f"unresolved dependencies: {unresolved}",
+        unresolved=[f"dependency:{item}" for item in unresolved],
+    )
 
 
 def _evidence_artifact_ids(result: SubagentResult) -> list[str]:

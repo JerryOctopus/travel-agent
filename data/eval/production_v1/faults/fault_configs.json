@@ -1,0 +1,107 @@
+[
+  {
+    "fault_id": "F01_TIMEOUT",
+    "name": "工具超时",
+    "target": "route_planning",
+    "injection": {
+      "type": "timeout",
+      "trigger_call_index": 1
+    },
+    "expected": [
+      "有限重试",
+      "失败后保守降级"
+    ]
+  },
+  {
+    "fault_id": "F02_RATE_LIMIT",
+    "name": "429限流",
+    "target": "poi_search",
+    "injection": {
+      "type": "http_error",
+      "status": 429
+    },
+    "expected": [
+      "退避重试或缓存",
+      "禁止高频轰炸"
+    ]
+  },
+  {
+    "fault_id": "F03_SERVER_ERROR",
+    "name": "5xx错误",
+    "target": "poi_search",
+    "injection": {
+      "type": "http_error",
+      "status": 503
+    },
+    "expected": [
+      "有限重试",
+      "安全降级"
+    ]
+  },
+  {
+    "fault_id": "F04_EMPTY_RESULT",
+    "name": "合法空结果",
+    "target": "poi_search",
+    "injection": {
+      "type": "empty_success_response"
+    },
+    "expected": [
+      "调整关键词或半径",
+      "说明放宽条件"
+    ]
+  },
+  {
+    "fault_id": "F05_MISSING_FIELDS",
+    "name": "字段缺失",
+    "target": "poi_search",
+    "injection": {
+      "type": "drop_fields",
+      "fields": [
+        "distance",
+        "business_area"
+      ]
+    },
+    "expected": [
+      "容错解析",
+      "不伪造精确距离"
+    ]
+  },
+  {
+    "fault_id": "F06_DUPLICATE_CONFLICT",
+    "name": "重复冲突POI",
+    "target": "poi_search",
+    "injection": {
+      "type": "duplicate_and_conflict",
+      "duplicate_ratio": 0.4
+    },
+    "expected": [
+      "实体去重",
+      "冲突信息重查或降权"
+    ]
+  },
+  {
+    "fault_id": "F07_MALFORMED_JSON",
+    "name": "JSON异常",
+    "target": "any_tool",
+    "injection": {
+      "type": "malformed_json"
+    },
+    "expected": [
+      "结构化重试或修复",
+      "安全终止分支"
+    ]
+  },
+  {
+    "fault_id": "F08_AGENT_LOOP",
+    "name": "子Agent无进展循环",
+    "target": "subagent",
+    "injection": {
+      "type": "loop_signal",
+      "max_no_progress_steps": 3
+    },
+    "expected": [
+      "Supervisor终止分支",
+      "使用已有证据降级"
+    ]
+  }
+]

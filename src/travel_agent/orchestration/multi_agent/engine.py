@@ -23,11 +23,18 @@
 
 from __future__ import annotations
 
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import hashlib
+import json
+import re
+import time
 from typing import Any
 
 from travel_agent.agent.turn_analysis import TaskType
 from travel_agent.orchestration.multi_agent.schemas import (
+    SEVERITY_RECOVERABLE,
     STATUS_CLARIFICATION_REQUIRED,
     STATUS_COMPLETED,
     STATUS_COMPLETED_WITH_WARNINGS,
@@ -119,6 +126,27 @@ class TurnOutcome:
     gate_status: str = "skipped"
     review: ReviewResult | None = None
     trace_artifact_id: str | None = None
+    routing_policy_hash: str = ""
+
+
+@dataclass(frozen=True)
+class DynamicBaseOutcome:
+    """Immutable V2/V3 base result; production variants execute it independently."""
+
+    status: str
+    reply: str
+    results: tuple[SubagentResult, ...] = ()
+    plan_artifact_id: str | None = None
+    routing_policy_hash: str = ""
+
+    def to_turn_outcome(self) -> TurnOutcome:
+        return TurnOutcome(
+            status=self.status,
+            reply=self.reply,
+            results=list(self.results),
+            plan_artifact_id=self.plan_artifact_id,
+            routing_policy_hash=self.routing_policy_hash,
+        )
 
 
 class MultiAgentEngine:
@@ -220,6 +248,9 @@ class MultiAgentEngine:
         turn_inputs: dict[str, Any] | None = None,
     ) -> TurnOutcome:
         rid = request_id or new_request_id()
+        from travel_agent.orchestration.multi_agent.deadlines import TurnDeadline
+
+        deadline = TurnDeadline.start(settings)
         if self.capabilities.mode == "single":
             outcome = self._run_v0(ctx, settings, user_message, history or [], rid)
         else:
@@ -228,6 +259,7 @@ class MultiAgentEngine:
                 outcome = self._run_fixed(
                     ctx,
                     runner,
+                    deadline,
                     rid,
                     task_type,
                     task_brief or user_message,
@@ -235,10 +267,11 @@ class MultiAgentEngine:
                     turn_inputs or {},
                 )
             else:
-                outcome = self._run_dynamic(
+                outcome = self.run_dynamic_base(
                     ctx,
                     settings,
                     runner,
+                    deadline,
                     rid,
                     user_message,
                     task_brief,
@@ -246,7 +279,7 @@ class MultiAgentEngine:
                     history or [],
                     existing_plan_artifact_id,
                     turn_inputs or {},
-                )
+                ).to_turn_outcome()
 
         if outcome.status == STATUS_CLARIFICATION_REQUIRED:
             self._flush_trace(ctx, rid, outcome)
@@ -265,7 +298,13 @@ class MultiAgentEngine:
                 outcome.reply = "Planner 未成功产出本轮 TravelPlan，当前结果不可交付。"
         elif outcome.plan_artifact_id:
             self._apply_review_and_render(
-                ctx, settings, outcome, task_type, task_brief or user_message, rid
+                ctx,
+                settings,
+                outcome,
+                task_type,
+                task_brief or user_message,
+                rid,
+                deadline,
             )
         self._flush_trace(ctx, rid, outcome)
         return outcome
@@ -287,6 +326,7 @@ class MultiAgentEngine:
                 "dispatch": self.capabilities.dispatch,
                 "rework_used": outcome.rework_used,
                 "plan_artifact_id": outcome.plan_artifact_id,
+                "routing_policy_hash": outcome.routing_policy_hash,
             },
         )
         if outcome.plan_artifact_id:
@@ -359,6 +399,7 @@ class MultiAgentEngine:
         self,
         ctx: Any,
         runner: Any,
+        deadline: Any,
         request_id: str,
         task_type: TaskType | None,
         task_brief: str,
@@ -380,6 +421,7 @@ class MultiAgentEngine:
             inputs=_fixed_turn_inputs(
                 task_type, existing_plan_artifact_id, turn_inputs
             ),
+            deadline=deadline,
         )
         if status == STATUS_CLARIFICATION_REQUIRED:
             return TurnOutcome(
@@ -392,11 +434,12 @@ class MultiAgentEngine:
     # ------------------------------------------------------------------ #
     # V2/V3：动态 Orchestrator
     # ------------------------------------------------------------------ #
-    def _run_dynamic(
+    def run_dynamic_base(
         self,
         ctx: Any,
         settings: Any,
         runner: Any,
+        deadline: Any,
         request_id: str,
         user_message: str,
         task_brief: str,
@@ -404,54 +447,318 @@ class MultiAgentEngine:
         history: list[tuple[str, str]],
         existing_plan_artifact_id: str | None,
         turn_inputs: dict[str, Any],
-    ) -> TurnOutcome:
-        from travel_agent.orchestration.multi_agent.orchestrator_agent import run_orchestrator
+    ) -> DynamicBaseOutcome:
+        """Shared V2/V3 wave state machine. It never inspects reviewer capability."""
+        from travel_agent.orchestration.multi_agent.orchestrator import DispatchLedger
+        from travel_agent.orchestration.multi_agent.orchestrator_agent import (
+            route_wave,
+            routing_policy_hash,
+        )
+        from travel_agent.orchestration.multi_agent.trace import current_trace
 
-        import inspect
+        orchestration = getattr(settings, "orchestration", None)
+        max_waves = max(1, min(3, int(getattr(orchestration, "routing_max_waves", 3) or 3)))
+        max_calls = max(1, min(3, int(getattr(orchestration, "routing_max_calls", 3) or 3)))
+        max_dispatches = max(
+            1, int(getattr(orchestration, "routing_max_dispatches", 6) or 6)
+        )
+        wave1_max = max(
+            1, min(4, int(getattr(orchestration, "routing_wave1_max_tasks", 4) or 4))
+        )
+        # 给“当前 Router 路由策略”生成一个稳定指纹
+        policy_hash = routing_policy_hash(settings)
+        # 限制任务调度次数
+        ledger = DispatchLedger(
+            max_total=max_dispatches,
+            per_agent_limits={
+                "attraction": 2,
+                "hotel": 2,
+                "restaurant": 2,
+                "transport": 2,
+                "planner": 0,
+            },
+        )
+        base_inputs = _fixed_turn_inputs(
+            task_type, existing_plan_artifact_id, turn_inputs
+        )
+        results: list[SubagentResult] = []
+        attempted: list[str] = [] # 保存已经尝试过的派工目标
+        router_calls = 0
+        last_wave_results: list[SubagentResult] = [] # 上一波派工的结果
+        stop_reason = "routing_exhausted" # 默认停止原因
+        trace = current_trace()
 
-        if "history" in inspect.signature(run_orchestrator).parameters:
-            orch = run_orchestrator(
+        for wave in range(1, max_waves + 1):
+            missing_hard, _missing_soft = _required_evidence(
+                ctx, task_type, results, base_inputs
+            )
+            if wave > 1 and not missing_hard:
+                stop_reason = "hard_evidence_ready"
+                break
+            if router_calls >= max_calls or ledger.attempts >= max_dispatches:
+                stop_reason = "routing_budget_exhausted"
+                break
+            if wave > 1 and not deadline.admits_recovery_wave():
+                stop_reason = "recovery_admission_denied"
+                break
+            if wave == 3 and not _wave3_recovery_allowed(
+                last_wave_results, missing_hard
+            ):
+                stop_reason = "wave3_conditions_not_met"
+                break
+
+            if not deadline.admits_router():
+                stop_reason = "router_admission_denied"
+                break
+            router_admission = deadline.trace_detail()
+            router_timeout = deadline.router_timeout_preserving_worker()
+            if router_timeout <= 0:
+                stop_reason = "no_usable_preplanner_time"
+                break
+            remaining_dispatch = max_dispatches - ledger.attempts
+            max_tasks = min(wave1_max if wave == 1 else 2, remaining_dispatch)
+            decision = route_wave(
                 ctx,
                 settings,
                 user_message,
                 request_id,
-                runner=runner,
+                wave=wave,
                 model=self._orchestrator_model,
                 history=history,
                 task_type=task_type,
-                turn_inputs=_fixed_turn_inputs(
-                    task_type, existing_plan_artifact_id, turn_inputs
-                ),
+                turn_inputs=base_inputs,
+                compact_results=_compact_router_results(results),
+                attempted_objectives=attempted,
+                missing_evidence=missing_hard,
+                timeout_seconds=router_timeout,
+                max_tasks=max_tasks,
             )
-        else:
-            # Compatibility for injected legacy adapters.
-            orch = run_orchestrator(
-                ctx,
-                settings,
-                user_message,
-                request_id,
-                runner=runner,
-                model=self._orchestrator_model,
+            router_calls += 1
+            if trace is not None:
+                trace.append(
+                    "routing",
+                    agent="orchestrator",
+                    status="failed" if decision.error else "completed",
+                    attempt=wave,
+                    error=decision.error,
+                    duration_ms=None,
+                    detail={
+                        "wave": wave,
+                        "routing_policy_hash": policy_hash,
+                        "routing_manifest_hash": _routing_manifest_hash(decision),
+                        "readiness": {
+                            "router_ready": decision.ready,
+                            "missing_hard": missing_hard,
+                        },
+                        "objective_key": [task.objective_key for task in decision.tasks],
+                        "admission_required_ms": int(
+                            (
+                                deadline.config.router_useful
+                                + deadline.config.recovery_worker_useful
+                                + deadline.config.planner_reserve
+                                + deadline.config.admission_guard
+                            )
+                            * 1000
+                        ),
+                        "effective_timeout_ms": int(router_timeout * 1000),
+                        "admission": router_admission,
+                        **deadline.trace_detail(),
+                    },
+                )
+            if decision.clarification and not results:
+                return DynamicBaseOutcome(
+                    status=STATUS_CLARIFICATION_REQUIRED,
+                    reply=decision.reply or "需要补充目的地/天数等关键信息。",
+                    routing_policy_hash=policy_hash,
+                )
+            if decision.error:
+                stop_reason = "router_failed"
+                break
+
+            tasks: list[SubagentTask] = []
+            objective_by_task: dict[str, str] = {}
+            known_task_ids = {result.task_id for result in results}
+            successful_task_ids = {
+                result.task_id
+                for result in results
+                if result.status in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}
+            }
+            for routed in decision.tasks:
+                if routed.objective_key in attempted:
+                    continue
+                if any(dep not in known_task_ids for dep in routed.depends_on):
+                    continue
+                if any(dep not in successful_task_ids for dep in routed.depends_on):
+                    continue
+                limit_error = ledger.authorize(routed.agent, routed.objective)
+                if limit_error:
+                    continue
+                attempted.append(routed.objective_key)
+                inputs = dict(base_inputs)
+                artifact_ids = list(
+                    dict.fromkeys(
+                        [str(value) for value in (inputs.get("artifact_ids") or []) if value]
+                        + _all_evidence_ids(results)
+                    )
+                )
+                if artifact_ids:
+                    inputs["artifact_ids"] = artifact_ids
+                task = SubagentTask(
+                    request_id=request_id,
+                    task_id=new_task_id(routed.agent),
+                    agent=routed.agent,
+                    instruction=routed.instruction,
+                    inputs=inputs,
+                    depends_on=list(routed.depends_on),
+                    attempt=ledger.counts.get(routed.agent, 1),
+                )
+                tasks.append(task)
+                objective_by_task[task.task_id] = routed.objective_key
+            if not tasks:
+                stop_reason = "router_ready" if decision.ready else "no_valid_delta_tasks"
+                break
+
+            worker_admission = deadline.trace_detail()
+            worker_timeout = deadline.effective_preplanner_timeout(
+                deadline.config.worker_timeout
             )
-        results = [_dict_to_result(item) for item in orch.get("results", [])]
-        if orch.get("clarification"):
-            return TurnOutcome(
-                status=STATUS_CLARIFICATION_REQUIRED,
-                reply=orch.get("reply") or "需要补充目的地/天数等关键信息。",
-                results=results,
+            if worker_timeout <= 0 or (
+                _task_needs_plan(task_type)
+                and deadline.usable_preplanner_time()
+                < deadline.config.recovery_worker_useful
+            ):
+                stop_reason = "worker_admission_denied"
+                break
+            last_wave_results = _execute_parallel_wave(
+                runner, tasks, timeout_seconds=worker_timeout
             )
-        status = STATUS_COMPLETED
-        if _plan_required_for_turn("dynamic", task_type):
-            planner = next((result for result in reversed(results) if result.agent == "planner"), None)
-            if planner is None or planner.status not in {
-                STATUS_COMPLETED,
-                STATUS_COMPLETED_WITH_WARNINGS,
-            }:
-                status = STATUS_INCOMPLETE
-        return TurnOutcome(
-            status=status,
-            reply=orch.get("reply") or "",
-            results=results,
+            for result in last_wave_results:
+                ledger.record(result)
+            results.extend(last_wave_results)
+            if trace is not None:
+                trace.append(
+                    "wave_execution",
+                    agent="engine",
+                    status="completed",
+                    attempt=wave,
+                    detail={
+                        "wave": wave,
+                        "tasks": [
+                            {
+                                "task_id": result.task_id,
+                                "agent": result.agent,
+                                "objective_key": objective_by_task.get(result.task_id, ""),
+                                "status": result.status,
+                            }
+                            for result in last_wave_results
+                        ],
+                        "effective_timeout_ms": int(worker_timeout * 1000),
+                        "admission": worker_admission,
+                        **deadline.trace_detail(),
+                    },
+                )
+
+        missing_hard, missing_soft = _required_evidence(
+            ctx, task_type, results, base_inputs
+        )
+        if _task_needs_plan(task_type):
+            # Route evidence remains a hard routing target so recovery waves
+            # still dispatch transport. Once all waves are exhausted, the
+            # planner's own estimator plus final critic can safely recover it.
+            if task_type == TaskType.FULL_TRIP_PLAN:
+                missing_hard = [
+                    item for item in missing_hard if item != "路线可行性"
+                ]
+            if missing_hard:
+                _trace_stop(trace, deadline, stop_reason, missing_hard, policy_hash)
+                return DynamicBaseOutcome(
+                    status=STATUS_INCOMPLETE,
+                    reply=_incomplete_evidence_reply(missing_hard),
+                    results=tuple(results),
+                    routing_policy_hash=policy_hash,
+                )
+            if not deadline.admits_planner():
+                _trace_stop(
+                    trace,
+                    deadline,
+                    "planner_admission_denied",
+                    [],
+                    policy_hash,
+                )
+                return DynamicBaseOutcome(
+                    status=STATUS_INCOMPLETE,
+                    reply="领域证据已返回，但剩余时间不足以安全启动 Planner。",
+                    results=tuple(results),
+                    routing_policy_hash=policy_hash,
+                )
+            artifact_ids = list(
+                dict.fromkeys(
+                    [str(value) for value in (base_inputs.get("artifact_ids") or []) if value]
+                    + _all_evidence_ids(results)
+                )
+            )
+            if not artifact_ids:
+                return DynamicBaseOutcome(
+                    status=STATUS_INCOMPLETE,
+                    reply="当前没有可绑定给 Planner 的本轮证据 artifact。",
+                    results=tuple(results),
+                    routing_policy_hash=policy_hash,
+                )
+            planner_inputs = dict(base_inputs)
+            planner_inputs["artifact_ids"] = artifact_ids
+            if existing_plan_artifact_id:
+                planner_inputs["plan_artifact_id"] = existing_plan_artifact_id
+            planner_task = SubagentTask(
+                request_id=request_id,
+                task_id=new_task_id("planner"),
+                agent="planner",
+                instruction=(task_brief or user_message)
+                + "\n基于明确绑定的 artifacts 生成行程；soft evidence 缺失时标记 unresolved。",
+                inputs=planner_inputs,
+            )
+            if trace is not None:
+                trace.append(
+                    "admission",
+                    agent="planner",
+                    status="admitted",
+                    detail={
+                        "effective_timeout_ms": int(
+                            deadline.planner_timeout(deadline.config.planner_timeout)
+                            * 1000
+                        ),
+                        **deadline.trace_detail(),
+                    },
+                )
+            planner_timeout = deadline.planner_timeout(
+                deadline.config.planner_timeout
+            )
+            planner_result = _run_with_optional_timeout(
+                runner, planner_task, planner_timeout
+            )
+            results.append(planner_result)
+            plan_id = _plan_artifact_id_from_results(ctx, [planner_result], request_id)
+            status = _planner_delivery_status(ctx, planner_result, plan_id)
+            reply = planner_result.summary or (
+                "Planner 已生成行程。" if plan_id else "Planner 未产出可交付行程。"
+            )
+            if missing_soft and status != STATUS_COMPLETED:
+                reply += " 未完全覆盖：" + "、".join(missing_soft)
+            return DynamicBaseOutcome(
+                status=status,
+                reply=reply,
+                results=tuple(results),
+                plan_artifact_id=plan_id,
+                routing_policy_hash=policy_hash,
+            )
+
+        reply = _render_lightweight_evidence_reply(
+            ctx, task_type, results, missing_hard
+        )
+        return DynamicBaseOutcome(
+            status=STATUS_COMPLETED if not missing_hard else STATUS_INCOMPLETE,
+            reply=reply,
+            results=tuple(results),
+            routing_policy_hash=policy_hash,
         )
 
     # ------------------------------------------------------------------ #
@@ -465,18 +772,23 @@ class MultiAgentEngine:
         task_type: TaskType | None,
         task_brief: str,
         request_id: str,
+        deadline: Any,
     ) -> None:
         from travel_agent.orchestration.multi_agent.render_gate import render_plan_outcome
 
         delivery = outcome.status
         if requires_semantic_review(self.capabilities, task_type):
-            delivery = self._run_review_cycle(ctx, settings, outcome, task_brief, request_id)
+            delivery = self._run_review_cycle(
+                ctx, settings, outcome, task_brief, request_id, deadline
+            )
 
         allowed_agents = (
             frozenset({"single_agent"})
             if self.capabilities.mode == "single"
             else frozenset({"planner"})
         )
+        render_admission = deadline.trace_detail()
+        render_started = time.monotonic()
         render = render_plan_outcome(
             ctx, outcome.plan_artifact_id, delivery, allowed_agents=allowed_agents
         )
@@ -489,6 +801,20 @@ class MultiAgentEngine:
             outcome.status = delivery if delivery in {STATUS_FAILED, STATUS_INCOMPLETE} else STATUS_INCOMPLETE
         else:
             outcome.status = delivery
+        from travel_agent.orchestration.multi_agent.trace import current_trace
+
+        trace = current_trace()
+        if trace is not None:
+            trace.append(
+                "finalization",
+                agent="renderer",
+                status=outcome.gate_status,
+                duration_ms=round((time.monotonic() - render_started) * 1000, 2),
+                detail={
+                    "admission": render_admission,
+                    **deadline.trace_detail(),
+                },
+            )
 
     def _run_review_cycle(
         self,
@@ -497,6 +823,7 @@ class MultiAgentEngine:
         outcome: TurnOutcome,
         task_brief: str,
         request_id: str,
+        deadline: Any,
     ) -> str:
         from travel_agent.orchestration.multi_agent.review import (
             ReviewContext,
@@ -508,7 +835,20 @@ class MultiAgentEngine:
 
         runner = self._resolve_runner(ctx, settings)
         plan_payload = ctx.store.get(outcome.plan_artifact_id) or {}
-        review_callable = self._review_callable or build_review_callable(settings)
+        review_admission = deadline.trace_detail()
+        review_timeout = deadline.reviewer_timeout()
+        if review_timeout <= 0:
+            outcome.status = STATUS_INCOMPLETE
+            return STATUS_INCOMPLETE
+        review_callable = self._review_callable or build_review_callable(
+            settings,
+            timeout_seconds=review_timeout,
+            evaluation_trace=(
+                ctx.evaluation_trace
+                if getattr(ctx, "evaluation_trace_enabled", False)
+                else None
+            ),
+        )
         if review_callable is None:
             # fail-closed：V3 固定要 Review，Reviewer 不可用时不得声称完成。
             outcome.status = STATUS_INCOMPLETE
@@ -521,7 +861,11 @@ class MultiAgentEngine:
             subagent_results=[r for r in outcome.results if isinstance(r, SubagentResult)],
             task_brief=task_brief,
         )
-        review = run_semantic_review(review_ctx, review_callable=review_callable)
+        review = run_semantic_review(
+            review_ctx,
+            review_callable=review_callable,
+            timeout_seconds=review_timeout,
+        )
         outcome.review = review
         from travel_agent.orchestration.multi_agent.trace import current_trace
 
@@ -535,8 +879,17 @@ class MultiAgentEngine:
                 error=review.error,
                 duration_ms=review.duration_ms,
                 detail={
+                    "effective_timeout_ms": int(review_timeout * 1000),
+                    "admission": review_admission,
+                    **deadline.trace_detail(),
                     "issues": [
-                        {"issue_type": issue.issue_type, "severity": issue.severity}
+                        {
+                            "issue_type": issue.issue_type,
+                            "severity": issue.severity,
+                            "description": issue.description,
+                            "evidence": list(issue.evidence),
+                            "repair_target": issue.repair_target,
+                        }
                         for issue in review.issues
                     ]
                 },
@@ -548,9 +901,24 @@ class MultiAgentEngine:
             rework_used=outcome.rework_used,
         )
         if start_repair:
+            targets = repair_targets(review)
+            domain_repair = any(target != "planner" for target in targets)
+            if not deadline.admits_repair(domain_worker=domain_repair):
+                if trace is not None:
+                    trace.append(
+                        "repair",
+                        agent="engine",
+                        status=STATUS_INCOMPLETE,
+                        detail={
+                            "stop_reason": "repair_admission_denied",
+                            "targets": targets,
+                            **deadline.trace_detail(),
+                        },
+                    )
+                return STATUS_INCOMPLETE
             # 整个修复周期只计一次 rework；修复后不再进行第二轮 Reviewer。
             delivery = self._run_repair_cycle(
-                ctx, runner, request_id, review, outcome, repair_targets(review)
+                ctx, runner, request_id, review, outcome, targets, deadline
             )
             outcome.rework_used += 1
         return delivery
@@ -563,36 +931,78 @@ class MultiAgentEngine:
         review: ReviewResult,
         outcome: TurnOutcome,
         targets: list[str],
+        deadline: Any,
     ) -> str:
-        domain_targets = [name for name in targets if name != "planner"]
+        # One repair cycle owns at most one domain worker, then one Planner.
+        domain_targets = [name for name in targets if name != "planner"][:1]
         instructions = _repair_instructions_by_agent(review)
         new_artifact_ids: list[str] = []
         previous_plan = ctx.store.get(outcome.plan_artifact_id) or {}
         planner_input_ids = list(previous_plan.get("source_artifact_ids") or [])
+        if not domain_targets and outcome.plan_artifact_id and not planner_input_ids:
+            planner_input_ids.append(outcome.plan_artifact_id)
         for agent in domain_targets:
             task = SubagentTask(
                 request_id=request_id,
                 task_id=new_task_id(agent),
                 agent=agent,
                 instruction=instructions.get(agent) or "按 Reviewer 意见定向补充本领域结果。",
+                inputs={"artifact_ids": list(planner_input_ids)},
                 attempt=2,
             )
-            result = runner.run_subagent(task)
+            worker_timeout = deadline.repair_worker_timeout()
+            if worker_timeout <= 0:
+                return STATUS_INCOMPLETE
+            from travel_agent.orchestration.meter import current_turn_meter
+
+            meter = current_turn_meter()
+            if meter is not None:
+                meter.record_dispatch(agent)
+            result = _run_with_optional_timeout(runner, task, worker_timeout)
             outcome.results.append(result)
             new_artifact_ids.extend(_evidence_ids(result))
         for artifact_id in new_artifact_ids:
             if artifact_id not in planner_input_ids:
                 planner_input_ids.append(artifact_id)
 
+        planner_review_instructions = "\n".join(
+            issue.repair_instruction
+            for issue in review.issues
+            if issue.severity == SEVERITY_RECOVERABLE and issue.repair_instruction
+        )
+        planner_review_issue_types = [
+            issue.issue_type
+            for issue in review.issues
+            if issue.severity == SEVERITY_RECOVERABLE
+        ]
+
         planner_task = SubagentTask(
             request_id=request_id,
             task_id=new_task_id("planner"),
             agent="planner",
-            instruction="使用修复周期更新后的领域证据重新规划，并执行 plan_and_critique。",
-            inputs={"artifact_ids": planner_input_ids},
+            instruction=(
+                "使用修复周期更新后的领域证据重新规划，并执行 plan_and_critique。"
+                + (
+                    "\nReviewer 定向修复要求：\n" + planner_review_instructions
+                    if planner_review_instructions
+                    else ""
+                )
+            ),
+            inputs={
+                "artifact_ids": planner_input_ids,
+                "revision_directives": {
+                    "reviewer_instructions": planner_review_instructions,
+                    "reviewer_issue_types": planner_review_issue_types,
+                },
+            },
             attempt=2,
         )
-        planner_result = runner.run_subagent(planner_task)
+        planner_timeout = deadline.repair_planner_timeout()
+        if planner_timeout <= 0:
+            return STATUS_INCOMPLETE
+        planner_result = _run_with_optional_timeout(
+            runner, planner_task, planner_timeout
+        )
         outcome.results.append(planner_result)
         outcome.plan_artifact_id = _plan_artifact_id_from_results(
             ctx,
@@ -646,6 +1056,306 @@ class MultiAgentEngine:
 # --- 辅助 ------------------------------------------------------------------- #
 
 
+def _component_timeout(agent: str) -> float:
+    from travel_agent.orchestration.multi_agent.registry import SUBAGENT_REGISTRY
+
+    definition = SUBAGENT_REGISTRY.get(agent)
+    return float(definition.timeout_seconds if definition is not None else 0.0)
+
+
+def _run_with_optional_timeout(
+    runner: Any,
+    task: SubagentTask,
+    timeout_seconds: float,
+) -> SubagentResult:
+    try:
+        return runner.run_subagent(task, timeout_seconds=timeout_seconds)
+    except TypeError as exc:
+        if "timeout_seconds" not in str(exc):
+            raise
+        return runner.run_subagent(task)
+
+
+def _execute_parallel_wave(
+    runner: Any,
+    tasks: list[SubagentTask],
+    *,
+    timeout_seconds: float,
+) -> list[SubagentResult]:
+    """Execute a wave concurrently; timeout is one shared wall-clock window."""
+    if not tasks:
+        return []
+    from travel_agent.orchestration.meter import current_turn_meter
+
+    futures: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="dynamic-wave") as pool:
+        for task in tasks:
+            meter = current_turn_meter()
+            if meter is not None:
+                meter.record_dispatch(task.agent)
+            context = contextvars.copy_context()
+            futures[task.task_id] = pool.submit(
+                context.run,
+                _run_with_optional_timeout,
+                runner,
+                task,
+                timeout_seconds,
+            )
+        return [futures[task.task_id].result() for task in tasks]
+
+
+def _all_evidence_ids(results: list[SubagentResult]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            artifact_id
+            for result in results
+            if result.status in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}
+            for artifact_id in _evidence_ids(result)
+        )
+    )
+
+
+def _compact_router_results(results: list[SubagentResult]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for result in results:
+        compact.append(
+            {
+                "task_id": result.task_id,
+                "agent": result.agent,
+                "status": result.status,
+                "attempt": result.attempt,
+                "summary": result.summary[:400],
+                "evidence": [
+                    {
+                        "artifact_id": item.get("artifact_id"),
+                        "kind": item.get("kind"),
+                    }
+                    for item in result.evidence
+                    if isinstance(item, dict) and item.get("artifact_id")
+                ],
+                "warnings": list(result.warnings)[:6],
+                "unresolved": list(result.unresolved)[:6],
+                "error": result.error,
+            }
+        )
+    return compact
+
+
+def _task_needs_plan(task_type: TaskType | None) -> bool:
+    return task_type in REVIEW_REQUIRED_TASK_TYPES
+
+
+def _required_evidence(
+    ctx: Any,
+    task_type: TaskType | None,
+    results: list[SubagentResult],
+    base_inputs: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Return deterministic (hard_missing, soft_missing) evidence labels."""
+    kinds: set[str] = set()
+    nonempty_kinds: set[str] = set()
+    restaurant_keys: set[str] = set()
+
+    def register_record(record: dict[str, Any] | None) -> None:
+        if not record or not record.get("kind"):
+            return
+        kind = str(record["kind"])
+        kinds.add(kind)
+        payload = record.get("payload") or {}
+        if kind in {"restaurants", "hotels"}:
+            collection = payload.get(kind) or payload.get("items")
+            if collection:
+                nonempty_kinds.add(kind)
+                if kind == "restaurants":
+                    for item in collection:
+                        if isinstance(item, dict):
+                            key = item.get("poi_id") or item.get("name")
+                            if key:
+                                restaurant_keys.add(str(key))
+        else:
+            nonempty_kinds.add(kind)
+
+    for result in results:
+        if result.status not in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}:
+            continue
+        for item in result.evidence:
+            if isinstance(item, dict) and item.get("kind"):
+                kind = str(item["kind"])
+                record = ctx.store.get_record(str(item.get("artifact_id") or ""))
+                if record is not None:
+                    register_record(record)
+                else:
+                    kinds.add(kind)
+                    # Restaurant readiness is deliberately payload-backed;
+                    # legacy metadata-only evidence remains valid elsewhere.
+                    if kind != "restaurants":
+                        nonempty_kinds.add(kind)
+    for artifact_id in base_inputs.get("artifact_ids") or []:
+        register_record(ctx.store.get_record(str(artifact_id)))
+    if "pois" in kinds:
+        kinds.add("candidates")
+    if "pois" in nonempty_kinds:
+        nonempty_kinds.add("candidates")
+
+    # 当前用户已经明确提出的结构化约束
+    state = dict(getattr(getattr(ctx, "profile", None), "constraint_state", {}) or {})
+    hard: list[str] = []
+    soft: list[str] = []
+
+    def require(kind: str, label: str, *, hard_required: bool = True) -> None:
+        if kind in nonempty_kinds:
+            return
+        target = hard if hard_required else soft
+        if label not in target:
+            target.append(label)
+
+    if task_type == TaskType.FULL_TRIP_PLAN:
+        require("candidates", "景点候选")
+        require("routes", "路线可行性")
+        hotel_explicit = bool(
+            getattr(getattr(ctx, "profile", None), "hotel_area", None)
+            or any(
+                state.get(key) not in (None, "", [], {})
+                for key in (
+                    "lodging_area",
+                    "compare_lodging_areas",
+                    "hotel_budget_per_night_cny",
+                    "prepaid_lodging_cny",
+                )
+            )
+        )
+        require("hotels", "住宿证据", hard_required=hotel_explicit)
+        budget_explicit = bool(
+            getattr(getattr(ctx, "profile", None), "budget_limit", None)
+            or any(
+                state.get(key) not in (None, "", [], {})
+                for key in (
+                    "budget_max_cny",
+                    "budget_total_cny",
+                    "budget_per_person_cny",
+                    "budget_remaining_cny",
+                    "hotel_budget_per_night_cny",
+                )
+            )
+        )
+        require("budget", "预算证据", hard_required=budget_explicit)
+        raw_dietary = state.get("dietary") or []
+        food_explicit = bool(
+            getattr(getattr(ctx, "profile", None), "food_preference", None)
+            or raw_dietary
+            or "food" in (getattr(getattr(ctx, "profile", None), "interests", None) or [])
+        )
+        # A missing meal is a completeness warning for a generic itinerary,
+        # but only explicit cuisine/dietary requirements justify blocking the
+        # planner. This keeps evidence strict without turning provider sparsity
+        # into a total delivery failure.
+        require("restaurants", "餐饮证据", hard_required=food_explicit)
+        required_meals = max(1, int(getattr(getattr(ctx, "profile", None), "days", 1) or 1))
+        if len(restaurant_keys) < required_meals:
+            target = hard if food_explicit else soft
+            if "餐饮证据" not in target:
+                target.append("餐饮证据")
+    elif task_type == TaskType.ITINERARY_REVISION:
+        require("itinerary", "既有行程")
+    elif task_type == TaskType.ROUTE_QUERY:
+        require("routes", "路线耗时/距离")
+    elif task_type == TaskType.POI_ADVICE:
+        if not kinds.intersection({"candidates", "restaurants", "hotels"}):
+            hard.append("候选地点")
+        if state.get("walking_time_max_min") is not None:
+            require("routes", "步行时间")
+        elif state.get("location"):
+            require("routes", "与指定位置的距离")
+        extra = _lightweight_missing_payload_fields(results, ctx.profile)
+        for label in extra:
+            if label not in hard:
+                hard.append(label)
+    elif task_type == TaskType.DAY_ADVICE:
+        require("weather", "天气")
+        require("candidates", "活动候选")
+    elif task_type is None or task_type == TaskType.UNKNOWN:
+        hard.append("可识别的任务目标")
+    return hard, soft
+
+
+def _wave3_recovery_allowed(
+    wave2_results: list[SubagentResult],
+    missing_hard: list[str],
+) -> bool:
+    if not missing_hard or not wave2_results:
+        return False
+    retryable_failure = any(
+        result.status in {STATUS_FAILED, "budget_exhausted"}
+        for result in wave2_results
+    )
+    new_unlocking_artifact = any(
+        result.status in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}
+        and bool(_evidence_ids(result))
+        for result in wave2_results
+    )
+    return retryable_failure or new_unlocking_artifact
+
+
+def _routing_manifest_hash(decision: Any) -> str:
+    payload = decision.to_dict() if hasattr(decision, "to_dict") else decision
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()[:20]
+
+
+def _trace_stop(
+    trace: Any,
+    deadline: Any,
+    reason: str,
+    missing_hard: list[str],
+    policy_hash: str,
+) -> None:
+    if trace is None:
+        return
+    trace.append(
+        "routing_stop",
+        agent="engine",
+        status=STATUS_INCOMPLETE if missing_hard else STATUS_COMPLETED,
+        detail={
+            "stop_reason": reason,
+            "missing_hard": list(missing_hard),
+            "routing_policy_hash": policy_hash,
+            **deadline.trace_detail(),
+        },
+    )
+
+
+def _incomplete_evidence_reply(missing_hard: list[str]) -> str:
+    return (
+        "当前缺少安全规划所需的关键证据："
+        + "、".join(missing_hard)
+        + "。未强行启动 Planner，也未生成行程。"
+    )
+
+
+def _planner_delivery_status(
+    ctx: Any,
+    planner_result: SubagentResult,
+    plan_artifact_id: str | None,
+) -> str:
+    if planner_result.status not in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}:
+        return STATUS_INCOMPLETE
+    if not plan_artifact_id:
+        return STATUS_INCOMPLETE
+    from travel_agent.agent.toolkit import _validate_plan_gate
+
+    gate_error, record = _validate_plan_gate(ctx, plan_artifact_id)
+    payload = (record or {}).get("payload") or {}
+    critic = payload.get("critic") or {}
+    critical_issues = [
+        issue
+        for issue in (critic.get("issues") or [])
+        if str(issue.get("severity") or "").lower() in {"error", "critical"}
+    ]
+    if gate_error or critic.get("passed") is not True or critical_issues:
+        return STATUS_INCOMPLETE
+    return STATUS_COMPLETED
+
+
 def _fixed_delivery_status(results: list[SubagentResult]) -> str:
     planner = next((r for r in reversed(results) if r.agent == "planner"), None)
     if planner is None:
@@ -672,30 +1382,6 @@ def _compose_fixed_reply(results: list[SubagentResult]) -> str:
     return base
 
 
-def _dict_to_result(item: Any) -> Any:
-    if isinstance(item, SubagentResult):
-        return item
-    if not isinstance(item, dict):
-        return item
-    return SubagentResult(
-        request_id=str(item.get("request_id") or ""),
-        task_id=str(item.get("task_id") or ""),
-        agent=str(item.get("agent") or ""),
-        status=str(item.get("status") or STATUS_FAILED),
-        attempt=int(item.get("attempt") or 1),
-        summary=str(item.get("summary") or ""),
-        payload=dict(item.get("payload") or {}),
-        evidence=list(item.get("evidence") or []),
-        constraints_used=list(item.get("constraints_used") or []),
-        warnings=list(item.get("warnings") or []),
-        unresolved=list(item.get("unresolved") or []),
-        tool_trace=list(item.get("tool_trace") or []),
-        token_usage=dict(item.get("token_usage") or {}),
-        duration_ms=int(item.get("duration_ms") or 0),
-        error=item.get("error"),
-    )
-
-
 def _evidence_ids(result: SubagentResult) -> list[str]:
     ids: list[str] = []
     for item in result.evidence:
@@ -710,6 +1396,209 @@ def _plan_required_for_turn(dispatch: str, task_type: TaskType | None) -> bool:
     if task_type in {TaskType.ROUTE_QUERY, TaskType.POI_ADVICE, TaskType.DAY_ADVICE}:
         return False
     return task_type in REVIEW_REQUIRED_TASK_TYPES or dispatch == "dynamic"
+
+
+def _lightweight_missing_payload_fields(
+    results: list[SubagentResult],
+    profile: Any,
+) -> list[str]:
+    """Return missing POI-advice fields not covered by artifact-kind checks."""
+    successful_results = [
+        result
+        for result in results
+        if result.status in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}
+    ]
+    state = getattr(profile, "constraint_state", {}) or {}
+    missing: list[str] = []
+    if state.get("budget_per_person_cny") is not None and not _results_have_field(
+        successful_results, {"average_cost", "cost", "price_cny"}
+    ):
+        missing.append("人均消费")
+    if state.get("parking_preferred") is True and not _results_have_field(
+        successful_results, {"parking_type", "parking_available"}
+    ):
+        missing.append("停车条件")
+    return missing
+
+
+def _results_have_field(results: list[SubagentResult], keys: set[str]) -> bool:
+    def has(value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(
+                (key in keys and item not in (None, "", [], {})) or has(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, list):
+            return any(has(item) for item in value)
+        return False
+
+    return any(has(result.payload) for result in results)
+
+
+def _render_lightweight_evidence_reply(
+    ctx: Any,
+    task_type: TaskType | None,
+    results: list[SubagentResult],
+    missing: list[str],
+) -> str:
+    """Render lightweight answers from artifacts only; never trust free-form worker prose."""
+    records: list[tuple[str, dict[str, Any]]] = []
+    seen_ids: set[str] = set()
+    for result in results:
+        for item in result.evidence:
+            if not isinstance(item, dict):
+                continue
+            artifact_id = str(item.get("artifact_id") or "")
+            if not artifact_id or artifact_id in seen_ids:
+                continue
+            payload = ctx.store.get(artifact_id)
+            if isinstance(payload, dict):
+                records.append((str(item.get("kind") or ""), payload))
+                seen_ids.add(artifact_id)
+
+    lines = ["已按工具证据整理如下："]
+    weather = next((payload for kind, payload in records if kind == "weather"), None)
+    if weather:
+        lines.append(
+            f"- 天气：{weather.get('city') or ''} {weather.get('condition') or '未知'}，"
+            f"{weather.get('temperature_c')}°C（来源：{weather.get('source') or '未标注'}）"
+        )
+
+    routes = [payload for kind, payload in records if kind == "routes"]
+    route_seen: set[tuple[Any, ...]] = set()
+    for payload in routes:
+        key = (
+            payload.get("origin_name"),
+            payload.get("destination_name"),
+            payload.get("mode"),
+        )
+        if key in route_seen:
+            continue
+        route_seen.add(key)
+        lines.append(
+            f"- 路线：{payload.get('origin_name') or payload.get('origin_poi_id')} → "
+            f"{payload.get('destination_name') or payload.get('destination_poi_id')}，"
+            f"{payload.get('mode')}，约 {payload.get('duration_min')} 分钟 / "
+            f"{payload.get('distance_km')} 公里（来源：{payload.get('source') or '未标注'}）"
+        )
+
+    candidates: list[dict[str, Any]] = []
+    if task_type != TaskType.ROUTE_QUERY:
+        for kind, payload in records:
+            if kind == "candidates":
+                candidates.extend(item for item in (payload.get("pois") or []) if isinstance(item, dict))
+            elif kind == "restaurants":
+                candidates.extend(
+                    item for item in (payload.get("restaurants") or payload.get("items") or [])
+                    if isinstance(item, dict)
+                )
+            elif kind == "hotels":
+                candidates.extend(item for item in (payload.get("hotels") or []) if isinstance(item, dict))
+    state = getattr(ctx.profile, "constraint_state", {}) or {}
+    candidates = _select_lightweight_candidates(candidates, routes, state)
+    limit = int(state.get("top_n") or state.get("max_selected") or 5)
+    candidate_seen: set[str] = set()
+    rendered = 0
+    for item in candidates:
+        identity = str(item.get("poi_id") or item.get("hotel_id") or item.get("name") or "")
+        if not identity or identity in candidate_seen:
+            continue
+        candidate_seen.add(identity)
+        details = []
+        if item.get("category"):
+            details.append(str(item["category"]))
+        if item.get("rating") is not None:
+            details.append(f"评分 {item['rating']}")
+        if item.get("opening_hours"):
+            details.append(f"营业/开放时间 {item['opening_hours']}")
+        if item.get("average_cost") is not None:
+            details.append(f"人均约 {item['average_cost']} 元")
+        if item.get("parking_type"):
+            details.append(f"停车 {item['parking_type']}")
+        if item.get("address"):
+            details.append(f"地址 {item['address']}")
+        if item.get("source"):
+            details.append(f"来源 {item['source']}")
+        lines.append(f"- 候选：{item.get('name') or identity}" + (f"（{'；'.join(details)}）" if details else ""))
+        rendered += 1
+        if rendered >= max(1, min(limit, 8)):
+            break
+
+    if missing:
+        lines.append(
+            "- 未核实："
+            + "、".join(missing)
+            + "。当前不能确认这些条件已满足，请以地图或官方渠道复核。"
+        )
+    if len(lines) == 1:
+        lines.append("- 当前没有可交付的结构化工具证据。")
+    return "\n".join(lines)
+
+
+def _select_lightweight_candidates(
+    candidates: list[dict[str, Any]],
+    routes: list[dict[str, Any]],
+    state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Entity-dedupe, distance-rank and diversify lightweight POI results."""
+    route_rank: dict[str, float] = {}
+    for route in routes:
+        try:
+            duration = float(route.get("duration_min"))
+        except (TypeError, ValueError):
+            continue
+        for key in (route.get("destination_poi_id"), route.get("destination_name")):
+            if key:
+                route_rank[str(key)] = min(duration, route_rank.get(str(key), duration))
+
+    unique: list[dict[str, Any]] = []
+    seen_entities: set[str] = set()
+    for item in candidates:
+        if state.get("diversity_required") and str(item.get("category") or "") in {
+            "hotel",
+            "transport",
+        }:
+            continue
+        name = str(item.get("name") or item.get("poi_id") or item.get("hotel_id") or "").strip()
+        entity = _canonical_candidate_entity(name)
+        if not entity or entity in seen_entities:
+            continue
+        seen_entities.add(entity)
+        unique.append(item)
+
+    def rank(item: dict[str, Any]) -> tuple[int, float, float]:
+        keys = [str(item.get("poi_id") or ""), str(item.get("name") or "")]
+        durations = [route_rank[key] for key in keys if key in route_rank]
+        return (
+            0 if durations else 1,
+            min(durations) if durations else float("inf"),
+            -float(item.get("rating") or 0),
+        )
+
+    unique.sort(key=rank)
+    if not state.get("diversity_required"):
+        return unique
+    diverse: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    seen_categories: set[str] = set()
+    for item in unique:
+        category = str(item.get("category") or "unknown")
+        if category not in seen_categories:
+            diverse.append(item)
+            seen_categories.add(category)
+        else:
+            deferred.append(item)
+    return diverse + deferred
+
+
+def _canonical_candidate_entity(name: str) -> str:
+    value = re.sub(r"[（(][^）)]*[）)]", "", name).strip().lower()
+    value = re.sub(
+        r"(?:景区)?(?:东|西|南|北)?(?:门|入口|出口|游客中心|售票处)$",
+        "",
+        value,
+    )
+    return re.sub(r"\s+", "", value)
 
 
 def _fixed_turn_inputs(

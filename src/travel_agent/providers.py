@@ -72,6 +72,7 @@ class LocalToolProvider:
             duration_min=duration_min,
             mode=mode,
             source="haversine_estimate",
+            walking_distance_km=distance_km if mode == "walk" else None,
         )
 
 
@@ -95,6 +96,10 @@ class AmapToolProvider:
                 "key": self.api_key,
                 "keywords": keywords,
                 "city": city,
+                # A named venue may legitimately sit in a neighbouring city
+                # (for example a fixed day trip).  Generic interests remain
+                # city-scoped; explicit venue queries may search nationwide.
+                "citylimit": "false" if _has_named_venue_query(query_tags) else "true",
                 "offset": str(max_results),
                 "page": "1",
                 "extensions": "all",
@@ -139,7 +144,7 @@ class AmapToolProvider:
     ) -> RouteInfo:
         path, params = _amap_route_request(origin, destination, mode)
         payload = self._get_json(path, {"key": self.api_key, **params})
-        distance_m, duration_seconds = _parse_amap_route_payload(payload, mode)
+        distance_m, duration_seconds, walking_distance_m = _parse_amap_route_payload(payload, mode)
         if distance_m <= 0 or duration_seconds <= 0:
             distance_km, duration_min = estimate_route_minutes(origin, destination, mode)
             return RouteInfo(
@@ -149,6 +154,7 @@ class AmapToolProvider:
                 duration_min=duration_min,
                 mode=mode,
                 source="amap_fallback_estimate",
+                walking_distance_km=distance_km if mode == "walk" else None,
             )
         return RouteInfo(
             origin_poi_id=origin.poi_id,
@@ -157,6 +163,11 @@ class AmapToolProvider:
             duration_min=max(1, round(duration_seconds / 60)),
             mode=mode,
             source="amap",
+            walking_distance_km=(
+                round(walking_distance_m / 1000, 2)
+                if walking_distance_m is not None
+                else (round(distance_m / 1000, 2) if mode == "walk" else None)
+            ),
         )
 
     def _resolve_city_adcode(self, city: str) -> str | None:
@@ -264,32 +275,47 @@ def _build_keywords(
     category: str | None,
 ) -> str:
     tags = query_tags or []
-    mapped = [_TAG_TO_KEYWORD.get(tag, tag) for tag in tags]
+    mapped = []
+    for tag in tags:
+        keyword = _TAG_TO_KEYWORD.get(tag, tag)
+        if keyword not in mapped:
+            mapped.append(keyword)
     if category:
-        mapped.append(_CATEGORY_TO_KEYWORD.get(category, category))
+        keyword = _CATEGORY_TO_KEYWORD.get(category, category)
+        if keyword not in mapped:
+            mapped.append(keyword)
     return " ".join(mapped) or f"{city} 景点"
 
 
 def _amap_poi_to_schema(item: dict, city: str, rank: int) -> POI:
     lng, lat = _parse_location(item.get("location", "0,0"))
+    name = str(item.get("name") or "未知地点")
     type_text = str(item.get("type") or "")
     category = _map_amap_category(type_text)
     biz_ext = item.get("biz_ext") if isinstance(item.get("biz_ext"), dict) else {}
     rating = _safe_float(biz_ext.get("rating"), default=4.0)
+    average_cost = _safe_optional_float(biz_ext.get("cost"))
+    opening_hours = _optional_amap_text(
+        biz_ext.get("opentime2") or biz_ext.get("open_time")
+    )
+    actual_city = _optional_amap_text(item.get("cityname")) or city
     return POI(
-        poi_id=f"amap_{item.get('id') or item.get('name') or rank}",
-        name=str(item.get("name") or "未知地点"),
-        city=city,
+        poi_id=f"amap_{item.get('id') or name or rank}",
+        name=name,
+        city=actual_city,
         category=category,
         lat=lat,
         lng=lng,
         rating=rating,
         popularity=max(0.2, round(1 - rank * 0.03, 2)),
         tags=_tags_for_category(category),
-        estimated_duration_min=_duration_for_category(category),
+        estimated_duration_min=_duration_for_category(category, name=name, type_text=type_text),
         price_level="mid",
         indoor=category in {"museum", "shopping", "food"},
-        opening_hours=None,
+        opening_hours=opening_hours,
+        address=_optional_amap_text(item.get("address")),
+        average_cost=average_cost,
+        parking_type=_optional_amap_text(item.get("parking_type")),
         source="amap",
     )
 
@@ -322,26 +348,30 @@ def _amap_route_request(
     return "/v3/direction/driving", params
 
 
-def _parse_amap_route_payload(payload: dict, mode: TransportMode) -> tuple[float, float]:
+def _parse_amap_route_payload(
+    payload: dict, mode: TransportMode
+) -> tuple[float, float, float | None]:
     if payload.get("status") != "1":
-        return 0.0, 0.0
+        return 0.0, 0.0, None
     route = payload.get("route") or {}
     if mode == "public_transport":
         transits = route.get("transits") or []
         if not transits:
-            return 0.0, 0.0
+            return 0.0, 0.0, None
         transit = transits[0]
         return (
             _safe_float(transit.get("distance"), default=0.0),
             _safe_float(transit.get("duration"), default=0.0),
+            _safe_float(transit.get("walking_distance"), default=0.0),
         )
     paths = route.get("paths") or []
     if not paths:
-        return 0.0, 0.0
+        return 0.0, 0.0, None
     path = paths[0]
     return (
         _safe_float(path.get("distance"), default=0.0),
         _safe_float(path.get("duration"), default=0.0),
+        _safe_float(path.get("distance"), default=0.0) if mode == "walk" else None,
     )
 
 
@@ -359,7 +389,28 @@ def _safe_int(value, default: int) -> int:
         return default
 
 
+def _safe_optional_float(value) -> float | None:
+    try:
+        return float(value) if value not in (None, "", [], {}) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_amap_text(value) -> str | None:
+    """Normalize optional v3 ``biz_ext`` text fields without inventing data."""
+    if value is None or isinstance(value, (list, dict)):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"[]", "null", "none"}:
+        return None
+    return text
+
+
 def _map_amap_category(type_text: str) -> str:
+    if any(term in type_text for term in ("公交车站", "地铁站", "交通设施", "停车场")):
+        return "transport"
+    if "住宿" in type_text or "酒店" in type_text or "宾馆" in type_text:
+        return "hotel"
     if "餐饮" in type_text:
         return "food"
     if "博物馆" in type_text or "展览" in type_text:
@@ -377,29 +428,69 @@ def _tags_for_category(category: str) -> list[str]:
         "museum": ["history", "culture", "rainy-day"],
         "shopping": ["shopping", "citywalk"],
         "scenic": ["classic", "sightseeing"],
+        "hotel": ["hotel", "accommodation"],
+        "transport": ["transport"],
     }.get(category, ["classic"])
 
 
-def _duration_for_category(category: str) -> int:
-    return {
-        "food": 60,
-        "museum": 120,
-        "shopping": 90,
-        "scenic": 120,
-    }.get(category, 90)
+def _duration_for_category(category: str, *, name: str = "", type_text: str = "") -> int:
+    text = f"{name} {type_text}"
+    if category == "food":
+        return 60
+    if category == "hotel":
+        return 0
+    if category == "transport":
+        return 0
+    if category == "shopping":
+        if any(term in text for term in ("步行街", "夜市", "街区", "商业街")):
+            return 90
+        return 75
+    if category == "museum":
+        if any(term in text for term in ("国家", "省", "大型", "故宫", "博物院")):
+            return 120
+        return 90
+    if category == "scenic":
+        if any(term in text for term in ("风景名胜区", "国家森林公园", "国家级景点", "度假区")):
+            return 150
+        if any(term in text for term in ("山", "湖", "古镇", "古城", "峡", "园林")):
+            return 120
+        if any(term in text for term in ("公园", "广场", "街", "码头", "观景台")):
+            return 90
+        return 105
+    return 90
 
 
 _TAG_TO_KEYWORD = {
     "nature": "自然风光",
     "food": "美食",
+    "local": "本地美食",
     "history": "历史文化",
     "culture": "文化",
+    "classic": "经典景点",
+    "sightseeing": "景点",
     "shopping": "购物",
     "citywalk": "城市漫步",
+    "family": "亲子游乐",
+    "museum": "博物馆",
+    "night": "夜市美食",
+    "餐厅": "美食",
+    "hotel": "酒店",
+    "酒店": "酒店",
+    "住宿": "酒店",
+    "公园": "公园",
+    "好玩": "景点",
 }
+
+
+def _has_named_venue_query(query_tags: list[str] | None) -> bool:
+    return any(
+        str(tag).strip() and str(tag).strip() not in _TAG_TO_KEYWORD
+        for tag in (query_tags or [])
+    )
 
 _CATEGORY_TO_KEYWORD = {
     "food": "餐饮",
+    "hotel": "酒店",
     "museum": "博物馆",
     "shopping": "购物",
     "scenic": "景点",

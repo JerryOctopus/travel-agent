@@ -13,7 +13,7 @@
 - ``runner``：统一 Subagent 执行器（异常包装为 failed，不上抛）；
 - ``executor``：真实 LLM 受限 ReAct Subagent 执行器（Step 3）；
 - ``fixed_dispatch``：V1 确定性派工执行（Step 3）；
-- ``orchestrator_agent``：V2/V3 动态 Main Orchestrator（Step 3）；
+- ``orchestrator_agent``：V2/V3 每 wave 一次的结构化动态 Router；
 - ``review``：Engine 直调的单层无工具 Semantic Reviewer 与修复周期判定；
 - ``render_gate``：Renderer Artifact Gate，Engine 统一渲染入口（Step 3）；
 - ``orchestrator``：Main Orchestrator 工具面约束与 dispatch 工具骨架；
@@ -29,6 +29,7 @@ from travel_agent.orchestration.multi_agent.engine import (
     V3_CONFIG,
     VARIANT_PRESETS,
     MultiAgentEngine,
+    DynamicBaseOutcome,
     TurnOutcome,
     capabilities_for_variant,
     requires_semantic_review,
@@ -36,8 +37,12 @@ from travel_agent.orchestration.multi_agent.engine import (
 from travel_agent.orchestration.multi_agent.executor import build_subagent_executor
 from travel_agent.orchestration.multi_agent.fixed_dispatch import run_fixed_dispatch
 from travel_agent.orchestration.multi_agent.orchestrator_agent import (
+    RoutingDecision,
+    RoutingTask,
     build_orchestrator_prompt,
     build_orchestrator_tools,
+    route_wave,
+    routing_policy_hash,
     run_orchestrator,
 )
 from travel_agent.orchestration.multi_agent.render_gate import render_plan_outcome
@@ -84,6 +89,7 @@ __all__ = [
     "V3_CONFIG",
     "VARIANT_PRESETS",
     "MultiAgentEngine",
+    "DynamicBaseOutcome",
     "TurnOutcome",
     "capabilities_for_variant",
     "requires_semantic_review",
@@ -91,6 +97,10 @@ __all__ = [
     "run_fixed_dispatch",
     "build_orchestrator_prompt",
     "build_orchestrator_tools",
+    "RoutingDecision",
+    "RoutingTask",
+    "route_wave",
+    "routing_policy_hash",
     "run_orchestrator",
     "render_plan_outcome",
     "ReviewCallable",

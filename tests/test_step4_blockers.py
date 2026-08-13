@@ -10,14 +10,24 @@ from travel_agent.agent import toolkit
 from travel_agent.agent.session import build_session
 from travel_agent.agent.turn_analysis import TaskType
 from travel_agent.orchestration.multi_agent.dispatch_rules import build_fixed_tasks
-from travel_agent.orchestration.multi_agent.engine import V1_CONFIG, V2_CONFIG, MultiAgentEngine
+from travel_agent.orchestration.multi_agent.engine import (
+    V1_CONFIG,
+    V2_CONFIG,
+    DynamicBaseOutcome,
+    MultiAgentEngine,
+)
+from travel_agent.orchestration.multi_agent.orchestrator_agent import RoutingDecision
 from travel_agent.orchestration.multi_agent.orchestrator import build_dispatch_tool
 from travel_agent.orchestration.multi_agent.review import ReviewContext, run_semantic_review
-from travel_agent.orchestration.multi_agent.runner import SubagentRunner
+from travel_agent.orchestration.multi_agent.runner import (
+    SubagentRunner,
+    _compact_dependency_inputs,
+)
 from travel_agent.orchestration.multi_agent.schemas import (
     STATUS_CLARIFICATION_REQUIRED,
     STATUS_COMPLETED,
     STATUS_INCOMPLETE,
+    SubagentResult,
     SubagentTask,
 )
 
@@ -26,6 +36,35 @@ PLAN_PAYLOAD = {
     "itinerary": {"city": "杭州", "summary": "杭州两日游", "days": []},
     "critic": {"passed": True, "issues": []},
 }
+
+
+def test_dependency_compaction_does_not_embed_recursive_plan_payloads() -> None:
+    ctx = build_session(session_id="sess_compact_dependencies", persist=False)
+    huge = {
+        "itinerary": {
+            "city": "上海",
+            "summary": "四日游",
+            "days": [{
+                "day_index": 1,
+                "stops": [{
+                    "poi": {"poi_id": "p1", "name": "外滩", "opening_hours": "x" * 50000},
+                    "start_time": "09:00",
+                }],
+            }],
+        },
+        "original_itinerary": {"blob": "x" * 100000},
+        "domain_inputs": {"blob": "x" * 100000},
+        "source_artifact_ids": [f"a{i}" for i in range(1000)],
+    }
+    plan_id = ctx.store.put("itinerary", huge)
+
+    compact = _compact_dependency_inputs(ctx.store, [plan_id])
+    encoded = json.dumps(compact, ensure_ascii=False)
+
+    assert len(encoded) < 1000
+    assert "original_itinerary" not in encoded
+    assert "domain_inputs" not in encoded
+    assert compact[0]["payload"]["days"][0]["stops"][0]["name"] == "外滩"
 
 
 def test_runner_claims_only_artifacts_from_its_own_request_and_task():
@@ -181,12 +220,8 @@ def test_dynamic_full_plan_without_planner_is_incomplete(monkeypatch):
     ctx = build_session(session_id="sess_no_planner", persist=False)
     engine = MultiAgentEngine(V2_CONFIG, runner=SubagentRunner(ctx, lambda *_args: {}))
     monkeypatch.setattr(
-        "travel_agent.orchestration.multi_agent.orchestrator_agent.run_orchestrator",
-        lambda *_args, **_kwargs: {
-            "reply": "这里是一份模型手写行程",
-            "results": [],
-            "clarification": False,
-        },
+        "travel_agent.orchestration.multi_agent.orchestrator_agent.route_wave",
+        lambda *_args, **_kwargs: RoutingDecision(ready=True),
     )
 
     outcome = engine.run_turn(
@@ -216,21 +251,22 @@ def test_renderer_incomplete_overrides_top_level_completed(monkeypatch):
         agent="planner",
     )
     engine = MultiAgentEngine(V2_CONFIG, runner=SubagentRunner(ctx, lambda *_args: {}))
+    planner_result = SubagentResult(
+        request_id="req_gate_override",
+        task_id=task_id,
+        agent="planner",
+        status=STATUS_COMPLETED,
+        evidence=[{"artifact_id": plan_id, "kind": "itinerary"}],
+    )
     monkeypatch.setattr(
-        "travel_agent.orchestration.multi_agent.orchestrator_agent.run_orchestrator",
-        lambda *_args, **_kwargs: {
-            "reply": "done",
-            "results": [
-                {
-                    "request_id": "req_gate_override",
-                    "task_id": task_id,
-                    "agent": "planner",
-                    "status": STATUS_COMPLETED,
-                    "evidence": [{"artifact_id": plan_id}],
-                }
-            ],
-            "clarification": False,
-        },
+        engine,
+        "run_dynamic_base",
+        lambda *_args, **_kwargs: DynamicBaseOutcome(
+            status=STATUS_COMPLETED,
+            reply="done",
+            results=(planner_result,),
+            plan_artifact_id=plan_id,
+        ),
     )
 
     outcome = engine.run_turn(

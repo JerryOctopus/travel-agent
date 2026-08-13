@@ -223,6 +223,16 @@ def evaluate_release_gates(results: dict[str, Any]) -> dict[str, Any]:
             "Product suite must record one fixed model/provider and contain samples",
         )
 
+    long_horizon = results.get("agent-long-horizon")
+    if long_horizon:
+        long_metrics = long_horizon.get("metrics") or {}
+        long_artifacts = long_horizon.get("artifacts") or {}
+        gates["agent-long-horizon"] = _gate(
+            long_artifacts.get("independent_case_count", 0) > 0
+            and long_metrics.get("turn_state_pass_rate") == 1.0,
+            "Long-horizon suite requires every per-turn state checkpoint to pass",
+        )
+
     chinatravel = {
         key: value for key, value in results.items()
         if key.startswith("chinatravel-")

@@ -80,6 +80,134 @@ def test_critic_reports_missing_must_visit_and_uncovered_interest() -> None:
     assert result.passed is False
     assert "interest_not_covered" in codes
     assert "must_visit_missing" in codes
+    assert "day_too_sparse" in codes
+    assert "daily_meal_missing" in codes
+
+
+def test_explicit_dietary_requirement_makes_missing_daily_meal_an_error() -> None:
+    profile = TravelProfile(
+        destination="西安",
+        days=2,
+        interests=["food"],
+        constraint_state={"dietary": ["仅清真餐厅"]},
+    )
+    itinerary = Itinerary(
+        city="西安",
+        summary="test",
+        days=[
+            ItineraryDay(1, "test", [ItineraryStop(_poi("城墙", "scenic", ["history"]), "09:30", 90, "")]),
+            ItineraryDay(2, "test", [ItineraryStop(_poi("兵马俑", "museum", ["history"]), "09:30", 90, "")]),
+        ],
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    missing_meals = [issue for issue in result.issues if issue.code == "daily_meal_missing"]
+    assert len(missing_meals) == 2
+    assert all(issue.severity == "error" for issue in missing_meals)
+    assert result.passed is False
+
+
+def test_critic_reports_duplicate_restaurant_brand() -> None:
+    profile = TravelProfile(destination="北京", days=1, pace="standard")
+    itinerary = Itinerary(
+        city="北京",
+        summary="test",
+        days=[
+            ItineraryDay(
+                day_index=1,
+                theme="test",
+                stops=[
+                    ItineraryStop(
+                        poi=_poi("四季民福烤鸭店(东安门店)", "food", ["food"]),
+                        start_time="11:30",
+                        duration_min=60,
+                        note="test",
+                    ),
+                    ItineraryStop(
+                        poi=_poi("四季民福烤鸭店(灯市口店)", "food", ["food"]),
+                        start_time="18:00",
+                        duration_min=60,
+                        note="test",
+                    ),
+                ],
+            )
+        ],
+    )
+
+    codes = {issue.code for issue in critique_itinerary(itinerary, profile).issues}
+
+    assert "duplicate_food_brand" in codes
+
+
+def test_warning_only_critic_result_passes() -> None:
+    profile = TravelProfile(destination="杭州", days=1, pace="standard")
+    itinerary = Itinerary(
+        city="杭州",
+        days=[
+            ItineraryDay(
+                day_index=1,
+                theme="test",
+                stops=[
+                    ItineraryStop(
+                        poi=_poi("西湖", "scenic", []),
+                        start_time="09:30",
+                        duration_min=90,
+                        note="test",
+                        route_from_previous=RouteInfo(
+                            origin_poi_id="a",
+                            destination_poi_id="b",
+                            distance_km=10,
+                            duration_min=61,
+                            mode="public_transport",
+                            source="test",
+                        ),
+                    )
+                ],
+            )
+        ],
+        summary="test",
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    assert result.passed is True
+    assert {issue.severity for issue in result.issues} == {"warning"}
+
+
+def test_gross_route_violation_is_error() -> None:
+    profile = TravelProfile(destination="杭州", days=1, pace="standard")
+    itinerary = Itinerary(
+        city="杭州",
+        days=[
+            ItineraryDay(
+                day_index=1,
+                theme="test",
+                stops=[
+                    ItineraryStop(
+                        poi=_poi("西湖", "scenic", []),
+                        start_time="09:30",
+                        duration_min=90,
+                        note="test",
+                        route_from_previous=RouteInfo(
+                            origin_poi_id="a",
+                            destination_poi_id="b",
+                            distance_km=60,
+                            duration_min=180,
+                            mode="walk",
+                            source="test",
+                        ),
+                    )
+                ],
+            )
+        ],
+        summary="test",
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    assert result.passed is False
+    assert any(issue.severity == "error" for issue in result.issues)
 
 
 def test_critic_reports_route_too_long() -> None:
@@ -128,6 +256,138 @@ def test_critic_reports_route_too_long() -> None:
     assert result.passed is False
     assert "route_too_long" in codes
     assert "daily_route_too_long" in codes
+
+
+def test_critic_rejects_food_without_required_halal_evidence() -> None:
+    profile = TravelProfile(
+        destination="西安",
+        days=1,
+        constraint_state={"dietary": ["仅清真餐厅"]},
+    )
+    itinerary = Itinerary(
+        city="西安",
+        summary="test",
+        days=[ItineraryDay(
+            day_index=1,
+            theme="test",
+            stops=[ItineraryStop(
+                poi=_poi("普通餐厅", "food", ["food"]),
+                start_time="11:30",
+                duration_min=60,
+                note="test",
+            )],
+        )],
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    assert result.passed is False
+    assert "dietary_constraint_violated" in {issue.code for issue in result.issues}
+
+
+def test_structured_specific_interests_are_not_satisfied_by_broad_categories() -> None:
+    profile = TravelProfile(
+        destination="苏州",
+        days=1,
+        interests=["nature"],
+        constraint_state={"interests": ["园林"]},
+    )
+    itinerary = Itinerary(
+        city="苏州",
+        summary="test",
+        days=[ItineraryDay(
+            day_index=1,
+            theme="test",
+            stops=[
+                ItineraryStop(
+                    poi=_poi("七里山塘景区", "scenic", ["classic", "sightseeing"]),
+                    start_time="09:30",
+                    duration_min=90,
+                    note="test",
+                ),
+                ItineraryStop(
+                    poi=_poi("本地餐厅", "food", ["food"]),
+                    start_time="11:30",
+                    duration_min=60,
+                    note="test",
+                ),
+            ],
+        )],
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    assert any(
+        issue.code == "interest_not_covered" and "园林" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_accessibility_priority_fails_when_evidence_is_missing() -> None:
+    profile = TravelProfile(
+        destination="苏州",
+        days=1,
+        constraint_state={"wheelchair_user": True, "accessibility_priority": True},
+    )
+    itinerary = Itinerary(
+        city="苏州",
+        summary="test",
+        days=[ItineraryDay(
+            day_index=1,
+            theme="test",
+            stops=[ItineraryStop(
+                poi=_poi("拙政园", "scenic", ["garden"]),
+                start_time="09:30",
+                duration_min=90,
+                note="test",
+            )],
+        )],
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    assert result.passed is False
+    assert "accessibility_evidence_missing" in {issue.code for issue in result.issues}
+
+
+def test_commercial_amenity_cannot_satisfy_must_visit() -> None:
+    from travel_agent.critic import poi_matches_must_visit
+
+    assert not poi_matches_must_visit(
+        _poi("兵马俑旅游纪念品综合超市", "shopping", ["shopping"]), "兵马俑"
+    )
+    assert not poi_matches_must_visit(
+        _poi("兵马俑旅游广场", "scenic", ["sightseeing"]), "兵马俑"
+    )
+    assert not poi_matches_must_visit(
+        _poi("兵马俑枢纽", "scenic", ["sightseeing"]), "兵马俑"
+    )
+    assert poi_matches_must_visit(
+        _poi("秦始皇兵马俑博物馆", "museum", ["history"]), "兵马俑"
+    )
+
+
+def test_multiday_day_with_only_one_activity_and_meal_is_sparse() -> None:
+    profile = TravelProfile(destination="北京", days=3)
+    itinerary = Itinerary(
+        city="北京",
+        summary="test",
+        days=[
+            ItineraryDay(
+                day_index=index,
+                theme="test",
+                stops=[
+                    ItineraryStop(_poi(f"景点{index}", "scenic", []), "09:30", 90, ""),
+                    ItineraryStop(_poi(f"餐厅{index}", "food", ["food"]), "12:00", 60, ""),
+                ],
+            )
+            for index in range(1, 4)
+        ],
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    assert sum(issue.code == "daily_activity_sparse" for issue in result.issues) == 3
 
 
 def _poi(name: str, category: str, tags: list[str]) -> POI:

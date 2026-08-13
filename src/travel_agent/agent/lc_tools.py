@@ -1,4 +1,4 @@
-"""把会话级工具函数包装成 LangChain 工具，供 ``create_react_agent`` 自主调用。
+"""把会话级工具函数包装成 LangChain 工具，供 ``create_agent`` 自主调用。
 
 工具刻意拆细（search_poi / check_weather / plan_route / recommend_candidates /
 plan_and_critique / render_*），让 LLM 在它们之间真正编排，而不是调用一个黑盒

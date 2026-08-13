@@ -17,16 +17,20 @@ from travel_agent.harness.runner import AgentHarness
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_PRODUCT_CASES = ROOT / "data" / "eval" / "production_v1" / "all_cases.jsonl"
-PRODUCTION_DATASET_VERSION = "travel-agent-eval-production-v1.0"
+PRODUCTION_DATASET_VERSION = "travel-agent-eval-production-v1.1"
 
-# 180 条数据集的 split 构成（随数据集冻结，禁止用于训练/调优回流）。
+# 192 条数据集的 split 构成（随数据集冻结，禁止用于训练/调优回流）。
 PRODUCTION_SPLIT_COUNTS = {
-    "dev": 30,
-    "core_frozen": 90,
-    "challenge_frozen": 30,
+    "dev": 34,
+    "core_frozen": 94,
+    "challenge_frozen": 34,
     "shadow_frozen": 30,
 }
 FROZEN_SPLITS = {"core_frozen", "challenge_frozen", "shadow_frozen"}
+FINE_TUNING_FROZEN_COUNT = (
+    PRODUCTION_SPLIT_COUNTS["core_frozen"]
+    + PRODUCTION_SPLIT_COUNTS["challenge_frozen"]
+)
 TRAINING_DATA_POLICY = (
     "production_v1 frozen cases (core/challenge/shadow) must never be used for training."
 )
@@ -59,7 +63,7 @@ class ProductDatasetValidation:
 
 
 def validate_product_dataset(cases: list[HarnessCase]) -> ProductDatasetValidation:
-    """校验 production_v1 数据集：180 条、split 构成、case_id 唯一、turns 非空。"""
+    """校验 production_v1 数据集：192 条、split 构成、case_id 唯一、turns 非空。"""
     errors: list[str] = []
     ids = [case.case_id for case in cases]
     if len(ids) != len(set(ids)):
@@ -302,7 +306,16 @@ def aggregate_product_rows(
         "tool_schema_valid_rate": _bool_rate(primary, "tool_schema_valid"),
         "fault_recovery_rate": _bool_rate(primary, "fault_recovery_ok"),
         "memory_accuracy": _bool_rate(primary, "memory_ok"),
+        "turn_state_pass_rate": _bool_rate(primary, "turn_state_ok"),
     }
+    turn_state_scores = [
+        float(row["turn_state_accuracy"])
+        for row in primary
+        if row.get("turn_state_accuracy") is not None
+    ]
+    turn_state_accuracy = (
+        round(statistics.mean(turn_state_scores), 4) if turn_state_scores else None
+    )
     tool_required = sum(row["tool_required_count"] for row in primary)
     tool_hits = sum(row["tool_required_hit_count"] for row in primary)
     tool_selected = sum(row["tool_selected_count"] for row in primary)
@@ -328,6 +341,12 @@ def aggregate_product_rows(
     offline_completed = sum(row.get("delivery_mode") == "offline" for row in completed_rows)
     durations = [row["duration_ms"] for row in rows if row["duration_ms"] is not None]
     token_values = [row["total_tokens"] for row in rows if row["total_tokens"] is not None]
+    input_token_values = [row["input_tokens"] for row in rows if row.get("input_tokens") is not None]
+    output_token_values = [row["output_tokens"] for row in rows if row.get("output_tokens") is not None]
+    cost_values = [float(row.get("estimated_cost_usd") or 0.0) for row in rows]
+    llm_call_values = [int(row.get("model_call_count") or 0) for row in rows]
+    tool_call_values = [int(row.get("tool_call_count") or 0) for row in rows]
+    dispatch_values = [int(row.get("dispatch_count") or 0) for row in rows]
     confidence_intervals = {
         name: wilson_interval(*_bool_counts(primary, _metric_row_key(name)))
         for name, value in proportions.items()
@@ -338,6 +357,7 @@ def aggregate_product_rows(
         "sample_size": len(primary),
         "execution_count": len(rows),
         **proportions,
+        "turn_state_accuracy": turn_state_accuracy,
         "tool_precision": tool_precision,
         "tool_recall": tool_recall,
         "tool_f1": tool_f1,
@@ -352,6 +372,12 @@ def aggregate_product_rows(
         "latency_p50_ms": _percentile(durations, 0.50),
         "latency_p95_ms": _percentile(durations, 0.95),
         "avg_total_tokens": statistics.mean(token_values) if token_values else None,
+        "avg_input_tokens": statistics.mean(input_token_values) if input_token_values else None,
+        "avg_output_tokens": statistics.mean(output_token_values) if output_token_values else None,
+        "total_estimated_cost_usd": round(sum(cost_values), 8),
+        "avg_llm_calls": statistics.mean(llm_call_values) if llm_call_values else None,
+        "avg_tool_calls": statistics.mean(tool_call_values) if tool_call_values else None,
+        "avg_dispatches": statistics.mean(dispatch_values) if dispatch_values else None,
         "stability_rate": _stability_rate(rows),
         "confidence_intervals_95": confidence_intervals,
         "failure_attribution_counts": _attribution_counts(primary),
@@ -366,10 +392,13 @@ def decide_fine_tuning(
     remediation_complete: bool,
 ) -> dict[str, Any]:
     frozen = [row for row in primary_rows if row["split"] in FROZEN_SPLITS]
-    if len(frozen) < 120:
+    if len(frozen) < FINE_TUNING_FROZEN_COUNT:
         return {
             "decision": "insufficient_frozen_evidence",
-            "rationale": "冻结集（core+challenge 120 条）尚未完整运行，不能形成微调 go/no-go 结论。",
+            "rationale": (
+                f"冻结集（core+challenge {FINE_TUNING_FROZEN_COUNT} 条）尚未完整运行，"
+                "不能形成微调 go/no-go 结论。"
+            ),
             "model_failure_counts": {key: 0 for key in MODEL_FAILURE_CATEGORIES},
             "triggered_categories": {},
             "frozen_case_count": len(frozen),
@@ -407,7 +436,7 @@ def build_product_report(result: HarnessSuiteResult) -> str:
     metrics = result.metrics
     decision = result.artifacts.get("fine_tuning") or {}
     lines = [
-        "# production_v1 Evaluation Report (180 cases)",
+        "# production_v1 Evaluation Report (192 cases)",
         "",
         f"- dataset: `{result.artifacts.get('dataset_version')}`",
         f"- model: `{result.artifacts.get('model')}`",
@@ -451,6 +480,17 @@ def _product_row(
         if call.get("error")
     ]
     total_tokens = [call.get("total_tokens") for call in model_calls if call.get("total_tokens") is not None]
+    meter_totals = [
+        (turn.turn_metrics or {}).get("totals") or {}
+        for turn in result.turns
+    ]
+    metered_input_tokens = sum(int(item.get("input_tokens") or 0) for item in meter_totals)
+    metered_output_tokens = sum(int(item.get("output_tokens") or 0) for item in meter_totals)
+    metered_tokens = sum(int(item.get("total_tokens") or 0) for item in meter_totals)
+    metered_llm_calls = sum(int(item.get("llm_calls") or 0) for item in meter_totals)
+    metered_tool_calls = sum(int(item.get("tool_calls") or 0) for item in meter_totals)
+    metered_dispatches = sum(int(item.get("dispatch_count") or 0) for item in meter_totals)
+    metered_cost_usd = sum(float(item.get("cost_usd") or 0.0) for item in meter_totals)
     metrics = result.metrics
     itinerary = result.final_artifacts.get("itinerary")
     expected_task = case.expect_itinerary is not False and not case.expect_clarification
@@ -507,6 +547,9 @@ def _product_row(
         "tool_schema_valid": metrics.get("tool_schema_valid"),
         "fault_recovery_ok": metrics.get("fault_recovery_ok"),
         "memory_ok": metrics.get("memory_ok"),
+        "turn_state_ok": metrics.get("turn_state_ok"),
+        "turn_state_accuracy": metrics.get("turn_state_accuracy"),
+        "turn_state_results": metrics.get("turn_state_results") or [],
         "tool_required_count": metrics.get("tool_required_count", 0),
         "tool_required_hit_count": metrics.get("tool_required_hit_count", 0),
         "tool_selected_count": metrics.get("tool_selected_count", 0),
@@ -515,18 +558,28 @@ def _product_row(
         "tool_argument_pass_count": metrics.get("tool_argument_pass_count", 0),
         "tool_trace": [name for turn in result.turns for name in turn.tool_trace],
         "duration_ms": sum(turn.duration_ms or 0 for turn in result.turns),
-        "total_tokens": sum(total_tokens) if total_tokens else None,
-        "model_call_count": len(model_calls),
+        "input_tokens": metered_input_tokens or None,
+        "output_tokens": metered_output_tokens or None,
+        "total_tokens": metered_tokens or (sum(total_tokens) if total_tokens else None),
+        "estimated_cost_usd": round(metered_cost_usd, 8),
+        "model_call_count": metered_llm_calls or len(model_calls),
         "model_error_call_count": len(model_call_errors),
         "model_call_errors": model_call_errors,
-        "tool_call_count": sum(len(turn.tool_calls) for turn in result.turns),
+        "tool_call_count": metered_tool_calls or sum(len(turn.tool_calls) for turn in result.turns),
+        "dispatch_count": metered_dispatches,
         "failure_attributions": attributions,
         "errors": [_sanitize_error(error) for error in result.errors],
     }
 
 
-def _execution_case(case: HarnessCase, repeat_index: int) -> HarnessCase:
-    namespace = f"product:{case.case_id}:repeat-{repeat_index}"
+def _execution_case(
+    case: HarnessCase,
+    repeat_index: int,
+    *,
+    run_namespace: str | None = None,
+) -> HarnessCase:
+    prefix = f"product:{run_namespace}" if run_namespace else "product"
+    namespace = f"{prefix}:{case.case_id}:repeat-{repeat_index}"
     if case.user_ids:
         user_ids = [f"{namespace}:{user_id}" for user_id in case.user_ids]
         metadata = dict(case.metadata)
@@ -659,6 +712,7 @@ def _metric_row_key(name: str) -> str:
         "tool_schema_valid_rate": "tool_schema_valid",
         "fault_recovery_rate": "fault_recovery_ok",
         "memory_accuracy": "memory_ok",
+        "turn_state_pass_rate": "turn_state_ok",
     }[name]
 
 
@@ -701,7 +755,13 @@ def _sha256(path: Path) -> str:
 
 
 def _prompt_fingerprint() -> str:
-    paths = [ROOT / "src" / "travel_agent" / "agent" / "prompts.py"]
+    paths = [
+        ROOT / "src" / "travel_agent" / "agent" / "prompts.py",
+        ROOT / "src" / "travel_agent" / "agent" / "turn_analysis.py",
+        ROOT / "src" / "travel_agent" / "orchestration" / "multi_agent" / "orchestrator_agent.py",
+        ROOT / "src" / "travel_agent" / "orchestration" / "multi_agent" / "registry.py",
+        ROOT / "src" / "travel_agent" / "orchestration" / "multi_agent" / "review.py",
+    ]
     digest = hashlib.sha256()
     for path in paths:
         digest.update(path.read_bytes())

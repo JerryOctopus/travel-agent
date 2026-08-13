@@ -230,6 +230,7 @@ def _architecture_variant(environment: HarnessEnvironment) -> str:
 
 def _prepare_context(ctx: SessionContext, case: HarnessCase) -> None:
     ctx.evaluation_trace_enabled = True
+    ctx.reference_datetime = case.snapshot_date
     if case.failure_injection:
         ctx.provider = FaultInjectingProvider(ctx.provider, case.failure_injection)
 

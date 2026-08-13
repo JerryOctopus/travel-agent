@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from travel_agent.critic import poi_matches_interest, requested_interests
 from travel_agent.schemas import POI, ScoredPOI, TravelProfile
 
 
@@ -33,15 +34,15 @@ def diversify_ranked_pois(ranked: list[ScoredPOI]) -> list[ScoredPOI]:
 
 def _score_one(poi: POI, profile: TravelProfile) -> ScoredPOI:
     reasons: list[str] = []
-    interest_match = _interest_match(poi, profile.interests)
+    interest_match = _profile_interest_match(poi, profile)
     if interest_match > 0:
         reasons.append("匹配用户兴趣")
 
     popularity = max(0.0, min(1.0, poi.popularity))
     rating = max(0.0, min(1.0, poi.rating / 5.0))
-    pace_fit = _pace_fit(poi, profile)
+    pace_fit = _pace_fit(poi, profile) #按出行节奏匹配时长阈值
     budget_fit = _budget_fit(poi, profile)
-    constraint_boost = _constraint_boost(poi, profile)
+    constraint_boost = _constraint_boost(poi, profile) # 命中 must_visit 给 1.0；命中 avoid 给 0.0；否则 0.5
 
     score = (
         0.30 * interest_match
@@ -69,6 +70,14 @@ def _interest_match(poi: POI, interests: list[str]) -> float:
         return 0.5
     overlap = set(poi.tags).intersection(interests)
     return len(overlap) / max(1, len(set(interests)))
+
+
+def _profile_interest_match(poi: POI, profile: TravelProfile) -> float:
+    interests = requested_interests(profile)
+    if not interests:
+        return 0.5
+    matched = sum(1 for interest in interests if poi_matches_interest(poi, interest))
+    return matched / len(interests)
 
 
 def _pace_fit(poi: POI, profile: TravelProfile) -> float:

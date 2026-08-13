@@ -40,8 +40,12 @@ class LLMSettings:
     model: str = "gpt-4o-mini"
     timeout_seconds: int = 30
     temperature: float = 0.2
+    thinking_enabled: bool = False
+    requests_per_second: float = 0.0
     input_cost_per_million: float = 0.0
     output_cost_per_million: float = 0.0
+    # 模型上下文窗口（token）；None 时由 memory 模块按模型名离线估算。
+    context_window: int | None = None
 
     @property
     def enabled(self) -> bool:
@@ -69,14 +73,16 @@ class AmapSettings:
 class AgentSettings:
     recursion_limit: int = 20
     max_tool_retries: int = 1
-    request_timeout_seconds: int = 120
+    request_timeout_seconds: int = 300
 
 
 @dataclass(frozen=True)
 class MemorySettings:
-    compress_message_threshold: int = 8
-    profile_only_token_threshold: int = 4000
-    keep_recent_turns: int = 4
+    compress_message_threshold: int = 20
+    profile_only_token_threshold: int = 64000
+    keep_recent_turns: int = 10
+    backend: str = "json"
+    database_url: str | None = None
     profile_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "data" / "profiles")
 
 
@@ -98,12 +104,55 @@ class OrchestrationSettings:
     variant_token_budget: int = 0
     variant_llm_call_budget: int = 0
     variant_tool_call_budget: int = 0
+    base_timeout_seconds: int = 210
+    planner_reserve_seconds: int = 25
+    reviewer_reserve_seconds: int = 85
+    router_timeout_seconds: int = 80
+    router_useful_seconds: int = 35
+    worker_timeout_seconds: int = 60
+    planner_timeout_seconds: int = 60
+    worker_max_output_tokens: int = 2048
+    planner_max_output_tokens: int = 1024
+    reviewer_max_output_tokens: int = 1024
+    recovery_worker_useful_seconds: int = 25
+    reviewer_timeout_seconds: int = 85
+    repair_worker_timeout_seconds: int = 30
+    repair_planner_timeout_seconds: int = 45
+    admission_guard_seconds: int = 5
+    latency_sla_seconds: int = 180
+    routing_max_waves: int = 3
+    routing_max_calls: int = 3
+    routing_max_dispatches: int = 6
+    routing_wave1_max_tasks: int = 4
 
 
 @dataclass(frozen=True)
 class SkillsSettings:
     skills_dir: Path = field(default_factory=lambda: PROJECT_ROOT / ".storyline" / "skills")
     enabled: bool = True
+
+
+@dataclass(frozen=True)
+class JudgeSettings:
+    provider: str = "google"
+    api_key: str | None = None
+    base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    model: str = "gemini-3.6-flash"
+    timeout_seconds: int = 60
+    temperature: float = 0.0
+    thinking_enabled: bool = False
+    # AI Studio currently reports 20 RPM for gemini-3.6-flash on this project.
+    # Keep 10% headroom so minute-window jitter does not cause avoidable 429s.
+    requests_per_second: float = 0.3
+
+    @property
+    def enabled(self) -> bool:
+        return self.provider != "rule" and bool(self.api_key)
+
+
+@dataclass(frozen=True)
+class EvaluationSettings:
+    judge: JudgeSettings = field(default_factory=JudgeSettings)
 
 
 @dataclass(frozen=True)
@@ -115,6 +164,7 @@ class Settings:
     orchestration: OrchestrationSettings = field(default_factory=OrchestrationSettings)
     mcp: McpSettings = field(default_factory=McpSettings)
     skills: SkillsSettings = field(default_factory=SkillsSettings)
+    evaluation: EvaluationSettings = field(default_factory=EvaluationSettings)
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -158,22 +208,111 @@ def _empty_to_none(value: Any) -> str | None:
     return text or None
 
 
+def _provider_api_key(provider: str) -> str | None:
+    """读取 provider 专属环境变量，避免跨服务复用凭据。"""
+    names: tuple[str, ...]
+    if provider.lower() in {"freellmapi", "free_llm_api", "free-llm-api"}:
+        names = ("TRAVEL_AGENT_FREELLMAPI_API_KEY", "FREELLMAPI_API_KEY")
+    elif provider.lower() in {
+        "freellmapi-docker",
+        "freellmapi_server",
+        "freellmapi-server",
+    }:
+        names = ("TRAVEL_AGENT_FREELLMAPI_API_KEY", "FREELLMAPI_API_KEY")
+    elif provider.lower() in {"google", "gemini", "google-gemini"}:
+        names = ("TRAVEL_AGENT_GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+    elif provider.lower() in {"siliconflow", "silicon-flow", "silicon_flow"}:
+        names = ("TRAVEL_AGENT_SILICONFLOW_API_KEY", "SILICONFLOW_API_KEY")
+    else:
+        names = (f"TRAVEL_AGENT_{provider.upper().replace('-', '_')}_API_KEY",)
+    for name in names:
+        value = _empty_to_none(os.getenv(name))
+        if value:
+            return value
+    return None
+
+
+def _llm_api_key(provider: str, toml_value: Any, *, provider_overridden: bool) -> str | None:
+    generic = _empty_to_none(os.getenv("TRAVEL_AGENT_LLM_API_KEY"))
+    if generic:
+        return generic
+    provider_key = _provider_api_key(provider)
+    if provider_key:
+        return provider_key
+    return None if provider_overridden else _empty_to_none(toml_value)
+
+
+def _judge_api_key(provider: str, toml_value: Any, *, provider_overridden: bool) -> str | None:
+    """Resolve a Judge credential without falling back to the Agent credential.
+
+    ``TRAVEL_AGENT_JUDGE_API_KEY`` remains the highest-priority override. Provider-specific
+    variables (including ``FREELLMAPI_API_KEY``) make it possible to switch the Judge without
+    copying a unified router key into ``config.toml``.
+    """
+    generic = _empty_to_none(os.getenv("TRAVEL_AGENT_JUDGE_API_KEY"))
+    if generic:
+        return generic
+    provider_key = _provider_api_key(provider)
+    if provider_key:
+        return provider_key
+    return None if provider_overridden else _empty_to_none(toml_value)
+
+
 def _default_base_url(provider: str) -> str:
     provider = provider.lower()
+    if provider in {"freellmapi", "free_llm_api", "free-llm-api"}:
+        return "http://localhost:31415/v1"
+    if provider in {"freellmapi-docker", "freellmapi_server", "freellmapi-server"}:
+        return "http://localhost:3001/v1"
     if provider in {"qwen", "dashscope", "aliyun"}:
         return "https://dashscope.aliyuncs.com/compatible-mode/v1"
     if provider == "deepseek":
         return "https://api.deepseek.com/v1"
+    if provider in {"zhipu", "glm", "zai"}:
+        return "https://open.bigmodel.cn/api/paas/v4"
+    if provider in {"google", "gemini", "google-gemini"}:
+        return "https://generativelanguage.googleapis.com/v1beta/openai"
+    if provider in {"siliconflow", "silicon-flow", "silicon_flow"}:
+        return "https://api.siliconflow.cn/v1"
     return "https://api.openai.com/v1"
 
 
 def _default_model(provider: str) -> str:
     provider = provider.lower()
+    if provider in {
+        "freellmapi",
+        "free_llm_api",
+        "free-llm-api",
+        "freellmapi-docker",
+        "freellmapi_server",
+        "freellmapi-server",
+    }:
+        return "auto"
     if provider in {"qwen", "dashscope", "aliyun"}:
         return "qwen-plus"
     if provider == "deepseek":
         return "deepseek-chat"
+    if provider in {"zhipu", "glm", "zai"}:
+        return "glm-4.7-flash"
+    if provider in {"google", "gemini", "google-gemini"}:
+        return "gemini-2.5-flash"
+    if provider in {"siliconflow", "silicon-flow", "silicon_flow"}:
+        return "deepseek-ai/DeepSeek-V4-Flash"
     return "gpt-4o-mini"
+
+
+def _default_judge_model(provider: str) -> str:
+    if provider.lower() in {"google", "gemini", "google-gemini"}:
+        return "gemini-3.6-flash"
+    return _default_model(provider)
+
+
+def _default_judge_requests_per_second(provider: str) -> float:
+    # The public Gemini quota benefits from a conservative client-side limiter.
+    # A local FreeLLMAPI router owns upstream quotas/fallbacks itself.
+    if provider.lower() in {"google", "gemini", "google-gemini"}:
+        return 0.3
+    return 0.0
 
 
 def load_settings(config_path: Path | str | None = None) -> Settings:
@@ -187,20 +326,55 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
     orch_toml = data.get("orchestration", {}) if isinstance(data.get("orchestration"), dict) else {}
     mcp_toml = data.get("mcp", {}) if isinstance(data.get("mcp"), dict) else {}
     skills_toml = data.get("skills", {}) if isinstance(data.get("skills"), dict) else {}
+    evaluation_toml = (
+        data.get("evaluation", {}) if isinstance(data.get("evaluation"), dict) else {}
+    )
+    judge_toml = (
+        evaluation_toml.get("judge", {})
+        if isinstance(evaluation_toml.get("judge"), dict)
+        else {}
+    )
 
-    provider = str(_pick("TRAVEL_AGENT_LLM_PROVIDER", llm_toml.get("provider"), "rule")).lower()
+    provider_env = _empty_to_none(os.getenv("TRAVEL_AGENT_LLM_PROVIDER"))
+    provider = str(provider_env or llm_toml.get("provider") or "rule").lower()
+    provider_overridden = bool(
+        provider_env
+        and provider_env.lower() != str(llm_toml.get("provider") or "rule").lower()
+    )
+    configured_base_url = None if provider_overridden else llm_toml.get("base_url")
+    configured_model = None if provider_overridden else llm_toml.get("model")
     llm = LLMSettings(
         provider=provider,
-        api_key=_empty_to_none(_pick("TRAVEL_AGENT_LLM_API_KEY", llm_toml.get("api_key"), None)),
+        api_key=_llm_api_key(
+            provider,
+            llm_toml.get("api_key"),
+            provider_overridden=provider_overridden,
+        ),
         base_url=str(
-            _pick("TRAVEL_AGENT_LLM_BASE_URL", llm_toml.get("base_url"), _default_base_url(provider))
+            _pick("TRAVEL_AGENT_LLM_BASE_URL", configured_base_url, _default_base_url(provider))
         ).rstrip("/"),
-        model=str(_pick("TRAVEL_AGENT_LLM_MODEL", llm_toml.get("model"), _default_model(provider))),
+        model=str(_pick("TRAVEL_AGENT_LLM_MODEL", configured_model, _default_model(provider))),
         timeout_seconds=_as_int(
             _pick("TRAVEL_AGENT_LLM_TIMEOUT_SECONDS", llm_toml.get("timeout_seconds"), 30), 30
         ),
         temperature=_as_float(
             _pick("TRAVEL_AGENT_LLM_TEMPERATURE", llm_toml.get("temperature"), 0.2), 0.2
+        ),
+        thinking_enabled=str(
+            _pick(
+                "TRAVEL_AGENT_LLM_THINKING_ENABLED",
+                llm_toml.get("thinking_enabled"),
+                "false",
+            )
+        ).lower()
+        in {"1", "true", "yes", "on"},
+        requests_per_second=_as_float(
+            _pick(
+                "TRAVEL_AGENT_LLM_REQUESTS_PER_SECOND",
+                llm_toml.get("requests_per_second"),
+                0.0,
+            ),
+            0.0,
         ),
         input_cost_per_million=_as_float(
             _pick(
@@ -218,6 +392,10 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
             ),
             0.0,
         ),
+        context_window=_as_int(
+            _pick("TRAVEL_AGENT_LLM_CONTEXT_WINDOW", llm_toml.get("context_window"), 0), 0
+        )
+        or None,
     )
 
     amap = AmapSettings(
@@ -245,9 +423,9 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
             _pick(
                 "TRAVEL_AGENT_REQUEST_TIMEOUT_SECONDS",
                 agent_toml.get("request_timeout_seconds"),
-                120,
+                300,
             ),
-            120,
+            300,
         ),
     )
 
@@ -256,21 +434,31 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
             _pick(
                 "TRAVEL_AGENT_MEMORY_COMPRESS_THRESHOLD",
                 memory_toml.get("compress_message_threshold"),
-                8,
+                20,
             ),
-            8,
+            20,
         ),
         profile_only_token_threshold=_as_int(
             _pick(
                 "TRAVEL_AGENT_MEMORY_PROFILE_ONLY_TOKEN_THRESHOLD",
                 memory_toml.get("profile_only_token_threshold"),
-                4000,
+                64000,
             ),
-            4000,
+            64000,
         ),
         keep_recent_turns=_as_int(
-            _pick("TRAVEL_AGENT_MEMORY_KEEP_RECENT_TURNS", memory_toml.get("keep_recent_turns"), 4),
-            4,
+            _pick("TRAVEL_AGENT_MEMORY_KEEP_RECENT_TURNS", memory_toml.get("keep_recent_turns"), 10),
+            10,
+        ),
+        backend=str(
+            _pick("TRAVEL_AGENT_MEMORY_BACKEND", memory_toml.get("backend"), "json")
+        ).lower(),
+        database_url=_empty_to_none(
+            _pick(
+                "TRAVEL_AGENT_DATABASE_URL",
+                memory_toml.get("database_url"),
+                None,
+            )
         ),
         profile_dir=Path(
             str(_pick("TRAVEL_AGENT_PROFILE_DIR", memory_toml.get("profile_dir"), str(PROJECT_ROOT / "data" / "profiles")))
@@ -301,6 +489,90 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
                 0,
             ),
             0,
+        ),
+        base_timeout_seconds=_as_int(
+            _pick("TRAVEL_AGENT_BASE_TIMEOUT_SECONDS", orch_toml.get("base_timeout_seconds"), 210),
+            210,
+        ),
+        planner_reserve_seconds=_as_int(
+            _pick("TRAVEL_AGENT_PLANNER_RESERVE_SECONDS", orch_toml.get("planner_reserve_seconds"), 25),
+            25,
+        ),
+        reviewer_reserve_seconds=_as_int(
+            _pick("TRAVEL_AGENT_REVIEWER_RESERVE_SECONDS", orch_toml.get("reviewer_reserve_seconds"), 85),
+            85,
+        ),
+        router_timeout_seconds=_as_int(
+            _pick("TRAVEL_AGENT_ROUTER_TIMEOUT_SECONDS", orch_toml.get("router_timeout_seconds"), 80),
+            80,
+        ),
+        router_useful_seconds=_as_int(
+            _pick("TRAVEL_AGENT_ROUTER_USEFUL_SECONDS", orch_toml.get("router_useful_seconds"), 35),
+            35,
+        ),
+        worker_timeout_seconds=_as_int(
+            _pick("TRAVEL_AGENT_WORKER_TIMEOUT_SECONDS", orch_toml.get("worker_timeout_seconds"), 60),
+            60,
+        ),
+        planner_timeout_seconds=_as_int(
+            _pick("TRAVEL_AGENT_PLANNER_TIMEOUT_SECONDS", orch_toml.get("planner_timeout_seconds"), 60),
+            25,
+        ),
+        worker_max_output_tokens=_as_int(
+            _pick("TRAVEL_AGENT_WORKER_MAX_OUTPUT_TOKENS", orch_toml.get("worker_max_output_tokens"), 2048),
+            2048,
+        ),
+        planner_max_output_tokens=_as_int(
+            _pick("TRAVEL_AGENT_PLANNER_MAX_OUTPUT_TOKENS", orch_toml.get("planner_max_output_tokens"), 1024),
+            1024,
+        ),
+        reviewer_max_output_tokens=_as_int(
+            _pick("TRAVEL_AGENT_REVIEWER_MAX_OUTPUT_TOKENS", orch_toml.get("reviewer_max_output_tokens"), 1024),
+            1024,
+        ),
+        recovery_worker_useful_seconds=_as_int(
+            _pick(
+                "TRAVEL_AGENT_RECOVERY_WORKER_USEFUL_SECONDS",
+                orch_toml.get("recovery_worker_useful_seconds"),
+                25,
+            ),
+            25,
+        ),
+        reviewer_timeout_seconds=_as_int(
+            _pick("TRAVEL_AGENT_REVIEWER_TIMEOUT_SECONDS", orch_toml.get("reviewer_timeout_seconds"), 85),
+            85,
+        ),
+        repair_worker_timeout_seconds=_as_int(
+            _pick("TRAVEL_AGENT_REPAIR_WORKER_TIMEOUT_SECONDS", orch_toml.get("repair_worker_timeout_seconds"), 30),
+            30,
+        ),
+        repair_planner_timeout_seconds=_as_int(
+            _pick("TRAVEL_AGENT_REPAIR_PLANNER_TIMEOUT_SECONDS", orch_toml.get("repair_planner_timeout_seconds"), 45),
+            20,
+        ),
+        admission_guard_seconds=_as_int(
+            _pick("TRAVEL_AGENT_ADMISSION_GUARD_SECONDS", orch_toml.get("admission_guard_seconds"), 5),
+            5,
+        ),
+        latency_sla_seconds=_as_int(
+            _pick("TRAVEL_AGENT_LATENCY_SLA_SECONDS", orch_toml.get("latency_sla_seconds"), 180),
+            180,
+        ),
+        routing_max_waves=_as_int(
+            _pick("TRAVEL_AGENT_ROUTING_MAX_WAVES", orch_toml.get("routing_max_waves"), 3),
+            3,
+        ),
+        routing_max_calls=_as_int(
+            _pick("TRAVEL_AGENT_ROUTING_MAX_CALLS", orch_toml.get("routing_max_calls"), 3),
+            3,
+        ),
+        routing_max_dispatches=_as_int(
+            _pick("TRAVEL_AGENT_ROUTING_MAX_DISPATCHES", orch_toml.get("routing_max_dispatches"), 6),
+            6,
+        ),
+        routing_wave1_max_tasks=_as_int(
+            _pick("TRAVEL_AGENT_ROUTING_WAVE1_MAX_TASKS", orch_toml.get("routing_wave1_max_tasks"), 4),
+            4,
         ),
     )
 
@@ -335,6 +607,63 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
         not in {"0", "false", "no", "off"},
     )
 
+    judge_provider_env = _empty_to_none(os.getenv("TRAVEL_AGENT_JUDGE_PROVIDER"))
+    judge_provider = str(judge_provider_env or judge_toml.get("provider") or "google").lower()
+    judge_provider_overridden = bool(
+        judge_provider_env
+        and judge_provider_env.lower() != str(judge_toml.get("provider") or "google").lower()
+    )
+    configured_judge_base_url = (
+        None if judge_provider_overridden else judge_toml.get("base_url")
+    )
+    configured_judge_model = None if judge_provider_overridden else judge_toml.get("model")
+    judge = JudgeSettings(
+        provider=judge_provider,
+        api_key=_judge_api_key(
+            judge_provider,
+            judge_toml.get("api_key"),
+            provider_overridden=judge_provider_overridden,
+        ),
+        base_url=str(
+            _pick(
+                "TRAVEL_AGENT_JUDGE_BASE_URL",
+                configured_judge_base_url,
+                _default_base_url(judge_provider),
+            )
+        ).rstrip("/"),
+        model=str(
+            _pick(
+                "TRAVEL_AGENT_JUDGE_MODEL",
+                configured_judge_model,
+                _default_judge_model(judge_provider),
+            )
+        ),
+        timeout_seconds=_as_int(
+            _pick("TRAVEL_AGENT_JUDGE_TIMEOUT_SECONDS", judge_toml.get("timeout_seconds"), 60),
+            60,
+        ),
+        temperature=_as_float(
+            _pick("TRAVEL_AGENT_JUDGE_TEMPERATURE", judge_toml.get("temperature"), 0.0),
+            0.0,
+        ),
+        thinking_enabled=str(
+            _pick(
+                "TRAVEL_AGENT_JUDGE_THINKING_ENABLED",
+                judge_toml.get("thinking_enabled"),
+                "false",
+            )
+        ).lower()
+        in {"1", "true", "yes", "on"},
+        requests_per_second=_as_float(
+            _pick(
+                "TRAVEL_AGENT_JUDGE_REQUESTS_PER_SECOND",
+                judge_toml.get("requests_per_second"),
+                _default_judge_requests_per_second(judge_provider),
+            ),
+            _default_judge_requests_per_second(judge_provider),
+        ),
+    )
+
     return Settings(
         llm=llm,
         amap=amap,
@@ -343,6 +672,7 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
         orchestration=orchestration,
         mcp=mcp,
         skills=skills,
+        evaluation=EvaluationSettings(judge=judge),
     )
 
 

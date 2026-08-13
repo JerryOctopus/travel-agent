@@ -3,18 +3,51 @@
 # 环境变量优先级高于本文件，便于 CI / 临时覆盖。
 
 [llm]
-# provider: rule / qwen / deepseek / openai
+# provider: rule / freellmapi / qwen / deepseek / zhipu / google / gemini / siliconflow / openai
 # 设为 rule（或留空 api_key）时走离线确定性兜底，不调用任何 LLM。
 provider = "rule"
 api_key = ""
 # 留空则按 provider 选择默认 base_url / model：
-#   qwen     -> https://dashscope.aliyuncs.com/compatible-mode/v1, qwen-plus
+#   freellmapi -> http://localhost:31415/v1, auto（Desktop）
+#                 api_key 填 FreeLLMAPI Dashboard 生成的 unified key；
+#                 model 也可用 auto:fast / auto:smart / 命名 profile / 具体模型 ID
+#   freellmapi-docker -> http://localhost:3001/v1, auto
+#   qwen     -> https://dashscope.aliyuncs.com/compatible-mode/v1
+# model 在 DashScope 控制台查看有额度的型号，例如 qwen3.7-plus、qwen-turbo（qwen-plus 免费包易用尽）
 #   deepseek -> https://api.deepseek.com/v1, deepseek-chat
+#   zhipu   -> https://open.bigmodel.cn/api/paas/v4, glm-4.7-flash
+#   google  -> https://generativelanguage.googleapis.com/v1beta/openai, gemini-2.5-flash
+#              `gemini` 和 `google-gemini` 也可作为 provider 别名
+#   siliconflow -> https://api.siliconflow.cn/v1, deepseek-ai/DeepSeek-V4-Flash
+#                  `silicon-flow` 和 `silicon_flow` 也可作为 provider 别名
 #   openai   -> https://api.openai.com/v1, gpt-4o-mini
 base_url = ""
 model = ""
 timeout_seconds = 30
 temperature = 0.2
+# 思考模式会改变质量、延迟和工具调用轨迹；正式评测前固定后不要中途切换。
+thinking_enabled = false
+# 0 表示客户端不限速；免费接口可按账户 RPM 设置，例如 0.05 表示约每20秒一次。
+requests_per_second = 0
+# 可选：模型上下文窗口（token）。不填时按模型名离线估算；
+# memory 模块用它推导强压缩阈值（窗口 - 20k 预留输出）。
+# context_window = 131072
+
+[evaluation.judge]
+# 独立行程质量 Judge；可直接通过本机 FreeLLMAPI 路由，与被测 Agent 的配置分开。
+# Desktop 示例：provider = "freellmapi", base_url/model 留空，api_key 填 unified key；
+# 默认得到 http://localhost:31415/v1 + auto。Docker/server 用 freellmapi-docker。
+# 也可将 key 放在 TRAVEL_AGENT_JUDGE_API_KEY 或 FREELLMAPI_API_KEY 环境变量中。
+# 如需固定 Gemini，则改回 google / Gemini endpoint / gemini-3.6-flash。
+provider = "google"
+api_key = ""
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+model = "gemini-3.6-flash"
+timeout_seconds = 60
+temperature = 0
+thinking_enabled = false
+# AI Studio 当前显示 20 RPM；按 18 RPM 运行，预留 10% 窗口余量。
+requests_per_second = 0.3
 
 [amap]
 # 高德「Web 服务」key：用于后端 REST（POI / 天气 / 驾车路线）。
@@ -30,19 +63,45 @@ timeout_seconds = 5
 # ReAct 递归上限，防止工具调用死循环。
 recursion_limit = 20
 max_tool_retries = 1
-request_timeout_seconds = 120
+request_timeout_seconds = 300
 
 [memory]
-# L1：超过消息条数切换 compressed；超过 token 估算阈值切换 profile_only
-compress_message_threshold = 8
-profile_only_token_threshold = 4000
-keep_recent_turns = 4
+# 面向 qwen3.7-plus 的生产默认值：强压缩时仍保留最近对话。
+compress_message_threshold = 20
+profile_only_token_threshold = 64000
+keep_recent_turns = 10
+# 本地开发使用 json；生产设置 postgres，并通过 TRAVEL_AGENT_DATABASE_URL 提供连接串。
+backend = "json"
 profile_dir = "data/profiles"
 
 [orchestration]
 # 生产入口固定 Multi-Agent Full（V3），此处无开关可配。
 # 仅 V0–V3 消融实验（run_variant_turn）共用的 Token 硬上限；<=0 表示不设上限。
 variant_token_budget = 0
+variant_llm_call_budget = 0
+variant_tool_call_budget = 0
+# Wave-based dynamic routing 的统一 deadline/budget。V2/V3 读取完全相同的配置。
+base_timeout_seconds = 210
+planner_reserve_seconds = 25
+reviewer_reserve_seconds = 85
+router_timeout_seconds = 80
+router_useful_seconds = 35
+worker_timeout_seconds = 60
+planner_timeout_seconds = 60
+worker_max_output_tokens = 2048
+planner_max_output_tokens = 1024
+reviewer_max_output_tokens = 1024
+recovery_worker_useful_seconds = 25
+reviewer_timeout_seconds = 85
+repair_worker_timeout_seconds = 30
+repair_planner_timeout_seconds = 45
+admission_guard_seconds = 5
+# 仅用于指标标记，不参与 timeout/admission。
+latency_sla_seconds = 180
+routing_max_waves = 3
+routing_max_calls = 3
+routing_max_dispatches = 6
+routing_wave1_max_tasks = 4
 
 [skills]
 # M6 声明式技能目录

@@ -10,7 +10,7 @@
   ``assert_no_dispatch_leak`` 兜底校验）。
 
 Step 1 阶段：``executor`` 参数支持注入 Mock 执行器（单测用）；真实
-LLM 执行路径（create_react_agent + token/duration 采集）在 Step 3 接入。
+LLM 执行路径（create_agent + token/duration 采集）在 Step 3 接入。
 
 并发纪律（Step 2 验证项，这里先声明契约）：
 
@@ -68,8 +68,13 @@ class SubagentRunner:
     def context(self) -> Any:
         return self._ctx
 
-    def run_subagent(self, task: SubagentTask) -> SubagentResult:
-        result = self._run_subagent(task)
+    def run_subagent(
+        self,
+        task: SubagentTask,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SubagentResult:
+        result = self._run_subagent(task, timeout_seconds=timeout_seconds)
         from travel_agent.orchestration.multi_agent.trace import current_trace
 
         trace = current_trace()
@@ -83,6 +88,11 @@ class SubagentRunner:
                 error=result.error,
                 duration_ms=result.duration_ms,
                 detail={
+                    "effective_timeout_ms": (
+                        int(timeout_seconds * 1000)
+                        if timeout_seconds is not None
+                        else None
+                    ),
                     "tool_trace": list(result.tool_trace),
                     "evidence": list(result.evidence),
                     "warnings": list(result.warnings),
@@ -91,7 +101,12 @@ class SubagentRunner:
             )
         return result
 
-    def _run_subagent(self, task: SubagentTask) -> SubagentResult:
+    def _run_subagent(
+        self,
+        task: SubagentTask,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SubagentResult:
         """执行单个任务并返回结构化结果；任何异常都包装为 failed，不上抛。"""
         from travel_agent.agent.session import (
             reset_task_meta,
@@ -108,6 +123,24 @@ class SubagentRunner:
                 status=STATUS_FAILED,
                 attempt=task.attempt,
                 error=f"unknown subagent: {task.agent}",
+                duration_ms=_elapsed_ms(start),
+            )
+
+        effective_timeout = min(
+            definition.timeout_seconds,
+            float(timeout_seconds)
+            if timeout_seconds is not None
+            else definition.timeout_seconds,
+        )
+        if effective_timeout <= 0:
+            return SubagentResult(
+                request_id=task.request_id,
+                task_id=task.task_id,
+                agent=task.agent,
+                status=STATUS_BUDGET_EXHAUSTED,
+                attempt=task.attempt,
+                error="effective timeout exhausted before dispatch",
+                warnings=["未启动 Subagent：阶段 deadline 已无可用时间"],
                 duration_ms=_elapsed_ms(start),
             )
 
@@ -155,6 +188,13 @@ class SubagentRunner:
         base_ids = isolated_store.artifact_ids() if isolated_store is not None else set()
 
         def _execute() -> Any:
+            # Preserve our task/trace/meter context, but do not inherit the
+            # parent LangChain RunnableConfig.  Otherwise Orchestrator
+            # callbacks observe every nested worker model call as if it were
+            # an Orchestrator call, double-counting tokens, calls and latency.
+            from langchain_core.runnables.config import var_child_runnable_config
+
+            runnable_token = var_child_runnable_config.set({})
             token = set_current_task_meta(
                 {
                     "request_id": task.request_id,
@@ -170,20 +210,29 @@ class SubagentRunner:
                 return self._executor(definition, task, isolated_ctx)
             finally:
                 reset_task_meta(token)
+                var_child_runnable_config.reset(runnable_token)
 
         pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"subagent-{task.agent}")
         future = pool.submit(contextvars.copy_context().run, _execute)
         try:
-            raw = future.result(timeout=definition.timeout_seconds)
+            raw = future.result(timeout=effective_timeout)
         except FutureTimeoutError:
             future.cancel()
+            from travel_agent.orchestration.meter import current_turn_meter
+
+            meter = current_turn_meter()
+            if meter is not None:
+                role = "planner" if task.agent == "planner" else f"worker:{task.agent}"
+                meter.fail_pending_llm(
+                    role, f"subagent timeout after {effective_timeout:g}s"
+                )
             return SubagentResult(
                 request_id=task.request_id,
                 task_id=task.task_id,
                 agent=task.agent,
                 status=STATUS_BUDGET_EXHAUSTED,
                 attempt=task.attempt,
-                error=f"timeout after {definition.timeout_seconds:g}s",
+                error=f"timeout after {effective_timeout:g}s",
                 warnings=["Subagent 执行达到 timeout_seconds 硬上限"],
                 duration_ms=_elapsed_ms(start),
             )
@@ -283,7 +332,12 @@ def _elapsed_ms(start: float) -> int:
 def _compact_dependency_inputs(store: Any, artifact_ids: list[str]) -> list[dict[str, Any]]:
     """给非 Planner 下游提供可执行的紧凑依赖数据；Planner 仍只按 ID 自取。"""
     compact: list[dict[str, Any]] = []
-    for artifact_id in artifact_ids:
+    # Revision plans can reference the previous plan and its whole ancestry.
+    # Workers need a bounded snapshot, not recursively embedded plan payloads.
+    selected_ids = list(dict.fromkeys(artifact_ids))
+    if len(selected_ids) > 20:
+        selected_ids = [selected_ids[0], *selected_ids[-19:]]
+    for artifact_id in selected_ids:
         record = store.get_record(artifact_id)
         payload = store.get(artifact_id)
         if record is None or not isinstance(payload, dict):
@@ -293,8 +347,17 @@ def _compact_dependency_inputs(store: Any, artifact_ids: list[str]) -> list[dict
         if kind == "candidates":
             value["pois"] = [
                 {"poi_id": item.get("poi_id"), "name": item.get("name")}
-                for item in (payload.get("pois") or [])[:12]
+                for item in (payload.get("pois") or [])[:8]
                 if isinstance(item, dict)
+            ]
+        elif kind == "ranked":
+            value["pois"] = [
+                {
+                    "poi_id": (item.get("poi") or {}).get("poi_id"),
+                    "name": (item.get("poi") or {}).get("name"),
+                }
+                for item in (payload.get("pois") or [])[:8]
+                if isinstance(item, dict) and isinstance(item.get("poi"), dict)
             ]
         elif kind == "hotels":
             value["hotels"] = [
@@ -308,7 +371,72 @@ def _compact_dependency_inputs(store: Any, artifact_ids: list[str]) -> list[dict
                 for item in (payload.get("restaurants") or [])[:8]
                 if isinstance(item, dict)
             ]
+        elif kind == "itinerary":
+            plan = payload.get("itinerary") or {}
+            value = {
+                "city": plan.get("city"),
+                "summary": plan.get("summary"),
+                "days": [
+                    {
+                        "day_index": day.get("day_index"),
+                        "stops": [
+                            {
+                                "poi_id": (stop.get("poi") or {}).get("poi_id"),
+                                "name": (stop.get("poi") or {}).get("name"),
+                                "start_time": stop.get("start_time"),
+                            }
+                            for stop in (day.get("stops") or [])[:4]
+                            if isinstance(stop, dict)
+                        ],
+                    }
+                    for day in (plan.get("days") or [])[:14]
+                    if isinstance(day, dict)
+                ],
+            }
+        elif kind == "routes":
+            value = {
+                key: payload.get(key)
+                for key in (
+                    "origin_poi_id",
+                    "destination_poi_id",
+                    "origin_name",
+                    "destination_name",
+                    "distance_km",
+                    "duration_min",
+                    "mode",
+                    "walking_distance_km",
+                    "source",
+                )
+                if payload.get(key) is not None
+            }
         else:
-            value = {key: payload.get(key) for key in sorted(payload)[:12]}
+            value = {
+                key: _bounded_dependency_value(payload.get(key))
+                for key in sorted(payload)[:12]
+                if key not in {
+                    "domain_inputs",
+                    "original_itinerary",
+                    "source_artifact_ids",
+                }
+            }
         compact.append({"artifact_id": artifact_id, "kind": kind, "payload": value})
     return compact
+
+
+def _bounded_dependency_value(value: Any, depth: int = 0) -> Any:
+    if depth >= 2:
+        if isinstance(value, (dict, list)):
+            return f"<{type(value).__name__}:{len(value)}>"
+        return str(value)[:160] if value is not None else None
+    if isinstance(value, str):
+        return value[:240]
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [_bounded_dependency_value(item, depth + 1) for item in value[:8]]
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_dependency_value(item, depth + 1)
+            for key, item in list(value.items())[:12]
+        }
+    return str(value)[:160]

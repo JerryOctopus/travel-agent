@@ -11,6 +11,7 @@ import pytest
 from travel_agent.agent.session import build_session
 from travel_agent.agent.turn_analysis import TaskType
 from travel_agent.agent.turn_lifecycle import prepare_turn
+from travel_agent.orchestration.meter import TurnMeter, turn_meter_scope
 from travel_agent.orchestration.multi_agent.engine import V0_CONFIG
 from travel_agent.orchestration.multi_agent.orchestrator import DispatchLedger, build_dispatch_tool
 from travel_agent.orchestration.multi_agent.registry import SUBAGENT_REGISTRY
@@ -147,6 +148,30 @@ def test_dispatch_ledger_rejects_duplicates_dependencies_limits_and_post_planner
     assert "global dispatch limit" in total_rejected["error"]
 
 
+def test_default_dispatch_ledger_allows_bounded_second_dispatch_per_domain() -> None:
+    ledger = DispatchLedger()
+
+    assert ledger.authorize("transport", "first route task") is None
+    assert ledger.authorize("transport", "different route task") is None
+    assert ledger.authorize("transport", "third route task") == (
+        "per-agent dispatch limit exhausted: transport=2"
+    )
+
+
+def test_rejected_dynamic_dispatch_is_not_counted_as_executed() -> None:
+    runner = _RecordingRunner()
+    dispatch = build_dispatch_tool(runner, "req-meter")
+    meter = TurnMeter("req-meter")
+
+    with turn_meter_scope(meter):
+        assert json.loads(dispatch("hotel", "first"))["status"] == STATUS_COMPLETED
+        assert json.loads(dispatch("hotel", "second"))["status"] == STATUS_COMPLETED
+        rejected = json.loads(dispatch("hotel", "third"))
+
+    assert "per-agent dispatch limit" in rejected["error"]
+    assert meter.snapshot()["totals"]["dispatch_count"] == 2
+
+
 def test_subagent_timeout_discards_late_artifacts(monkeypatch: pytest.MonkeyPatch) -> None:
     ctx = build_session(session_id="subagent-timeout", persist=False)
     original = SUBAGENT_REGISTRY["hotel"]
@@ -185,8 +210,8 @@ def test_max_steps_is_passed_as_hard_graph_limit(monkeypatch: pytest.MonkeyPatch
             raise GraphRecursionError("limit")
 
     monkeypatch.setattr(
-        "travel_agent.orchestration.multi_agent.executor.create_react_agent",
-        lambda _model, _tools: FakeAgent(),
+        "travel_agent.orchestration.multi_agent.executor.create_agent",
+        lambda _model, _tools, **_kwargs: FakeAgent(),
     )
     monkeypatch.setattr("travel_agent.agent.lc_tools.build_tools", lambda _ctx, _settings: [])
     settings = SimpleNamespace(llm=SimpleNamespace(enabled=True, model="fake"))

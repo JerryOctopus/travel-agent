@@ -70,6 +70,30 @@ def build_itinerary_cards(payload: dict[str, Any], weather: dict[str, Any] | Non
         }
     )
 
+    return_plan = payload.get("return_plan")
+    if isinstance(return_plan, dict) and return_plan.get("required"):
+        cards.append({"type": "return_plan", **return_plan})
+
+    lodging_plan = payload.get("lodging_plan")
+    if isinstance(lodging_plan, dict) and lodging_plan.get("required"):
+        cards.append({"type": "lodging_plan", **lodging_plan})
+
+    budget_plan = payload.get("budget_plan")
+    if isinstance(budget_plan, dict):
+        cards.append({"type": "budget_plan", **budget_plan})
+
+    fixed_event_plan = payload.get("fixed_event_plan")
+    if isinstance(fixed_event_plan, dict):
+        cards.append({"type": "fixed_event_plan", **fixed_event_plan})
+
+    mobility_plan = payload.get("mobility_plan")
+    if isinstance(mobility_plan, dict):
+        cards.append({"type": "mobility_plan", **mobility_plan})
+
+    candidate_verification = payload.get("candidate_verification")
+    if isinstance(candidate_verification, dict):
+        cards.append({"type": "candidate_verification", **candidate_verification})
+
     for day in itinerary.get("days", []):
         stops = []
         for stop in day.get("stops", []):
@@ -101,6 +125,95 @@ def build_itinerary_cards(payload: dict[str, Any], weather: dict[str, Any] | Non
                 "day_index": day.get("day_index"),
                 "theme": day.get("theme"),
                 "stops": stops,
+            }
+        )
+
+    cards.append(
+        {
+            "type": "handoff",
+            "title": "人工确认后导出",
+            "summary": "Agent 只生成路线建议；用户确认或微调后，再导出高德路书草稿。",
+            "provider": "amap",
+            "safety": {
+                "requires_user_confirmation": True,
+                "auto_ordering": False,
+                "auto_payment": False,
+            },
+            "roadbook": build_amap_roadbook_payload(itinerary),
+        }
+    )
+
+    return cards
+
+
+def build_supplement_cards(
+    *,
+    restaurants: dict[str, Any] | None = None,
+    hotels: dict[str, Any] | None = None,
+    budget: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build optional cards for tools that complement, but do not alter, the itinerary."""
+    cards: list[dict[str, Any]] = []
+
+    if restaurants:
+        cards.append(
+            {
+                "type": "restaurants",
+                "city": restaurants.get("city"),
+                "cuisine": restaurants.get("cuisine"),
+                "area": restaurants.get("area"),
+                "budget_level": restaurants.get("budget_level"),
+                "items": [
+                    {
+                        "name": item.get("name"),
+                        "category": item.get("category"),
+                        "rating": item.get("rating"),
+                        "tags": list(item.get("tags") or [])[:4],
+                        "price_level": item.get("price_level"),
+                        "source": item.get("source"),
+                    }
+                    for item in restaurants.get("restaurants", [])[:6]
+                ],
+            }
+        )
+
+    if hotels:
+        cards.append(
+            {
+                "type": "hotels",
+                "city": hotels.get("city"),
+                "area": hotels.get("area"),
+                "budget_level": hotels.get("budget_level"),
+                "items": [
+                    {
+                        "name": item.get("name"),
+                        "area": item.get("area"),
+                        "rating": item.get("rating"),
+                        "price_per_night": item.get("price_per_night"),
+                        "source": item.get("source"),
+                    }
+                    for item in hotels.get("hotels", [])[:5]
+                ],
+            }
+        )
+
+    if budget:
+        cards.append(
+            {
+                "type": "budget",
+                "city": budget.get("city"),
+                "days": budget.get("days"),
+                "companions": budget.get("companions"),
+                "budget_level": budget.get("budget_level"),
+                "hotel_required": budget.get("hotel_required"),
+                "total_low": budget.get("total_low"),
+                "total_high": budget.get("total_high"),
+                "breakdown": {
+                    "住宿": budget.get("hotel"),
+                    "餐饮": budget.get("meals"),
+                    "门票": budget.get("tickets"),
+                    "市内交通": budget.get("inner_city_transport"),
+                },
             }
         )
 
@@ -146,4 +259,34 @@ def build_map_payload(itinerary: dict[str, Any]) -> dict[str, Any]:
         "center": center,
         "markers": markers,
         "routes": routes,
+    }
+
+
+def build_amap_roadbook_payload(itinerary: dict[str, Any]) -> dict[str, Any]:
+    """灰度上线用的高德路书草稿。
+
+    第一版只在前端导出 JSON，不自动调用高德生产 API。
+    """
+    days = []
+    for day in itinerary.get("days", []):
+        stops = []
+        for stop in day.get("stops", []):
+            poi = stop.get("poi") or {}
+            stops.append(
+                {
+                    "name": poi.get("name"),
+                    "lng": poi.get("lng"),
+                    "lat": poi.get("lat"),
+                    "start_time": stop.get("start_time"),
+                    "duration_min": stop.get("duration_min"),
+                    "category": poi.get("category"),
+                }
+            )
+        days.append({"day": day.get("day_index"), "stops": stops})
+    return {
+        "provider": "amap",
+        "city": itinerary.get("city"),
+        "summary": itinerary.get("summary"),
+        "days": days,
+        "requires_user_confirmation": True,
     }

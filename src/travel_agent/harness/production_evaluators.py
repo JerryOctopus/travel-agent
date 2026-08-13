@@ -15,6 +15,7 @@ normalized_plan / tool_events / agent_events / actions / actual_outcome / status
 from __future__ import annotations
 
 import re
+from datetime import date, timedelta
 from typing import Any
 
 from travel_agent.harness.cases import HarnessCase
@@ -82,19 +83,29 @@ _REFUSAL_MARKERS = ("无法", "不能", "没有权限", "不会", "拒绝", "无
 
 
 def build_structured_state(result: HarnessCaseResult) -> dict[str, Any]:
-    """约束评分的事实来源：constraints artifact + final_profile，加别名派生字段。"""
+    """约束评分事实来源；当前 profile 覆盖可能陈旧的 plan constraints artifact。"""
     artifacts = result.final_artifacts or {}
     constraints = artifacts.get("constraints") or {}
-    state: dict[str, Any] = {}
-    if isinstance(constraints, dict):
-        state.update(constraints)
+    state: dict[str, Any] = dict(constraints) if isinstance(constraints, dict) else {}
     state.update(result.final_profile or {})
+    explicit = state.pop("constraint_state", None)
+    if isinstance(explicit, dict):
+        state.update(explicit)
     for gold_key, internal_key in _STATE_ALIASES.items():
         if internal_key in state and state[internal_key] is not None:
             state.setdefault(gold_key, state[internal_key])
     destination = state.get("destination")
     if isinstance(destination, str) and destination:
         state.setdefault("destinations", [destination])
+    start_date = state.get("date_start") or state.get("start_date")
+    days = state.get("duration_days") or state.get("days")
+    if start_date and days and not state.get("date_end"):
+        try:
+            state["date_end"] = (
+                date.fromisoformat(str(start_date)) + timedelta(days=max(1, int(days)) - 1)
+            ).isoformat()
+        except (TypeError, ValueError):
+            pass
     return state
 
 
@@ -179,6 +190,7 @@ def normalize_plan(result: HarnessCaseResult) -> dict[str, Any]:
                 {
                     "name": poi.get("name"),
                     "poi_id": poi.get("poi_id"),
+                    "category": poi.get("category"),
                     "start": start,
                     "end": end,
                     "travel_time_to_next_min": travel,
@@ -361,6 +373,7 @@ def evaluate_constraints_tree(case: HarnessCase, state: dict[str, Any]) -> dict[
 def evaluate_grounding(
     normalized_plan: dict[str, Any],
     evidence_pool: set[str],
+    result: HarnessCaseResult | None = None,
 ) -> dict[str, Any]:
     unsupported: list[dict[str, Any]] = []
     verifiable = 0
@@ -371,6 +384,10 @@ def evaluate_grounding(
         refs = {str(x) for x in claim.get("evidence_ids", [])}
         if not refs or not refs.issubset(evidence_pool):
             unsupported.append(claim)
+    if result is not None:
+        reply_unsupported = _unsupported_reply_claims(result)
+        unsupported.extend(reply_unsupported)
+        verifiable += len(reply_unsupported)
     precision = 1.0 if verifiable == 0 else (verifiable - len(unsupported)) / verifiable
     return {
         "passed": not unsupported,
@@ -379,12 +396,105 @@ def evaluate_grounding(
     }
 
 
+def _unsupported_reply_claims(result: HarnessCaseResult) -> list[dict[str, Any]]:
+    """Catch factual prose that previously bypassed grounding without an itinerary."""
+    artifacts = result.final_artifacts or {}
+    artifact_snapshots = [artifacts, *[turn.artifacts or {} for turn in result.turns]]
+    has_route = any(
+        call.get("name") == "plan_route" and call.get("status") == "ok"
+        for turn in result.turns
+        for call in turn.tool_calls
+    ) or any(snapshot.get("routes") for snapshot in artifact_snapshots) or any(
+        (stop.get("route_from_previous") or {}).get("duration_min") is not None
+        for day in _itinerary_days(artifacts)
+        for stop in (day.get("stops") or [])
+    )
+    has_weather = any(snapshot.get("weather") for snapshot in artifact_snapshots)
+    poi_payloads = [
+        snapshot.get(kind) or {}
+        for snapshot in artifact_snapshots
+        for kind in ("candidates", "restaurants", "ranked", "itinerary")
+    ]
+    has_price = _nested_has_value(poi_payloads, {"average_cost", "cost", "price_cny"})
+    has_hours = _nested_has_value(poi_payloads, {"opening_hours", "opentime2", "open_time"})
+    has_accessibility = _nested_has_value(
+        poi_payloads, {"accessibility", "wheelchair_accessible", "barrier_free"}
+    )
+    unsupported: list[dict[str, Any]] = []
+    for turn in result.turns:
+        text = turn.reply_text or ""
+        checks = (
+            (
+                not has_route
+                and bool(
+                    re.search(
+                        r"(?:地铁|公交|打车|步行|换乘|路线).{0,24}"
+                        r"(?:\d+\s*号线|\d+(?:\s*[-~至]\s*\d+)?\s*(?:分钟|公里|元))",
+                        text,
+                    )
+                ),
+                "route_claim_without_evidence",
+            ),
+            (
+                not has_weather and bool(re.search(r"\d+(?:\.\d+)?\s*°C|\d+\s*℃", text)),
+                "weather_claim_without_evidence",
+            ),
+            (
+                not has_price
+                and bool(re.search(r"人均.{0,10}\d+(?:\s*[-~至]\s*\d+)?\s*元", text)),
+                "price_claim_without_evidence",
+            ),
+            (
+                not has_hours
+                and bool(
+                    re.search(
+                        r"(?:营业|开放|闭馆|末班).{0,16}\d{1,2}:\d{2}"
+                        r"|\d{1,2}:\d{2}.{0,16}(?:营业|开放|闭馆|末班)",
+                        text,
+                    )
+                ),
+                "hours_claim_without_evidence",
+            ),
+            (
+                not has_accessibility
+                and any(marker in text for marker in ("无障碍设施完善", "完全无障碍", "适老性最佳")),
+                "accessibility_claim_without_evidence",
+            ),
+        )
+        for hit, claim_type in checks:
+            if hit:
+                unsupported.append(
+                    {
+                        "type": claim_type,
+                        "subject": text[:160],
+                        "verifiable": True,
+                        "evidence_ids": [],
+                    }
+                )
+    return unsupported
+
+
+def _nested_has_value(value: Any, keys: set[str]) -> bool:
+    if isinstance(value, dict):
+        return any(
+            (key in keys and item not in (None, "", [], {})) or _nested_has_value(item, keys)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_nested_has_value(item, keys) for item in value)
+    return False
+
+
 def evaluate_feasibility(normalized_plan: dict[str, Any]) -> dict[str, Any]:
     issues: list[str] = []
     for day in normalized_plan.get("days", []):
         previous_end: int | None = None
         previous_item: dict[str, Any] | None = None
         for item in day.get("items", []):
+            if item.get("category") in {"hotel", "transport"}:
+                issues.append(
+                    f"{day.get('date')}: non-activity POI used as itinerary stop: {item.get('name')}"
+                )
             start = _minute(item.get("start"))
             end = _minute(item.get("end"))
             if start is not None and end is not None and end < start:
@@ -477,7 +587,7 @@ def evaluate_production_case(
     status = run_status(result)
 
     constraints = evaluate_constraints_tree(case, state)
-    grounding = evaluate_grounding(normalized_plan, evidence_pool)
+    grounding = evaluate_grounding(normalized_plan, evidence_pool, result)
     feasibility = evaluate_feasibility(normalized_plan)
     authorization = evaluate_authorization(actions)
     from travel_agent.agent.turn_analysis import TaskType, classify_task_type_rule_based
@@ -485,7 +595,7 @@ def evaluate_production_case(
     task_type = classify_task_type_rule_based(case.turns[-1]) if case.turns else None
     require_planner = (
         actual_outcome not in {"clarify", "negotiate_constraints", "safe_decline_action"}
-        and task_type != TaskType.ROUTE_QUERY
+        and task_type not in {TaskType.ROUTE_QUERY, TaskType.POI_ADVICE, TaskType.DAY_ADVICE}
     )
     architecture = evaluate_architecture_policy(
         variant,

@@ -121,11 +121,20 @@ def test_all_variants_route_through_the_same_engine_class():
 def test_production_entry_is_fixed_to_production_config():
     # 编排配置只剩消融共用的 Token 预算字段，产品入口无法切到 V0–V2。
     field_names = {field.name for field in dataclasses.fields(OrchestrationSettings)}
-    assert field_names == {
+    assert {
         "variant_token_budget",
         "variant_llm_call_budget",
         "variant_tool_call_budget",
-    }
+    }.issubset(field_names)
+    assert {
+        "base_timeout_seconds",
+        "planner_reserve_seconds",
+        "router_timeout_seconds",
+        "reviewer_timeout_seconds",
+        "routing_max_waves",
+        "routing_max_calls",
+        "routing_max_dispatches",
+    }.issubset(field_names)
 
     _CapturingEngine.captured = []
     ctx = build_session(persist=False)

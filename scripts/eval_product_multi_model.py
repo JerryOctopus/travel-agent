@@ -1,8 +1,9 @@
-"""Run production_v1 (180 cases) using multiple LLMs with automatic relay on quota exhaustion."""
+"""Run production_v1.1 (192 cases) using multiple LLMs with automatic relay."""
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sys
@@ -39,13 +40,34 @@ from travel_agent.settings import load_settings
 REQUIRED_AGENTS = ["attraction", "hotel", "restaurant", "transport", "planner"]
 
 
+def acquire_run_lock(run_dir: Path):
+    """Hold an exclusive process lock for one run-id until the handle closes."""
+    lock_path = run_dir / ".run.lock"
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.seek(0)
+        owner = handle.read().strip() or "unknown"
+        handle.close()
+        raise RuntimeError(
+            f"run_id is already active (lock owner pid={owner}): {run_dir.name}"
+        ) from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    return handle
+
+
 DEFAULT_RELAY_MODELS = [
-    "qwen3.7-plus-2026-05-26",
-    "qwen3.8-max",
-    "deepseek-v4-flash",
-    "deepseek-v4-pro",
-    "deepseek-v3.2",
-    "deepseek-v3.2-exp",
+    "qwen-max",
+    "qwen3.6-flash",
+    "qwen3.7-flash-2026-07-15",
+    "qwen-long",
+    "qwen3.5-flash-2026-02-23",
+    "qwen-plus",
+    "glm:glm-5",
 ]
 
 DEFAULT_BASE_URL_BY_PROVIDER = {
@@ -55,6 +77,9 @@ DEFAULT_BASE_URL_BY_PROVIDER = {
     "deepseek": "https://api.deepseek.com/v1",
     "zhipu": "https://open.bigmodel.cn/api/paas/v4",
     "glm": "https://open.bigmodel.cn/api/paas/v4",
+    "siliconflow": "https://api.siliconflow.cn/v1",
+    "silicon-flow": "https://api.siliconflow.cn/v1",
+    "silicon_flow": "https://api.siliconflow.cn/v1",
 }
 
 QUOTA_KEYWORDS = {
@@ -144,9 +169,16 @@ def is_auth_error(text: str, status: object) -> bool:
     return any(marker in lower for marker in ("invalid api key", "authentication", "unauthorized"))
 
 
+def recorded_model_identity(models: list[dict[str, Any]]) -> tuple[str, str]:
+    """Record the actual fixed model unless a run truly contains a relay pool."""
+    if len(models) == 1:
+        return str(models[0]["provider"]), str(models[0]["model"])
+    return "quota-relay", "quota-relay"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run production_v1 (180 cases) with multi-model relay."
+        description="Run production_v1.1 (192 cases) with multi-model relay."
     )
     parser.add_argument("--product-cases", default=str(DEFAULT_PRODUCT_CASES))
     parser.add_argument(
@@ -155,6 +187,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
     )
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--case-id",
+        action="append",
+        default=[],
+        help="Run only the selected case id(s) after split filtering; repeatable.",
+    )
     parser.add_argument(
         "--model",
         action="append",
@@ -175,8 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-model-tokens",
         type=int,
-        default=900000,
-        help="Token cap per model; switch when reaching this local threshold.",
+        default=0,
+        help="Optional token cap per model; 0 disables the local cap.",
     )
     parser.add_argument(
         "--output-root",
@@ -237,8 +275,10 @@ def build_state_template(
 
 def multi_agent_fields(result) -> dict[str, Any]:
     """Strict proof that all five real LLM Subagents completed for this execution."""
-    payload = result.final_artifacts.get("agent_trace") or {}
-    items = list(payload.get("items") or [])
+    items = [item for turn in result.turns for item in (turn.agent_trace or [])]
+    if not items:
+        payload = result.final_artifacts.get("agent_trace") or {}
+        items = list(payload.get("items") or [])
     successful_agents = {
         str(item.get("agent"))
         for item in items
@@ -269,7 +309,37 @@ def load_state(state_path: Path) -> dict[str, Any]:
 
 def save_state(state_path: Path, state: dict[str, Any]) -> None:
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = state_path.with_suffix(state_path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(state_path)
+
+
+def save_pending_case_output(pending_dir: Path, case_output: dict[str, Any]) -> Path:
+    """Persist a completed case before advancing relay resume state."""
+    case_id = str(case_output["case"]["case_id"])
+    repeat = int(case_output["execution"]["repeat"])
+    path = pending_dir / f"{case_id}__repeat-{repeat}.json"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(case_output, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
+    return path
+
+
+def load_pending_case_outputs(pending_dir: Path) -> list[dict[str, Any]]:
+    if not pending_dir.is_dir():
+        return []
+    outputs: list[dict[str, Any]] = []
+    for path in sorted(pending_dir.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"pending case output must be a JSON object: {path}")
+        outputs.append(payload)
+    return outputs
 
 
 def build_failed_row(case, reason: str) -> dict[str, Any]:
@@ -341,6 +411,12 @@ def main() -> None:
     if not validation.valid:
         raise RuntimeError("invalid production_v1 dataset: " + "; ".join(validation.errors))
     selected_cases = [case for case in cases if args.product_split == "all" or case.split == args.product_split]
+    if args.case_id:
+        wanted = set(args.case_id)
+        selected_cases = [case for case in selected_cases if case.case_id in wanted]
+        missing = wanted - {case.case_id for case in selected_cases}
+        if missing:
+            raise ValueError(f"case ids not found in selected split: {sorted(missing)}")
     if args.limit is not None:
         selected_cases = selected_cases[: max(1, args.limit)]
 
@@ -359,7 +435,9 @@ def main() -> None:
             run_dir = output_root / "runs" / run_id
             suffix += 1
     state_path = run_dir / "relay_state.json"
+    pending_cases_dir = run_dir / "pending_cases"
     run_dir.mkdir(parents=True, exist_ok=True)
+    _run_lock = acquire_run_lock(run_dir)
 
     base_url = str(settings.llm.base_url)
     state = load_state(state_path)
@@ -434,7 +512,14 @@ def main() -> None:
                     {"provider": provider, "model": model, "detail": result}
                 )
             else:
-                usable.append((provider, model, pick_base_url(provider, args.base_url, base_url)))
+                state["model_unavailable"].append(
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "reason": "preflight_failed",
+                        "detail": result,
+                    }
+                )
         if not usable:
             raise RuntimeError("No usable models after preflight.")
         model_specs = [(provider, model) for provider, model, _ in usable]
@@ -523,7 +608,7 @@ def main() -> None:
 
     completed_cases = set(state.get("completed_case_ids", []))
     rows = [row for row in state.get("rows", []) if isinstance(row, dict)]
-    case_outputs = []
+    case_outputs = load_pending_case_outputs(pending_cases_dir)
     attempts_total = int(state.get("attempts_total", 0))
     model_usage = {
         key: {"tokens": int(value.get("tokens", 0)), "cases": int(value.get("cases", 0))}
@@ -532,11 +617,12 @@ def main() -> None:
     current_model_index = int(state.get("current_model_index", 0))
 
     def append_case_output(case_output: dict[str, Any]) -> None:
+        save_pending_case_output(pending_cases_dir, case_output)
         case_outputs.append(case_output)
         state["rows"] = rows
         save_state(state_path, state)
 
-    def try_models_for_case(case) -> None:
+    def try_models_for_case(case) -> bool:
         nonlocal current_model_index, attempts_total
         local_switches = 0
         case_key = case.case_id
@@ -563,7 +649,12 @@ def main() -> None:
 
             harness = harnesses[(provider, model)]
             started = time.time()
-            result = harness.run_case(_execution_case(case, 1))
+            # Isolate L3 memory across distinct eval runs. Reusing the same
+            # case-scoped user id makes a prior Smoke/Mini run leak preferences
+            # into a later run even though artifact persistence is disabled.
+            result = harness.run_case(
+                _execution_case(case, 1, run_namespace=run_id)
+            )
             row = _product_row(case, result, 1)
             row.update(multi_agent_fields(result))
             attempts_total += 1
@@ -645,9 +736,11 @@ def main() -> None:
             state["rows"] = rows
             state["current_model_index"] = current_model_index
             save_state(state_path, state)
-            return
+            return True
 
         # if all remaining models fail on this case, write an explicit failure row
+        if last_reason == "local token cap reached":
+            return False
         failed_row = build_failed_row(case, last_reason or "all relay models unavailable")
         failed_row["runtime_model_provider"] = "quota-relay"
         failed_row["runtime_model"] = "n/a"
@@ -679,45 +772,27 @@ def main() -> None:
         state["completed_case_ids"] = sorted(completed_cases)
         state["rows"] = rows
         save_state(state_path, state)
+        return True
 
+    stopped_early = False
+    stop_reason: str | None = None
     for index, case in enumerate(selected_cases, start=1):
         if case.case_id in completed_cases:
             print(f"[skip] {case.case_id} already done")
             continue
         print(f"[case {index}/{len(selected_cases)}] {case.case_id}")
         if current_model_index >= len(model_specs):
-            failed_row = build_failed_row(
-                case, f"all models used: {len(model_specs)}"
+            stopped_early = True
+            stop_reason = f"relay pool exhausted after {len(completed_cases)} completed cases"
+            print(f"[stop] {stop_reason}")
+            break
+        if not try_models_for_case(case):
+            stopped_early = True
+            stop_reason = (
+                f"local model token cap reached after {len(completed_cases)} completed cases"
             )
-            failed_row["runtime_model_provider"] = "quota-relay"
-            failed_row["runtime_model"] = "n/a"
-            rows.append(failed_row)
-            output = {
-                "schema_version": "product-case-output-v1",
-                "case": case.__dict__,
-                "execution": {
-                    "repeat": 1,
-                    "passed": False,
-                    "errors": [failed_row["errors"]],
-                    "runtime_model": failed_row["runtime_model"],
-                    "runtime_model_provider": failed_row["runtime_model_provider"],
-                },
-                "turns": [],
-                "final_profile": {},
-                "final_artifacts": {},
-                "final_itinerary": None,
-                "evaluation": {
-                    "rule_metrics": None,
-                    "independent_judge": None,
-                    "human_review": None,
-                },
-            }
-            append_case_output(output)
-            completed_cases.add(case.case_id)
-            state["completed_case_ids"] = sorted(completed_cases)
-            state["rows"] = rows
-            continue
-        try_models_for_case(case)
+            print(f"[stop] {stop_reason}")
+            break
 
     summary = aggregate_product_rows(rows, remediation_complete=args.remediation_complete)
     summary["relay_mode"] = True
@@ -731,6 +806,7 @@ def main() -> None:
     summary["model_switch_log"] = state.get("model_switch_log", [])
     summary["model_switch_count"] = len(state.get("model_switch_log", []))
 
+    recorded_provider, recorded_model = recorded_model_identity(state["models"])
     suite_result = HarnessSuiteResult(
         suite="agent-product",
         mode="product",
@@ -745,8 +821,8 @@ def main() -> None:
             "dataset_version": PRODUCTION_DATASET_VERSION,
             "dataset_sha256": _sha256(Path(args.product_cases)),
             "code_revision": _git_revision(),
-            "model_provider": "quota-relay",
-            "model": "quota-relay",
+            "model_provider": recorded_provider,
+            "model": recorded_model,
             "model_temperature": settings.llm.temperature,
             "model_thinking_enabled": settings.llm.thinking_enabled,
             "model_requests_per_second": settings.llm.requests_per_second,
@@ -762,8 +838,8 @@ def main() -> None:
             "_case_outputs": case_outputs,
         },
         benchmarks=[],
-        stopped_early=False,
-        stop_reason=None,
+        stopped_early=stopped_early,
+        stop_reason=stop_reason,
     )
 
     if args.write_report:

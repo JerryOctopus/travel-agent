@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
 
+from travel_agent.schemas import TravelProfile
 from travel_agent.workflow_rules import CITY_ALIASES, extract_profile_rule_based
 
 if TYPE_CHECKING:
@@ -108,18 +109,22 @@ def classify_message(user_message: str) -> MessageKind:
     return decision.kind
 
 
-def classify_message_rule_based(user_message: str) -> IntentDecision:
+def classify_message_rule_based(
+    user_message: str,
+    extracted_profile: TravelProfile | None = None,
+) -> IntentDecision:
     """规则优先判断；弱旅行信号归为 ambiguous，留给 LLM 复判。"""
-    text = user_message.strip()
+    text = user_message.strip() # 把消息前后空格、换行、\t、\n 这些首尾空白字符删掉
     if not text:
         return IntentDecision(MessageKind.OUT_OF_SCOPE, "high", "empty")
     if is_pure_greeting(text):
         return IntentDecision(MessageKind.GREETING, "high", "pure_greeting")
     if _has_strong_non_travel_signal(text):
         return IntentDecision(MessageKind.OUT_OF_SCOPE, "high", "strong_non_travel")
-    if _has_strong_travel_signal(text):
+    extracted = extracted_profile or extract_profile_rule_based(text)
+    if _has_strong_travel_signal(text, extracted):
         return IntentDecision(MessageKind.TRAVEL, "high", "strong_travel")
-    if _has_weak_travel_signal(text):
+    if _has_weak_travel_signal(text, extracted):
         return IntentDecision(MessageKind.AMBIGUOUS, "uncertain", "weak_travel_signal")
     return IntentDecision(MessageKind.OUT_OF_SCOPE, "high", "no_travel_signal")
 
@@ -149,8 +154,7 @@ def has_travel_intent(user_message: str) -> bool:
     return classify_message(user_message) == MessageKind.TRAVEL
 
 
-def _has_strong_travel_signal(text: str) -> bool:
-    extracted = extract_profile_rule_based(text)
+def _has_strong_travel_signal(text: str, extracted: TravelProfile) -> bool:
     if extracted.destination or extracted.days:
         if extracted.destination and extracted.days:
             return True
@@ -177,8 +181,7 @@ def _has_strong_non_travel_signal(text: str) -> bool:
     return any(pattern.search(text) for pattern in _STRONG_NON_TRAVEL_PATTERNS)
 
 
-def _has_weak_travel_signal(text: str) -> bool:
-    extracted = extract_profile_rule_based(text)
+def _has_weak_travel_signal(text: str, extracted: TravelProfile) -> bool:
     if extracted.destination or extracted.days:
         return True
     if extracted.interests or extracted.budget_level or extracted.companions:

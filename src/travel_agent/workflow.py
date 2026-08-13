@@ -4,7 +4,7 @@ from pathlib import Path
 
 from travel_agent.critic import critique_itinerary
 from travel_agent.llm_extractor import RuleBasedTravelProfileExtractor, TravelProfileExtractor
-from travel_agent.planning import build_simple_itinerary
+from travel_agent.planning import apply_structured_schedule_constraints, build_simple_itinerary
 from travel_agent.providers import TravelToolProvider, build_tool_provider
 from travel_agent.rag import retrieve_destination_knowledge
 from travel_agent.recommendation import score_pois
@@ -67,6 +67,14 @@ def run_mvp_workflow(
             profile=profile,
             critic_result=critic_result,
         )
+        itinerary = itinerary.__class__(
+            city=itinerary.city,
+            days=apply_structured_schedule_constraints(
+                list(itinerary.days), ranked, profile, provider
+            ),
+            summary=itinerary.summary,
+        )
+        critic_result = critique_itinerary(itinerary, profile)
         revised = bool(revision_notes)
     return WorkflowResult(
         profile=profile,
@@ -80,8 +88,50 @@ def run_mvp_workflow(
     )
 
 
+def merge_l3_preferences(base: TravelProfile, l3: TravelProfile) -> TravelProfile:
+    """合并 L3 跨会话画像中的长期偏好，不注入目的地/天数等单次行程槽位。"""
+    if not any(
+        (
+            l3.budget_level,
+            l3.pace != "standard",
+            l3.companions,
+            l3.food_preference,
+            l3.must_visit,
+            l3.avoid,
+            l3.hotel_area,
+            l3.transport_mode != "public_transport",
+        )
+    ):
+        return base
+    return TravelProfile(
+        destination=base.destination,
+        days=base.days,
+        start_date=base.start_date,
+        budget_level=l3.budget_level or base.budget_level,
+        budget_limit=base.budget_limit,
+        interests=list(base.interests),
+        companions=l3.companions or base.companions,
+        party_size=base.party_size,
+        pace=l3.pace if l3.pace != "standard" else base.pace,
+        hotel_area=l3.hotel_area or base.hotel_area,
+        food_preference=_merge_unique(base.food_preference, l3.food_preference),
+        must_visit=_merge_unique(base.must_visit, l3.must_visit),
+        avoid=_merge_unique(base.avoid, l3.avoid),
+        transport_mode=(
+            l3.transport_mode
+            if l3.transport_mode != "public_transport"
+            else base.transport_mode
+        ),
+        constraint_state=dict(base.constraint_state),
+    )
+
+
 def merge_profile(base: TravelProfile, update: TravelProfile) -> TravelProfile:
     """合并多轮对话中的出行画像，新一轮信息优先。"""
+    explicit_public_transport = (
+        update.constraint_state.get("self_driving_allowed") is False
+        or update.constraint_state.get("public_transport_required") is True
+    )
     return TravelProfile(
         destination=update.destination or base.destination,
         days=update.days or base.days,
@@ -97,10 +147,15 @@ def merge_profile(base: TravelProfile, update: TravelProfile) -> TravelProfile:
         must_visit=_merge_unique(base.must_visit, update.must_visit),
         avoid=_merge_unique(base.avoid, update.avoid),
         transport_mode=(
-            update.transport_mode
-            if update.transport_mode != "public_transport"
-            else base.transport_mode
+            "public_transport"
+            if explicit_public_transport
+            else (
+                update.transport_mode
+                if update.transport_mode != "public_transport"
+                else base.transport_mode
+            )
         ),
+        constraint_state={**base.constraint_state, **update.constraint_state},
     )
 
 

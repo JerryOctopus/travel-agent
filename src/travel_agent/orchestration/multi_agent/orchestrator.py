@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -84,7 +85,7 @@ DispatchFn = Callable[[str, str, dict | None, list | None], str]
 class DispatchLedger:
     """Turn-scoped hard limits and dependency state for dynamic dispatch."""
 
-    max_total: int = 8
+    max_total: int = 6
     per_agent_limits: dict[str, int] = field(
         default_factory=lambda: {
             "attraction": 2,
@@ -99,30 +100,37 @@ class DispatchLedger:
     objectives: set[str] = field(default_factory=set)
     results_by_task: dict[str, SubagentResult] = field(default_factory=dict)
     terminal: bool = False
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def authorize(self, agent: str, instruction: str) -> str | None:
-        if self.terminal:
-            return "dispatch terminal: planner already completed"
-        objective = _normalize_objective(agent, instruction)
-        if objective in self.objectives:
-            return "duplicate objective rejected"
-        if self.attempts >= self.max_total:
-            return f"global dispatch limit exhausted: {self.max_total}"
-        limit = self.per_agent_limits.get(agent, 0)
-        if self.counts.get(agent, 0) >= limit:
-            return f"per-agent dispatch limit exhausted: {agent}={limit}"
-        self.attempts += 1
-        self.counts[agent] = self.counts.get(agent, 0) + 1
-        self.objectives.add(objective)
-        return None
+        with self._lock:
+            if self.terminal:
+                return "dispatch terminal: planner already completed"
+            objective = _normalize_objective(agent, instruction)
+            if objective in self.objectives:
+                return "duplicate objective rejected"
+            if self.attempts >= self.max_total:
+                return f"global dispatch limit exhausted: {self.max_total}"
+            limit = self.per_agent_limits.get(agent, 0)
+            if self.counts.get(agent, 0) >= limit:
+                return f"per-agent dispatch limit exhausted: {agent}={limit}"
+            self.attempts += 1
+            self.counts[agent] = self.counts.get(agent, 0) + 1
+            self.objectives.add(objective)
+            return None
 
     def record(self, result: SubagentResult) -> None:
-        self.results_by_task[result.task_id] = result
-        if result.agent == "planner" and result.status in {
-            STATUS_COMPLETED,
-            STATUS_COMPLETED_WITH_WARNINGS,
-        }:
-            self.terminal = True
+        with self._lock:
+            self.results_by_task[result.task_id] = result
+            if result.agent == "planner" and result.status in {
+                STATUS_COMPLETED,
+                STATUS_COMPLETED_WITH_WARNINGS,
+            }:
+                self.terminal = True
+
+    def result_for(self, task_id: str) -> SubagentResult | None:
+        with self._lock:
+            return self.results_by_task.get(task_id)
 
 
 def build_dispatch_tool(
@@ -132,7 +140,11 @@ def build_dispatch_tool(
     ledger: DispatchLedger | None = None,
     base_inputs: dict[str, Any] | None = None,
 ) -> DispatchFn:
-    """构建 ``dispatch_subagent`` 的执行闭包（Step 3 包装为 StructuredTool）。
+    """
+    派工函数工厂”：它本身不执行 Subagent，而是创建并返回一个 dispatch_subagent(...) 闭包，
+    供 Orchestrator 后续派发领域任务。
+
+    构建 ``dispatch_subagent`` 的执行闭包（Step 3 包装为 StructuredTool）。
 
     参数语义：``agent``（subagent 类型）、``instruction``（任务描述）、
     ``inputs``（可选结构化输入，可含 artifact_id 列表）、``depends_on``。
@@ -154,9 +166,6 @@ def build_dispatch_tool(
     ) -> str:
         from travel_agent.orchestration.meter import current_turn_meter
 
-        meter = current_turn_meter()
-        if meter is not None:
-            meter.record_dispatch(agent)
         task_id = new_task_id(agent)
         merged_inputs = dict(base_inputs or {})
         merged_inputs.update(inputs or {})
@@ -173,7 +182,7 @@ def build_dispatch_tool(
         dependency_ids: list[str] = []
         unresolved: list[str] = []
         for dependency_task_id in depends_on or []:
-            dependency = turn_ledger.results_by_task.get(str(dependency_task_id))
+            dependency = turn_ledger.result_for(str(dependency_task_id))
             if dependency is None or dependency.status not in {
                 STATUS_COMPLETED,
                 STATUS_COMPLETED_WITH_WARNINGS,
@@ -211,6 +220,9 @@ def build_dispatch_tool(
                 unresolved=[f"dependency:{item}" for item in unresolved],
             )
         else:
+            meter = current_turn_meter()
+            if meter is not None:
+                meter.record_dispatch(agent)
             result = runner.run_subagent(task)
         turn_ledger.record(result)
         return json.dumps(result.to_dict(), ensure_ascii=False, default=str)

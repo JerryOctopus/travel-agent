@@ -54,13 +54,30 @@ def user_confirms_l3_preferences(user_message: str) -> bool:
     return bool(_CONFIRM_L3_RE.search(user_message.strip()))
 
 
-def turn_expresses_preferences(user_message: str) -> bool:
+def turn_expresses_preferences(
+    user_message: str,
+    extracted_profile: TravelProfile | None = None,
+    *,
+    patches: dict[str, object] | None = None,
+) -> bool:
     """本轮输入是否已包含可规划的偏好信号。"""
-    extracted = extract_profile_rule_based(user_message)
-    if extracted.interests or extracted.budget_level or extracted.companions:
-        return True
-    if extracted.pace != "standard" or extracted.must_visit or extracted.avoid:
-        return True
+    preference_fields = {
+        "interests",
+        "budget_level",
+        "companions",
+        "pace",
+        "must_visit",
+        "avoid",
+    }
+    if patches is not None:
+        if preference_fields.intersection(patches):
+            return True
+    else:
+        extracted = extracted_profile or extract_profile_rule_based(user_message)
+        if extracted.interests or extracted.budget_level or extracted.companions:
+            return True
+        if extracted.pace != "standard" or extracted.must_visit or extracted.avoid:
+            return True
     text = user_message.strip()
     return any(keyword in text for keyword in _PREFERENCE_KEYWORDS)
 

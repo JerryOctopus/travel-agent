@@ -14,4 +14,4 @@ description: 从需求澄清到地图渲染的完整旅行规划流程
 5. `plan_and_critique` 产出经 critic 修正的行程（必须使用，不可手写行程）；
 6. `render_itinerary` 与 `render_map` 供前端展示。
 
-输出时说明 critic 是否通过、有无自动修正项。
+输出时仅用 3～5 句说明 critic 是否通过；逐日详情由 render_itinerary 卡片展示，禁止在对话里手写完整行程。
