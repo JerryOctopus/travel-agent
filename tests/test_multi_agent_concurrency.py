@@ -242,7 +242,9 @@ def test_session_lock_is_non_reentrant():
 
 def test_should_serialize_tool_excludes_dispatch():
     assert should_serialize_tool("dispatch_subagent") is False
-    for name in ("search_poi", "search_hotel", "plan_route", "plan_and_critique"):
+    for name in ("search_poi", "search_hotel", "plan_route"):
+        assert should_serialize_tool(name) is False
+    for name in ("build_constraints", "plan_and_critique", "unknown_tool"):
         assert should_serialize_tool(name) is True
 
 

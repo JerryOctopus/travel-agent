@@ -15,6 +15,7 @@ from travel_agent.planning import (
     ACTIVITY_TIMES, MEAL_TIMES, START_TIMES, _daily_opening_window,
     poi_open_on_trip_day,
 )
+from travel_agent.poi_evidence import is_verified_plannable_poi, poi_avoid_match
 from travel_agent.schemas import CriticResult, Itinerary, ItineraryDay, ItineraryStop, ScoredPOI, TravelProfile
 
 
@@ -24,6 +25,11 @@ def revise_itinerary(
     profile: TravelProfile,
     critic_result: CriticResult,
 ) -> tuple[Itinerary, CriticResult, list[str]]:
+    ranked_pois = [
+        item for item in ranked_pois
+        if (item.poi.category == "food" or is_verified_plannable_poi(item.poi))
+        and poi_avoid_match(item.poi, profile) is None
+    ]
     if not critic_result.issues:
         return itinerary, critic_result, []
 
@@ -57,9 +63,17 @@ def revise_itinerary(
     revised, changed = _fill_sparse_activity_days(revised, ranked_pois, profile)
     notes.extend(changed)
 
+    # Route and completeness repairs can remove a venue that satisfied a hard
+    # place or a stated interest. Re-apply coverage once to the final shape so
+    # revision prose and the delivered itinerary cannot diverge.
+    revised, changed = _ensure_must_visit(revised, ranked_pois, profile)
+    notes.extend(changed)
+    revised, changed = _ensure_interest_coverage(revised, ranked_pois, profile)
+    notes.extend(changed)
+
     revised = _normalize_start_times(revised)
     revised_result = critique_itinerary(revised, profile)
-    return revised, revised_result, notes
+    return revised, revised_result, _reconcile_revision_notes(notes, revised, profile)
 
 
 def _repair_long_routes(
@@ -88,7 +102,8 @@ def _repair_long_routes(
         if item.poi.poi_id not in used_ids
         and item.poi.category not in {"hotel", "transport"}
         and (item.poi.category != "food" or poi_complies_with_dietary(item.poi, profile))
-        and not _matches_any_term(item.poi.name, profile.avoid + optional_terms)
+        and poi_avoid_match(item.poi, profile) is None
+        and not _matches_any_term(item.poi.name, optional_terms)
     ]
     notes: list[str] = []
     days: list[ItineraryDay] = []
@@ -265,14 +280,14 @@ def _remove_avoided_pois(
         item
         for item in ranked_pois
         if item.poi.poi_id not in used_ids
-        and not _matches_any_term(item.poi.name, profile.avoid)
+        and poi_avoid_match(item.poi, profile) is None
     ]
 
     days: list[ItineraryDay] = []
     for day in itinerary.days:
         stops: list[ItineraryStop] = []
         for stop in day.stops:
-            if not _matches_any_term(stop.poi.name, profile.avoid):
+            if poi_avoid_match(stop.poi, profile) is None:
                 stops.append(stop)
                 continue
             replacement = _pop_first(replacement_pool)
@@ -339,12 +354,15 @@ def _ensure_must_visit(
             ranked_pois,
             used_ids=_used_poi_ids(revised),
             predicate=lambda item, term=term: poi_matches_must_visit(item.poi, term),
+            itinerary=revised,
         )
         if not candidate:
             notes.append(f"未找到必去地点 `{term}` 的候选 POI。")
             continue
-        revised = _add_or_replace_stop(revised, candidate, profile)
-        notes.append(f"补充必去地点 `{candidate.poi.name}`。")
+        updated = _add_or_replace_stop(revised, candidate, profile)
+        if candidate.poi.poi_id in _used_poi_ids(updated):
+            notes.append(f"补充必去地点 `{candidate.poi.name}`。")
+        revised = updated
     return revised, notes
 
 
@@ -367,12 +385,15 @@ def _ensure_interest_coverage(
             ranked_pois,
             used_ids=_used_poi_ids(revised),
             predicate=lambda item, interest=interest: poi_matches_interest(item.poi, interest),
+            itinerary=revised,
         )
         if not candidate:
             notes.append(f"未找到可覆盖 `{interest}` 偏好的候选 POI。")
             continue
-        revised = _add_or_replace_stop(revised, candidate, profile)
-        notes.append(f"为覆盖 `{interest}` 偏好，补充 `{candidate.poi.name}`。")
+        updated = _add_or_replace_stop(revised, candidate, profile)
+        if candidate.poi.poi_id in _used_poi_ids(updated):
+            notes.append(f"为覆盖 `{interest}` 偏好，补充 `{candidate.poi.name}`。")
+        revised = updated
     return revised, notes
 
 
@@ -391,7 +412,7 @@ def _fill_sparse_activity_days(
             marker in item.poi.name
             for marker in ("纪念品", "旅游广场", "停车场", "售票处", "游客中心")
         )
-        and not _matches_any_term(item.poi.name, profile.avoid)
+        and poi_avoid_match(item.poi, profile) is None
     ]
     pool = [item for item in all_candidates if item.poi.poi_id not in used_ids]
     notes: list[str] = []
@@ -419,13 +440,6 @@ def _fill_sparse_activity_days(
             if poi_open_on_trip_day(item.poi, profile, day.day_index)
         ]
         if not open_pool:
-            same_day_ids = {stop.poi.poi_id for stop in stops}
-            open_pool = [
-                item for item in all_candidates
-                if item.poi.poi_id not in same_day_ids
-                and poi_open_on_trip_day(item.poi, profile, day.day_index)
-            ]
-        if not open_pool:
             days.append(day)
             continue
         candidate = min(
@@ -435,6 +449,21 @@ def _fill_sparse_activity_days(
                 -item.score,
             ),
         )
+        max_anchor_distance = max(
+            (_haversine_km(candidate.poi, anchor) for anchor in anchors),
+            default=0.0,
+        )
+        sparse_fill_radius_km = {
+            "relaxed": 10.0,
+            "standard": 15.0,
+            "intensive": 25.0,
+        }[profile.pace]
+        if anchors and max_anchor_distance > sparse_fill_radius_km:
+            # A completeness warning must not reintroduce an outlier that the
+            # route repair just removed.  Preserve a truthful free period when
+            # no geographically coherent evidenced activity is available.
+            days.append(day)
+            continue
         stops.append(_stop_from_scored(candidate, ACTIVITY_TIMES[-1]))
         if candidate in pool:
             pool.remove(candidate)
@@ -473,6 +502,21 @@ def _fill_missing_meal_days(
                 -item.score,
             ),
         )
+        max_anchor_distance = max(
+            (_haversine_km(candidate.poi, anchor) for anchor in anchors),
+            default=0.0,
+        )
+        meal_fill_radius_km = {
+            "relaxed": 10.0,
+            "standard": 15.0,
+            "intensive": 25.0,
+        }[profile.pace]
+        if anchors and max_anchor_distance > meal_fill_radius_km:
+            # A meal-completeness repair must not undo a prior long-route
+            # repair. The renderer can truthfully reserve an unspecific meal
+            # window when no dietary-compliant evidenced venue is nearby.
+            days.append(day)
+            continue
         meal_stop = _stop_from_scored(candidate, MEAL_TIMES[0])
         if len(stops) < _max_stops_per_day(profile):
             stops.append(meal_stop)
@@ -645,8 +689,9 @@ def _time_sort_key(value: str) -> tuple[int, int]:
 
 
 def _time_to_minutes(value: str) -> int:
-    hour, minute = _time_sort_key(value)
-    return hour * 60 + minute
+    from travel_agent.constraint_events import clock_minutes
+
+    return clock_minutes(value)
 
 
 def _minutes_to_time(value: int) -> str:
@@ -700,13 +745,56 @@ def _find_candidate(
     ranked_pois: list[ScoredPOI],
     used_ids: set[str],
     predicate,
+    itinerary: Itinerary | None = None,
 ) -> ScoredPOI | None:
-    for item in ranked_pois:
-        if item.poi.poi_id in used_ids:
-            continue
-        if predicate(item):
-            return item
-    return None
+    candidates = [
+        item for item in ranked_pois
+        if item.poi.poi_id not in used_ids and predicate(item)
+    ]
+    if not candidates:
+        return None
+    anchors = [
+        stop.poi for day in (itinerary.days if itinerary else []) for stop in day.stops
+    ]
+    if not anchors:
+        return candidates[0]
+    rank = {item.poi.poi_id: index for index, item in enumerate(ranked_pois)}
+    return min(
+        candidates,
+        key=lambda item: (
+            min(_haversine_km(item.poi, anchor) for anchor in anchors),
+            rank[item.poi.poi_id],
+        ),
+    )
+
+
+def _reconcile_revision_notes(
+    notes: list[str], itinerary: Itinerary, profile: TravelProfile
+) -> list[str]:
+    """Remove stale success/failure prose after later repair stages changed the plan."""
+    final_pois = [stop.poi for day in itinerary.days for stop in day.stops]
+    reconciled: list[str] = []
+    for note in notes:
+        quoted = [item.strip() for item in note.split("`")[1::2]]
+        if any(marker in note for marker in ("补充", "增加")) and quoted:
+            candidate_name = quoted[-1]
+            if not any(poi.name == candidate_name for poi in final_pois):
+                continue
+        if any(marker in note for marker in ("移除", "删减")) and quoted:
+            removed_name = quoted[-1]
+            if any(poi.name == removed_name for poi in final_pois):
+                continue
+        if note.startswith("未找到可覆盖") and quoted:
+            interest = quoted[0]
+            if any(poi_matches_interest(poi, interest) for poi in final_pois):
+                continue
+        if note.startswith("未找到必去地点") and quoted:
+            term = quoted[0]
+            if any(poi_matches_must_visit(poi, term) for poi in final_pois):
+                continue
+        if note not in reconciled:
+            reconciled.append(note)
+    return reconciled
 
 
 def _pop_first(items: list[ScoredPOI]) -> ScoredPOI | None:

@@ -74,12 +74,18 @@ _PLANNER_PROMPT = """你是 planner Subagent，唯一负责生成完整 TravelPl
 4. plan_and_critique 成功后输出 artifact_id、critic 是否通过、遗留告警与未解决事项。
 禁止：调用白名单以外的工具、自行编造行程内容。"""
 
+_WORKER_ERROR_POLICY = """
+工具错误纪律：
+- `isError=false` 表示成功，不得重复相同查询；只有不同区域、不同端点或不同路线段才可继续调用允许多目标的工具；
+- `isError=true, retryable=true` 时仅允许修正参数后重试一次；
+- `isError=true, retryable=false` 时禁止重试，立即如实报告未解决事项，由 Engine 决定恢复或结束。"""
+
 
 SUBAGENT_REGISTRY: dict[str, SubagentDefinition] = {
     "attraction": SubagentDefinition(
         name="attraction",
         description="景点搜索、兴趣匹配、天气适配、适老性与无障碍；工具：search_poi、check_weather。",
-        system_prompt=_ATTRACTION_PROMPT,
+        system_prompt=_ATTRACTION_PROMPT + _WORKER_ERROR_POLICY,
         tool_names=("search_poi", "check_weather"),
         max_steps=8,
         max_tool_calls=4,
@@ -87,7 +93,7 @@ SUBAGENT_REGISTRY: dict[str, SubagentDefinition] = {
     "hotel": SubagentDefinition(
         name="hotel",
         description="酒店与住宿区域、价格和商圈比较；工具：search_hotel。",
-        system_prompt=_HOTEL_PROMPT,
+        system_prompt=_HOTEL_PROMPT + _WORKER_ERROR_POLICY,
         tool_names=("search_hotel",),
         max_steps=6,
         max_tool_calls=3,
@@ -95,7 +101,7 @@ SUBAGENT_REGISTRY: dict[str, SubagentDefinition] = {
     "restaurant": SubagentDefinition(
         name="restaurant",
         description="餐厅搜索、口味与饮食限制、人均预算；工具：search_restaurant、estimate_budget。",
-        system_prompt=_RESTAURANT_PROMPT,
+        system_prompt=_RESTAURANT_PROMPT + _WORKER_ERROR_POLICY,
         tool_names=("search_restaurant", "estimate_budget"),
         max_steps=6,
         max_tool_calls=4,
@@ -103,7 +109,7 @@ SUBAGENT_REGISTRY: dict[str, SubagentDefinition] = {
     "transport": SubagentDefinition(
         name="transport",
         description="市内与城际交通、换乘、步行、耗时与返程截止；工具：search_poi、plan_route、estimate_budget。",
-        system_prompt=_TRANSPORT_PROMPT,
+        system_prompt=_TRANSPORT_PROMPT + _WORKER_ERROR_POLICY,
         tool_names=("search_poi", "plan_route", "estimate_budget"),
         max_steps=10,
         max_tool_calls=6,

@@ -4,8 +4,10 @@ from travel_agent.agent.response_summary import (
     build_plan_reply_text,
     looks_like_hallucinated_itinerary,
 )
-from travel_agent.agent.runtime import _finalize_reply_text
+from travel_agent.agent.runtime import _finalize_reply_text, _reply_from_outcome
 from travel_agent.agent.session import ArtifactStore, build_session
+from travel_agent.orchestration.multi_agent.engine import TurnOutcome
+from travel_agent.orchestration.multi_agent.schemas import STATUS_INCOMPLETE
 from travel_agent.schemas import TravelProfile
 
 
@@ -86,6 +88,127 @@ def test_plan_reply_does_not_claim_delivery_when_budget_is_exceeded() -> None:
     text = build_plan_reply_text(ctx)
 
     assert "尚不可交付" in text
+    assert "已排好" not in text
+
+
+def test_no_current_artifact_never_claims_sidebar_or_map() -> None:
+    ctx = build_session(persist=False)
+    rejected = ctx.store.put(
+        "itinerary",
+        {
+            "artifact_status": "validation_failure",
+            "itinerary": {"summary": "失败候选", "days": []},
+            "critic": {"passed": False, "issues": []},
+        },
+    )
+
+    text = build_plan_reply_text(ctx, rejected)
+
+    assert "当前没有" in text
+    assert "右侧面板" not in text
+    assert "地图" not in text
+    assert "已排好" not in text
+
+
+def test_rejected_candidate_discards_contradictory_reviewer_or_planner_text() -> None:
+    ctx = build_session(persist=False)
+    rejected = ctx.store.put(
+        "itinerary",
+        {
+            "artifact_status": "validation_failure",
+            "itinerary": {"summary": "失败候选", "days": []},
+            "critic": {"passed": False, "issues": []},
+        },
+        agent="planner",
+    )
+    outcome = TurnOutcome(
+        status=STATUS_INCOMPLETE,
+        reply="行程已排好，地图路线请查看右侧面板。",
+        plan_artifact_id=rejected,
+        cards=[{"type": "summary"}],
+        map_payload={"routes": []},
+    )
+
+    reply = _reply_from_outcome(ctx, outcome)
+
+    assert "尚不可交付" in reply.text
+    assert "已排好" not in reply.text
+    assert "右侧面板" not in reply.text
+    assert reply.cards == [] and reply.map_payload is None
+
+
+def test_estimated_route_is_never_described_as_map_verified() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile = TravelProfile(destination="测试城", days=1)
+    ctx.store.put(
+        "itinerary",
+        {
+            "itinerary": {
+                "summary": "测试城一日游",
+                "days": [{
+                    "day_index": 1,
+                    "stops": [{
+                        "poi": {
+                            "poi_id": "p1",
+                            "name": "测试馆",
+                            "source": "provider",
+                            "verification_status": "verified",
+                        },
+                        "route_from_previous": {
+                            "origin_poi_id": "origin",
+                            "destination_poi_id": "p1",
+                            "duration_min": 20,
+                            "distance_km": 3.0,
+                            "source": "deterministic_speed_fallback",
+                            "evidence_status": "deterministic_estimate",
+                        },
+                    }],
+                }],
+            },
+            "critic": {"passed": True, "issues": []},
+        },
+    )
+
+    text = build_plan_reply_text(ctx)
+
+    assert "路线为估算结果" in text
+    assert "已核验地图路线" not in text
+
+
+def test_plan_reply_uses_actual_non_overlapping_meal_strategy() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile = TravelProfile(destination="测试城", days=1)
+    ctx.store.put(
+        "itinerary",
+        {
+            "itinerary": {
+                "summary": "测试城一日游",
+                "days": [{
+                    "day_index": 1,
+                    "stops": [
+                        {"name": "甲馆", "start_time": "09:00", "duration_min": 120},
+                        {"name": "乙园", "start_time": "12:00", "duration_min": 150},
+                        {"name": "丙街", "start_time": "15:00", "duration_min": 105},
+                    ],
+                }],
+            },
+            "critic": {"passed": True, "issues": []},
+            "meal_strategy": {
+                "scheduled_meals": [{
+                    "day_index": 1,
+                    "name": "晚餐时段（当日活动区域就近自行安排）",
+                    "start_time": "17:30",
+                    "end_time": "18:30",
+                    "is_reservation_only": True,
+                }],
+            },
+        },
+    )
+
+    text = build_plan_reply_text(ctx)
+
+    assert "17:30–18:30" in text
+    assert "12:00–13:00" not in text
 
 
 def test_finalize_prefers_artifact_over_llm() -> None:

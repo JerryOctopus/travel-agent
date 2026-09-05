@@ -43,29 +43,91 @@ if TYPE_CHECKING:
 
 
 class TaskType(str, Enum):
-    UNKNOWN = "unknown"  # 无法安全映射到当前支持的旅行任务
-    FULL_TRIP_PLAN = "full_trip_plan"  # 生成/规划完整行程
-    ROUTE_QUERY = "route_query"  # A 到 B 怎么走/交通方式/耗时
-    POI_ADVICE = "poi_advice"  # 住哪/选酒店/选区域等咨询
-    ITINERARY_REVISION = "itinerary_revision"  # 修改/删除/替换既有行程
-    DAY_ADVICE = "day_advice"  # 天气/特定日期去哪玩的轻量建议
+    FULL_ITINERARY = "full_itinerary"
+    ROUTE_PLAN = "route_plan"
+    CANDIDATE_COMPARISON = "candidate_comparison"
+    ITINERARY_PATCH = "itinerary_patch"
+    LOCAL_ADJUSTMENT_ADVICE = "local_adjustment_advice"
+    CLARIFICATION = "clarification"
+    CONSTRAINT_NEGOTIATION = "constraint_negotiation"
+    SAFE_DECLINE = "safe_decline"
+
+    # Source-compatible aliases for callers that still use the pre-routing-goals
+    # vocabulary.  Their serialized value is deliberately the canonical goal.
+    FULL_TRIP_PLAN = FULL_ITINERARY
+    ROUTE_QUERY = ROUTE_PLAN
+    POI_ADVICE = CANDIDATE_COMPARISON
+    ITINERARY_REVISION = ITINERARY_PATCH
+    LOCAL_ADJUSTMENT = LOCAL_ADJUSTMENT_ADVICE
+    DAY_ADVICE = CANDIDATE_COMPARISON
+    UNKNOWN = CLARIFICATION
+
+    @classmethod
+    def _missing_(cls, value: object) -> "TaskType | None":
+        legacy = {
+            "full_trip_plan": cls.FULL_ITINERARY,
+            "route_query": cls.ROUTE_PLAN,
+            "poi_advice": cls.CANDIDATE_COMPARISON,
+            "itinerary_revision": cls.ITINERARY_PATCH,
+            "local_adjustment": cls.LOCAL_ADJUSTMENT_ADVICE,
+            "day_advice": cls.CANDIDATE_COMPARISON,
+            "unknown": cls.CLARIFICATION,
+        }
+        return legacy.get(str(value).lower())
+
+
+class DeliveryIntent(str, Enum):
+    """How this turn should deliver its result, independently of task taxonomy."""
+
+    STATE_UPDATE_ONLY = "state_update_only"
+    REBUILD_NOW = "rebuild_now"
+    LOCAL_PATCH = "local_patch"
+    LIGHTWEIGHT_ADVICE = "lightweight_advice"
 
 
 REQUIRED_SLOTS: dict[TaskType, tuple[str, ...]] = {
-    TaskType.UNKNOWN: (),
-    TaskType.FULL_TRIP_PLAN: ("destination", "days"),
-    TaskType.POI_ADVICE: ("destination",),
-    TaskType.DAY_ADVICE: ("destination",),
-    TaskType.ROUTE_QUERY: (),
-    TaskType.ITINERARY_REVISION: (),
+    TaskType.CLARIFICATION: (),
+    TaskType.FULL_ITINERARY: ("destination", "days"),
+    TaskType.CANDIDATE_COMPARISON: ("destination",),
+    # Endpoints are carried in constraint_state rather than TravelProfile
+    # attributes and are validated by the route worker. Duration is irrelevant.
+    TaskType.ROUTE_PLAN: (),
+    TaskType.ITINERARY_PATCH: (),
+    TaskType.LOCAL_ADJUSTMENT_ADVICE: (),
+    TaskType.CONSTRAINT_NEGOTIATION: (),
+    TaskType.SAFE_DECLINE: (),
 }
+
+
+def required_slot_satisfied(profile: Any, task_type: TaskType, slot: str) -> bool:
+    """Return whether a workflow slot is supplied by compact or structured state.
+
+    Lightweight discovery requests often provide a self-contained geographic
+    scope (for example “在某湖附近找餐厅”) without a separately extracted city.
+    That scope is sufficient to start grounded search and must not be upgraded
+    into a full-trip destination clarification.
+    """
+    if getattr(profile, slot, None):
+        return True
+    if slot != "destination" or task_type != TaskType.CANDIDATE_COMPARISON:
+        return False
+    state = getattr(profile, "constraint_state", {}) or {}
+    return any(
+        state.get(field) not in (None, "", [], {})
+        for field in ("destination_city", "location", "location_anchor")
+    )
 
 # 修改类任务里规则易误抽的核心槽位（「第二天」会命中 days 等）
 CORE_SLOTS = ("destination", "days", "start_date")
 
 # 这些任务类型属于旅行需求，但规则意图分类容易因缺少强信号误判为 ambiguous/out_of_scope
 _TRAVEL_ADVICE_TASKS = frozenset(
-    {TaskType.ROUTE_QUERY, TaskType.POI_ADVICE, TaskType.DAY_ADVICE}
+    {
+        TaskType.ROUTE_PLAN,
+        TaskType.CANDIDATE_COMPARISON,
+        TaskType.ITINERARY_PATCH,
+        TaskType.LOCAL_ADJUSTMENT_ADVICE,
+    }
 )
 
 TURN_ANALYSIS_TIMEOUT_SECONDS = 120
@@ -76,6 +138,7 @@ TURN_ANALYSIS_MAX_OUTPUT_TOKENS = 512
 class TurnAnalysis:
     kind: MessageKind
     task_type: TaskType
+    delivery_intent: DeliveryIntent | None = None
     patches: dict[str, SlotPatch] = field(default_factory=dict)
     source: str = "rule"  # rule | llm
     revision_directives: dict[str, Any] = field(default_factory=dict)
@@ -126,12 +189,47 @@ _POI_ADVICE_RE = re.compile(
     r"|(?:找|选).{0,12}(?:餐厅|午餐|晚餐)"
     r"|(?:安排|找).{0,18}(?:午餐|晚餐|聚餐)"
     r"|(?:选|找|推荐).{0,8}\d+\s*个.{0,8}(?:活动|景点|候选)"
+    r"|(?:比较|对比).{0,18}(?:住宿区域|区域|酒店|餐厅|景点|地点)"
+    r"|(?:候选).{0,80}(?:排序|比较|对比|推荐|选择|选一个|选最多)"
+    r"|[^，。；;]{1,18}(?:和|与|还是|vs\.?)[^，。；;]{1,18}(?:哪个|哪一个|更方便|更合适|更好)"
 )
 _DAY_ADVICE_RE = re.compile(
     r"(?:今天|明天|后天|周末|周[一二三四五六日天]).{0,10}(?:下雨|天气|高温|降温).{0,12}(?:去哪|玩什么|安排|怎么办|适合)"
     r"|(?:下雨|天气不好|天气好).{0,8}(?:去哪|玩什么|适合)"
     r"|(?:只根据|根据).{0,18}天气.{0,18}(?:替换|备选|调整|判断)"
+    r"|(?:今天|明天|后天|周末|周[一二三四五六日天])?.{0,4}天气.{0,8}(?:怎么样|如何|预报|情况|要注意什么)"
+    r"|(?:天气|下雨|高温|大风).{0,16}(?:怎么调整|怎么办|是否要调整)"
+    r"|(?:天气|气候|温度|冷不冷|热不热).{0,16}(?:穿什么|怎么穿|穿衣|衣服|带什么)"
+    r"|(?:穿什么|怎么穿|穿衣建议|带什么衣服|(?:需要|要不要|是否要|要)带外套)"
+    r"|(?:当地|那边|目的地).{0,8}(?:常见|通常|一般)?.{0,4}(?:天气|气候)"
 )
+
+
+def is_pure_weather_advice_request(
+    user_message: str,
+    state: dict[str, Any] | None = None,
+) -> bool:
+    """Return true when weather itself, not a plan operation, is requested."""
+    if not _DAY_ADVICE_RE.search(user_message):
+        return False
+    if re.search(
+        r"餐厅|酒店|住宿|路线|怎么走|交通方式|景点|活动|"
+        r"替换|保留|取消|调整|备选|候选|排行|比较|对比",
+        user_message,
+    ):
+        return False
+    state = state or {}
+    return not any(
+        state.get(field) not in (None, "", [], {})
+        for field in (
+            "specific_restaurant_recommendation",
+            "compare_lodging_areas",
+            "conditional_activity",
+            "referenced_day_index",
+            "need_indoor_backup",
+            "top_n",
+        )
+    )
 _FULL_PLAN_CUE_RE = re.compile(
     r"(?:一|二|两|三|四|五|六|七|八|九|十|\d+)\s*(?:日|天)游"
     r"|(?:规划|安排|制定|生成).{0,12}(?:行程|旅行|旅游)"
@@ -139,11 +237,331 @@ _FULL_PLAN_CUE_RE = re.compile(
     r"(?:一|二|两|三|四|五|六|七|八|九|十|\d+)\s*(?:日|天)"
     r"|(?:我)?想去(?:旅行|旅游)"
 )
+_SAFE_DECLINE_RE = re.compile(
+    r"(?:替我|帮我).{0,8}(?:购票|付款|支付|预订|取消预订|联系商家|冒充)"
+)
+_CONSTRAINT_NEGOTIATION_RE = re.compile(
+    r"(?:无法|不能|冲突|超出预算|来不及).{0,16}(?:改成|放弃|取舍|怎么办|可以吗)"
+    r"|(?:必须|一定要).{0,12}(?:但|可是|同时).{0,12}(?:不能|不允许|预算)"
+)
+_EXPLICIT_LOCAL_ADJUSTMENT_RE = re.compile(
+    r"(?:已有|已经有|现有|当前).{0,12}(?:行程|计划).{0,30}"
+    r"(?:不要重写|不重写|只.{0,12}(?:替换|调整|修改)|局部调整)"
+    r"|(?:不要重写|不重写).{0,18}(?:行程|计划)"
+)
+_EXPLICIT_COMPARISON_RE = re.compile(
+    r"比较|对比|候选.{0,12}(?:排序|比较|对比|推荐|选)"
+    r"|[^，。；;]{1,18}(?:和|与|还是|vs\.?)[^，。；;]{1,18}(?:哪个|哪一个|更方便|更合适|更好)"
+)
+_TRANSPORT_MODE_COMPARISON_RE = re.compile(
+    r"(?:比较|对比).{0,20}(?:公共交通|公交|地铁|打车|出租车|驾车|步行|高铁|飞机)"
+    r".{0,12}(?:和|与|还是|vs\.?).{0,12}"
+    r"(?:公共交通|公交|地铁|打车|出租车|驾车|步行|高铁|飞机)"
+)
+_LOCAL_ADJUSTMENT_ADVICE_RE = re.compile(
+    r"(?:判断|看看|评估).{0,24}(?:是否|要不要|需不需要).{0,12}(?:替换|保留|取消|改成)"
+    r"|(?:某天|当天|第\s*[一二三四五六七八九十\d]+\s*天|周[一二三四五六日天]).{0,20}"
+    r"(?:户外|活动|景点).{0,16}(?:替换|保留|调整|备选)"
+    r"|(?:天气|下雨|高温|大风).{0,20}(?:替换|保留|调整|室内备选)"
+)
+_FULL_REBUILD_REQUEST_RE = re.compile(
+    r"(?:(?:最终|最后)(?:版|计划|方案|行程)|完整(?:版|行程)|更新完整行程|重新(?:生成|规划|安排)|重排(?:整份)?行程)"
+    r"|(?:按|基于).{0,12}(?:全部|所有|当前).{0,8}(?:条件|约束).{0,12}(?:出|生成|更新|规划)"
+    r"|再确认一次"
+)
+_IMMEDIATE_REBUILD_RE = re.compile(
+    r"(?:现在|立即|马上|本轮).{0,10}(?:更新|调整|重建|重排|生成|规划).{0,8}(?:行程|方案|计划)"
+    r"|(?:请|帮我).{0,4}(?:更新|调整|重建|重排|重新规划|改一下).{0,8}(?:现有|当前|整体|完整)?(?:行程|方案|计划)"
+    r"|(?:更新|调整|重建|重排|重新规划).{0,8}(?:现有|当前|整体|完整)(?:行程|方案|计划)"
+)
+_DEFERRED_REBUILD_RE = re.compile(
+    r"(?:先记住|记下来|先补充|暂时不用(?:出|生成|规划)|先别(?:出|生成|规划))"
+    r"|(?:之后|稍后|等我说).{0,12}(?:再出|再规划|最终版|开始)"
+)
+
+# These constraints affect the plan as a whole.  They may trigger a full
+# rebuild (or a deferred state update), but never an itinerary_patch artifact.
+_GLOBAL_REBUILD_CONSTRAINT_FIELDS = frozenset({
+    "date_start", "date_end", "duration_days", "destination", "destinations",
+    "destination_city", "budget_max_cny", "budget_total_cny",
+    "budget_remaining_cny", "budget_per_person_cny", "prepaid_cost",
+    "prepaid_lodging_cny", "hotel_budget_per_night_cny", "lodging_area",
+    "must_visit", "removed", "optional_remove", "avoid", "exclude", "dietary",
+    "food_preference", "mobility", "wheelchair_user", "accessibility_priority",
+    "walking_time_max_min", "max_single_walk_min", "max_walking_km_per_day",
+    "max_transfers_per_day", "fixed_events", "return_deadline",
+    "return_deadline_local_time", "return_deadline_day", "return_location",
+    "return_day_index", "activity_end_deadline", "activity_end_target",
+    "transport_mode",
+    "transport_modes", "self_driving_allowed", "public_transport_required",
+    "pace", "traveler_count",
+})
+_GLOBAL_REBUILD_PATCH_FIELDS = frozenset({
+    "destination", "days", "start_date", "budget_limit", "budget_level",
+    "hotel_area", "must_visit", "avoid", "food_preference", "transport_mode",
+    "pace", "party_size",
+})
+
+_ADDITIVE_CONSTRAINT_FIELDS = frozenset({
+    "must_visit", "candidate_attractions", "fixed_events", "interests",
+    "dietary", "transport_modes", "avoid", "exclude", "optional_remove",
+})
+_STATE_PROFILE_ALIASES: dict[str, str] = {
+    "date_start": "start_date",
+    "duration_days": "days",
+    "destination": "destination",
+    "destinations": "destination",
+    "destination_city": "destination",
+    "budget_max_cny": "budget_limit",
+    "budget_total_cny": "budget_limit",
+    "lodging_area": "hotel_area",
+    "food_preference": "food_preference",
+    "transport_mode": "transport_mode",
+    "pace": "pace",
+    "traveler_count": "party_size",
+}
+_BUDGET_CONSTRAINT_FIELDS = frozenset({
+    "budget_max_cny", "budget_total_cny", "budget_remaining_cny",
+    "budget_per_person_cny", "prepaid_cost", "prepaid_lodging_cny",
+    "hotel_budget_per_night_cny",
+})
+
+
+def _has_plan_context(ctx: "SessionContext | None") -> bool:
+    if ctx is None:
+        return False
+    return bool(ctx.store.latest_revisable_id("itinerary"))
+
+
+def _has_current_plan(ctx: "SessionContext | None") -> bool:
+    return bool(ctx is not None and ctx.store.latest_current_id("itinerary"))
+
+
+def _comparable_value(value: Any) -> Any:
+    if isinstance(value, list) and len(value) == 1:
+        return _comparable_value(value[0])
+    if isinstance(value, tuple):
+        return [_comparable_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _comparable_value(item) for key, item in sorted(value.items())}
+    return value
+
+
+def _existing_constraint_value(
+    ctx: "SessionContext",
+    field: str,
+) -> tuple[bool, Any]:
+    """Resolve a field against active state and its compact-profile mirror."""
+    active = ctx.profile.constraint_state or {}
+    if field in active and active.get(field) not in (None, "", [], {}):
+        return True, active[field]
+    if field in _BUDGET_CONSTRAINT_FIELDS:
+        for candidate in _BUDGET_CONSTRAINT_FIELDS:
+            if active.get(candidate) not in (None, "", [], {}):
+                return True, active[candidate]
+        if ctx.profile.budget_limit is not None:
+            return True, ctx.profile.budget_limit
+    profile_field = _STATE_PROFILE_ALIASES.get(field)
+    if profile_field:
+        value = getattr(ctx.profile, profile_field, None)
+        if value not in (None, "", [], {}):
+            return True, value
+    return False, None
+
+
+def _has_structured_global_replacement(
+    ctx: "SessionContext | None",
+    patches: dict[str, SlotPatch],
+    state: dict[str, Any],
+) -> bool:
+    """Detect replace/remove from structured deltas, independent of wording.
+
+    Additive declarations remain deferred.  Scalar changes, explicit clears,
+    and remove tombstones against a current itinerary require an immediate
+    rebuild so the deliverable cannot remain validated against an old value.
+    """
+    if ctx is None or not _has_current_plan(ctx):
+        return False
+    for field, value in state.items():
+        if field not in _GLOBAL_REBUILD_CONSTRAINT_FIELDS:
+            continue
+        if field == "removed":
+            if value not in (None, "", [], {}):
+                return True
+            continue
+        if field in _ADDITIVE_CONSTRAINT_FIELDS:
+            continue
+        exists, previous = _existing_constraint_value(ctx, field)
+        if exists and _comparable_value(previous) != _comparable_value(value):
+            return True
+    for field, patch in patches.items():
+        if field not in _GLOBAL_REBUILD_PATCH_FIELDS:
+            continue
+        profile_value = getattr(ctx.profile, field, None)
+        if patch.op == PatchOp.CLEAR:
+            if profile_value not in (None, "", [], {}):
+                return True
+            continue
+        if field in {"must_visit", "avoid", "food_preference"}:
+            continue
+        if (
+            profile_value not in (None, "", [], {})
+            and _comparable_value(profile_value) != _comparable_value(patch.value)
+        ):
+            return True
+    return False
+
+
+def _has_local_patch_target(text: str, state: dict[str, Any]) -> bool:
+    if state.get("referenced_day_index") or state.get("conditional_activity"):
+        return True
+    return bool(re.search(
+        r"第\s*[一二三四五六七八九十\d]+\s*天|最后一天|"
+        r"\d{4}年\d{1,2}月\d{1,2}日|"
+        r"(?:当天|当日|上午|下午|晚上|早上|午餐|晚餐|\d{1,2}:\d{2}).{0,18}"
+        r"(?:站点|景点|活动|安排|时段|替换|调整|修改)",
+        text,
+    ))
+
+
+def classify_delivery_intent(
+    user_message: str,
+    ctx: "SessionContext | None",
+    task_type: TaskType,
+    patches: dict[str, SlotPatch] | None = None,
+    state: dict[str, Any] | None = None,
+) -> DeliveryIntent:
+    """Classify delivery scope without changing the semantic task type.
+
+    Declarative, plan-wide constraints accumulate as state while a stale parent
+    remains available.  Planner admission is reserved for an explicit rebuild
+    request (or the initial full-plan request), while narrow schedule edits and
+    advice keep their own delivery contracts.
+    """
+    text = user_message.strip()
+    state = state or {}
+    patches = patches or {}
+    has_plan = _has_plan_context(ctx)
+    rebuild_pending = bool(
+        ctx is not None
+        and (ctx.profile.constraint_state or {}).get("_plan_status")
+        == "rebuild_pending"
+    )
+    deferred = bool(_DEFERRED_REBUILD_RE.search(text))
+    explicit_rebuild = bool(
+        _IMMEDIATE_REBUILD_RE.search(text)
+        or (_FULL_REBUILD_REQUEST_RE.search(text) and not deferred)
+    )
+
+    # A direct final-delivery request is the only operation that may interrupt
+    # a pending rebuild, and it also beats lightweight task taxonomy.
+    if explicit_rebuild and (has_plan or rebuild_pending):
+        return DeliveryIntent.REBUILD_NOW
+    if task_type in {TaskType.ROUTE_PLAN, TaskType.CANDIDATE_COMPARISON}:
+        return DeliveryIntent.LIGHTWEIGHT_ADVICE
+    if task_type == TaskType.LOCAL_ADJUSTMENT_ADVICE:
+        return DeliveryIntent.LIGHTWEIGHT_ADVICE
+    if rebuild_pending:
+        return DeliveryIntent.STATE_UPDATE_ONLY
+    if task_type == TaskType.ITINERARY_PATCH and _has_local_patch_target(text, state):
+        return DeliveryIntent.LOCAL_PATCH
+    if task_type == TaskType.FULL_ITINERARY:
+        if (
+            not has_plan
+            or (
+                _has_structured_global_replacement(ctx, patches, state)
+                and not deferred
+            )
+            or (_has_local_patch_target(text, state) and not deferred)
+        ):
+            return DeliveryIntent.REBUILD_NOW
+        if state or patches:
+            return DeliveryIntent.STATE_UPDATE_ONLY
+        return DeliveryIntent.REBUILD_NOW
+    if has_plan and (state or patches):
+        return (
+            DeliveryIntent.REBUILD_NOW
+            if _has_structured_global_replacement(ctx, patches, state) and not deferred
+            else DeliveryIntent.STATE_UPDATE_ONLY
+        )
+    return DeliveryIntent.LIGHTWEIGHT_ADVICE
+
+
+def _with_delivery_intent(
+    analysis: TurnAnalysis,
+    user_message: str,
+    ctx: "SessionContext | None",
+) -> TurnAnalysis:
+    if analysis.task_type != TaskType.CANDIDATE_COMPARISON:
+        # Words such as “交通方便” and “费用控制” are ordinary full-trip
+        # constraints.  They must not manufacture a comparison contract when
+        # the selected delivery is not a comparison.  A full itinerary may
+        # still retain ``candidate_attractions`` as an allowed shortlist.
+        for field in ("comparison_candidates", "comparison_dimensions"):
+            analysis.constraint_state.pop(field, None)
+    intent = classify_delivery_intent(
+        user_message,
+        ctx,
+        analysis.task_type,
+        analysis.patches,
+        analysis.constraint_state,
+    )
+    if (
+        intent == DeliveryIntent.REBUILD_NOW
+        and analysis.task_type == TaskType.ITINERARY_PATCH
+        and not _has_local_patch_target(user_message, analysis.constraint_state)
+    ):
+        analysis.task_type = TaskType.FULL_ITINERARY
+    analysis.delivery_intent = intent
+    return analysis
+
+
+def _enforce_itinerary_scope(
+    user_message: str,
+    ctx: "SessionContext | None",
+    proposed: TaskType,
+    patches: dict[str, SlotPatch],
+    state: dict[str, Any],
+) -> TaskType:
+    """Keep patch delivery local and route plan-wide changes to rebuild."""
+    if is_pure_weather_advice_request(user_message, state):
+        return proposed
+    has_context = _has_plan_context(ctx)
+    current_id = ctx.store.latest_current_id("itinerary") if ctx is not None else None
+    explicit_full = bool(_FULL_REBUILD_REQUEST_RE.search(user_message))
+    global_change = bool(
+        _GLOBAL_REBUILD_CONSTRAINT_FIELDS.intersection(state)
+        or _GLOBAL_REBUILD_PATCH_FIELDS.intersection(patches)
+    )
+    locally_scoped_global_fields = {
+        "must_visit", "removed", "optional_remove", "avoid", "exclude",
+    }
+    locally_scoped_patch_fields = {"must_visit", "avoid"}
+    planwide_global_change = bool(
+        (_GLOBAL_REBUILD_CONSTRAINT_FIELDS - locally_scoped_global_fields).intersection(state)
+        or (_GLOBAL_REBUILD_PATCH_FIELDS - locally_scoped_patch_fields).intersection(patches)
+    )
+    if has_context and explicit_full:
+        return TaskType.FULL_ITINERARY
+    if has_context and planwide_global_change:
+        return TaskType.FULL_ITINERARY
+    if proposed in {TaskType.ITINERARY_PATCH, TaskType.LOCAL_ADJUSTMENT_ADVICE}:
+        # A stale/historical plan is revision context for a rebuild only; it
+        # can never be the source of a newly deliverable local patch.
+        if has_context and not current_id:
+            return TaskType.FULL_ITINERARY
+        if current_id and _has_local_patch_target(user_message, state):
+            return TaskType.ITINERARY_PATCH
+        if current_id and not _has_local_patch_target(user_message, state):
+            return TaskType.FULL_ITINERARY
+    if has_context and global_change:
+        return TaskType.FULL_ITINERARY
+    return proposed
 
 
 def is_plan_revision_followup(user_message: str, ctx: "SessionContext") -> bool:
     """判断是否属于对既有行程的修改/对比场景。"""
-    if not ctx.store.latest("itinerary"):
+    if not ctx.store.latest_revisable_id("itinerary"):
         return False
     text = user_message.strip().lower()
     if not text:
@@ -160,21 +578,42 @@ def classify_task_type_rule_based(
     ctx: "SessionContext | None" = None,
 ) -> TaskType:
     text = user_message.strip()
-    if ctx is not None and is_plan_revision_followup(text, ctx):
-        return TaskType.ITINERARY_REVISION
+    if _SAFE_DECLINE_RE.search(text):
+        return TaskType.SAFE_DECLINE
+    if _CONSTRAINT_NEGOTIATION_RE.search(text):
+        return TaskType.CONSTRAINT_NEGOTIATION
+    if _EXPLICIT_LOCAL_ADJUSTMENT_RE.search(text) or _LOCAL_ADJUSTMENT_ADVICE_RE.search(text):
+        if ctx is not None and ctx.store.latest_current_id("itinerary"):
+            return TaskType.ITINERARY_PATCH
+        return TaskType.LOCAL_ADJUSTMENT_ADVICE
+    # Explicit scope words beat the generic verb “规划”. This is crucial for
+    # requests such as “只需要规划 9 月 5 日从机场到酒店区的路线”.
+    if re.search(r"(?:只需要|只要|仅).{0,40}(?:路线|怎么走|公共交通|打车)", text):
+        return TaskType.ROUTE_PLAN
+    if _FULL_PLAN_CUE_RE.search(text):
+        return TaskType.FULL_TRIP_PLAN
+    # Comparing multiple destination candidates by their travel time is a
+    # candidate decision, while comparing transport modes for one A->B leg is
+    # still a route plan.  Check this distinction before the broad route regex,
+    # which intentionally matches both forms because both mention transport.
+    if (
+        _EXPLICIT_COMPARISON_RE.search(text)
+        and not _TRANSPORT_MODE_COMPARISON_RE.search(text)
+    ):
+        return TaskType.CANDIDATE_COMPARISON
     # A complete trip request often contains an origin/destination leg and
     # words such as public transport or walking.  Those embedded logistics
     # must not downgrade an explicit multi-hour/day itinerary to route_query.
-    if _FULL_PLAN_CUE_RE.search(text):
-        return TaskType.FULL_TRIP_PLAN
     if _ROUTE_QUERY_RE.search(text) or (
         _ROUTE_FROM_TO_RE.search(text) and _ROUTE_CONTEXT_RE.search(text)
     ):
         return TaskType.ROUTE_QUERY
+    if ctx is not None and is_plan_revision_followup(text, ctx):
+        return TaskType.ITINERARY_PATCH
     if _POI_ADVICE_RE.search(text):
         return TaskType.POI_ADVICE
     if _DAY_ADVICE_RE.search(text):
-        return TaskType.DAY_ADVICE
+        return TaskType.CANDIDATE_COMPARISON
     return TaskType.UNKNOWN
 
 
@@ -205,6 +644,35 @@ def build_rule_patches(
     """规则抽取 → patches；修改类任务丢弃核心槽位的 SET，防止「第二天」误抽天数。"""
     extracted = extracted_profile or extract_profile_rule_based(user_message)
     patches = merge_patches(extracted_to_patches(extracted), extract_slot_clears(user_message))
+    # A cancelled venue is never a destination update. This must hold even
+    # before an itinerary exists; otherwise a long-horizon dialogue can turn
+    # “不去迪士尼了” into the bogus city destination “迪士”.
+    replacement = re.search(r"(?:换成|改成|改为|改去|换去)([^，,。；;]+)", user_message)
+    replacement_is_city = bool(
+        replacement
+        and any(alias in replacement.group(1) for alias in CITY_ALIASES)
+    )
+    if re.search(r"不(?:想|打算|要)?去|仍然不去|不去了", user_message) and not (
+        replacement_is_city
+        or re.search(
+            r"(?:目的地|城市).{0,8}(?:改|换)|(?:改去|换去|改成去|改为去)",
+            user_message,
+        )
+    ):
+        patches.pop("destination", None)
+    if _DAY_ADVICE_RE.search(user_message) and not _FULL_PLAN_CUE_RE.search(user_message):
+        # Relative dates in a weather question identify the advice horizon;
+        # they do not silently change the trip's start date or duration.
+        patches.pop("start_date", None)
+        patches.pop("days", None)
+    if task_type == TaskType.LOCAL_ADJUSTMENT_ADVICE:
+        # A fragment supplied from a user-owned itinerary is context for a
+        # local recommendation, not a request to create durable trip slots.
+        # Broad profile extraction can otherwise mistake phrases such as
+        # “只判断第二天…” for a destination and a trip duration.
+        for slot in ("destination", "start_date", "days"):
+            patches.pop(slot, None)
+    _remove_destination_city_from_patch_must_visits(patches)
     if _venues_require_verification(user_message):
         # “先核验这些地点是否适合安排” describes candidates whose feasibility
         # must be checked, not unconditional must-visits.  Keeping them hard can
@@ -214,12 +682,37 @@ def build_rule_patches(
     if "days" not in patches and date_range:
         start, end = (date.fromisoformat(value) for value in date_range)
         patches["days"] = SlotPatch(PatchOp.SET, (end - start).days + 1)
+    # Ordinal day references describe a schedule slot, not trip duration.
+    # Only explicit duration/range language is allowed to set ``days``.
+    ordinal_day = re.search(r"第\s*[一二三四五六七八九十\d]+\s*天|最后一天", user_message)
+    duration_cue = re.search(
+        r"(?:共|总共|一共|行程|旅行|旅游|玩|去[^，。]{0,12})\s*"
+        r"(?:一|二|两|三|四|五|六|七|八|九|十|\d+)\s*天"
+        r"|(?:一|二|两|三|四|五|六|七|八|九|十|\d+)\s*(?:日|天)游",
+        user_message,
+    )
+    if ordinal_day and not duration_cue and not date_range:
+        patches.pop("days", None)
     if task_type == TaskType.ITINERARY_REVISION:
+        explicit_core_change = {
+            "destination": bool(re.search(
+                r"(?:目的地|城市).{0,8}(?:改|换)|(?:改去|换去|改成去|改为去)",
+                user_message,
+            )),
+            "days": bool(duration_cue),
+            "start_date": bool(re.search(
+                r"(?:日期|出发时间|出发日期).{0,8}(?:改|换|提前|推迟)|"
+                r"(?:改到|改为|提前到|推迟到).{0,8}(?:月|日|号|周)",
+                user_message,
+            )),
+        }
         for name in CORE_SLOTS:
-            if name == "must_visit":
-                continue
             patch = patches.get(name)
-            if patch is not None and patch.op == PatchOp.SET:
+            if (
+                patch is not None
+                and patch.op == PatchOp.SET
+                and not explicit_core_change.get(name, False)
+            ):
                 patches.pop(name)
     return patches
 
@@ -231,6 +724,22 @@ def build_rule_constraint_state(
 ) -> dict[str, Any]:
     """Preserve common literal constraints even when the LLM analyzer is unavailable."""
     state: dict[str, Any] = {}
+    if _DAY_ADVICE_RE.search(user_message):
+        state["weather_condition"] = "query"
+        state["advice_topic"] = (
+            "clothing"
+            if re.search(r"穿|衣服|外套", user_message)
+            else "climate"
+            if re.search(r"气候|通常|一般|常见", user_message)
+            else "weather"
+        )
+        if re.search(r"下雨|雨天|降雨", user_message):
+            state["need_indoor_backup"] = True
+    referenced_day = re.search(r"第\s*([一二三四五六七八九十\d]+)\s*天", user_message)
+    if referenced_day:
+        parsed_day = _parse_chinese_day(referenced_day.group(1))
+        if parsed_day:
+            state["referenced_day_index"] = parsed_day
     values = {
         name: patch.value
         for name, patch in patches.items()
@@ -288,11 +797,15 @@ def build_rule_constraint_state(
         state[key] = deadline.group(1)
     if not deadline:
         return_deadline = re.search(r"(\d{1,2}:\d{2})\s*(?:要|需|必须)?\s*(回到|返回)", user_message)
-        activity_deadline = re.search(r"(?:晚上)?(\d{1,2}:\d{2})\s*(?:前)?\s*结束", user_message)
+        activity_deadline = re.search(
+            r"(?:晚上)?(\d{1,2}:\d{2})\s*(前)?\s*结束", user_message
+        )
         if return_deadline:
             state["return_deadline"] = return_deadline.group(1)
         elif activity_deadline:
             state["activity_end_deadline"] = activity_deadline.group(1)
+            if activity_deadline.group(2) is None:
+                state["activity_end_target"] = activity_deadline.group(1)
     route = re.search(r"从(.{1,36}?)(?:到|去|前往)(.{1,36}?)(?:的|，|,|。|$)", user_message)
     if route:
         origin = re.sub(r"^.*?(?:日|号|上午|下午|晚上)", "", route.group(1)).strip()
@@ -300,6 +813,11 @@ def build_rule_constraint_state(
         if origin:
             state["origin"] = origin
         if destination:
+            destination = re.sub(
+                r"(?:[一二两三四五六七八九十\d]+(?:日|天)游|(?:一日|两日|多日)游)$",
+                "",
+                destination,
+            ).strip()
             origin_city = next(
                 (city for alias, city in CITY_ALIASES.items() if alias in origin),
                 None,
@@ -342,6 +860,12 @@ def build_rule_constraint_state(
         state["dietary"] = ["不太辣"]
     elif re.search(r"(?:饮食|吃得?|口味).{0,5}清淡|清淡(?:饮食|口味)", user_message):
         state["dietary"] = ["清淡"]
+    if re.search(
+        r"(?:推荐|找|选择?|安排|列出|给出|具体|哪家).{0,12}(?:餐厅|饭店|馆子|午餐|晚餐|用餐)"
+        r"|(?:餐厅|饭店|馆子).{0,12}(?:推荐|哪家|具体|名单)",
+        user_message,
+    ):
+        state["specific_restaurant_recommendation"] = True
     fixed = re.search(
         r"第\s*([一二三四五六七八九十\d]+)天.{0,8}?(\d{1,2}:\d{2})\s*(?:到|至|[-—])\s*"
         r"(\d{1,2}:\d{2}).{0,10}?(?:预约|固定)([^，,。；;]+)",
@@ -391,6 +915,13 @@ def build_rule_constraint_state(
                 "end": end,
                 "location": meal_event.group(3).strip(),
             }]
+            # Keep the canonical fixed-event object backward compatible with
+            # frozen state contracts.  This companion field records that the
+            # user supplied an area-level reservation block, not a verified
+            # restaurant entity that the system may fabricate.
+            state["user_owned_unspecified_fixed_event_locations"] = [
+                meal_event.group(3).strip()
+            ]
 
     broad_event = re.search(
         r"第\s*([一二三四五六七八九十\d]+)天(?:的)?"
@@ -418,6 +949,14 @@ def build_rule_constraint_state(
         user_message,
         reference_datetime=reference_datetime,
     )
+    from travel_agent.constraint_events import normalize_return_deadline
+
+    normalize_return_deadline(
+        state,
+        start_date=str(state.get("date_start") or "") or None,
+        duration_days=state.get("duration_days"),
+        reference_datetime=reference_datetime,
+    )
     destinations = state.get("destinations") or []
     if state.get("must_visit") and destinations:
         city = str(destinations[0])
@@ -441,6 +980,31 @@ def _apply_general_constraint_patterns(
             state["date_start"] = reference_date.isoformat()
         elif "明天" in text:
             state["resolved_date"] = (reference_date + timedelta(days=1)).isoformat()
+
+    # Keep the enclosing city separate from the local anchor.  Downstream
+    # search uses destination_city; route and proximity checks use the anchor.
+    city_match = next(
+        (
+            (alias, city)
+            for alias, city in sorted(CITY_ALIASES.items(), key=lambda item: -len(item[0]))
+            if alias in text
+        ),
+        None,
+    )
+    if city_match:
+        city_alias, destination_city = city_match
+        state["destination_city"] = destination_city
+        anchor_match = re.search(
+            rf"(?:在|位于|靠近|住在|从)?{re.escape(city_alias)}(?:市|城区|城里)?"
+            rf"(?:的|内|中|里)?([^，,。；;]{{2,20}}?)(?:附近|周边|一带)",
+            text,
+        )
+        if anchor_match:
+            anchor = re.sub(r"^(?:的|内|中|里)", "", anchor_match.group(1)).strip()
+            anchor = re.sub(r"(?:区域|商圈)$", "", anchor).strip() or anchor
+            if anchor and anchor not in {city_alias, destination_city}:
+                state["location_anchor"] = anchor
+                state["location"] = f"{destination_city}{anchor}附近"
 
     child = re.search(
         r"(?:带|有(?:个|一位|一个)?|其中(?:一位|一个)?)(\d{1,2})岁(?:孩子|儿童)",
@@ -492,7 +1056,7 @@ def _apply_general_constraint_patterns(
     if initial_budget and not total_budget:
         state["budget_max_cny"] = float(initial_budget.group(1))
     changed_budget = re.search(
-        r"预算.{0,18}?(?:改成|调整为|降到)\s*(\d+(?:\.\d+)?)\s*元",
+        r"预算.{0,18}?(?:改成|改为|调整为|降到)\s*(\d+(?:\.\d+)?)\s*元",
         text,
     )
     if changed_budget:
@@ -518,7 +1082,7 @@ def _apply_general_constraint_patterns(
         state["fallback_transport"] = "public_transport"
 
     location = re.search(
-        r"(?:今晚在|地点在|^在|从)([^，,。；;]{2,28}?(?:附近|大道|商圈))",
+        r"(?:今晚在|地点在|(?:^|[，,])在|从)([^，,。；;]{2,28}?(?:附近|大道|商圈))",
         text,
     )
     if location:
@@ -526,14 +1090,23 @@ def _apply_general_constraint_patterns(
         city = next((city for alias, city in CITY_ALIASES.items() if alias in text), None)
         if city and city not in value and ("区" in value or "大道" in value):
             value = city + value
-        state["location"] = value
+        if not state.get("location_anchor"):
+            state["location"] = value
     lodging = re.search(
         r"(?:住宿(?:放在|安排在|住在|在)?|住(?!宿))([^，,。；;]{2,14}?)(?:，|。|$)",
         text,
     )
-    if lodging:
+    lodging_question = bool(
+        _EXPLICIT_COMPARISON_RE.search(text)
+        or re.search(r"住(?:在)?哪(?:里|儿|边|个)?", text)
+    )
+    if lodging and not lodging_question:
         value = lodging.group(1).strip()
-        if not re.search(r"酒店|景点|库存|降档|(?:区域)?不要改|(?:区域)?不变", value):
+        if not re.search(
+            r"酒店|景点|库存|降档|花了|已花|支付|预付|\d+\s*元|"
+            r"(?:区域)?不要改|(?:区域)?不变",
+            value,
+        ):
             state["lodging_area"] = value
     top_n = re.search(r"(?:只要|选|找)?\s*(\d+)\s*(?:个|家)(?:餐厅)?(?:候选|不同类型|适合|的下午活动)", text)
     if top_n:
@@ -546,16 +1119,20 @@ def _apply_general_constraint_patterns(
     if "停车场" in text or "停车方便" in text:
         state["parking_preferred"] = True
 
-    compare_areas = re.search(r"比较([^。]+?)三个区域", text)
+    compare_areas = re.search(
+        r"(?:只)?(?:比较|对比)([^。；;]+?)(?:[两二三四五六七八九十\d]+个)?(?:住宿)?区域",
+        text,
+    )
     if compare_areas:
         values = _split_named_items(compare_areas.group(1))
         if len(values) >= 2:
             state["compare_lodging_areas"] = values
+            state["comparison_candidates"] = values
     if re.search(r"不需要.{0,8}(?:酒店)?库存|不要.{0,8}(?:酒店)?库存", text):
         state["no_live_inventory_required"] = True
 
     candidate_match = re.search(
-        r"(?:候选是|想去|想看|安排)([^。；;]+?)(?:。|，请|，帮|，不能|，晚上|，单段|，全程|$)",
+        r"(?:候选是|想去|想看|(?<!不)安排)([^。；;]+?)(?:。|，请|，帮|，不能|，晚上|，单段|，全程|$)",
         text,
     )
     if candidate_match:
@@ -563,11 +1140,71 @@ def _apply_general_constraint_patterns(
         candidates = [item for item in candidates if _looks_like_named_candidate(item)]
         if len(candidates) >= 2:
             state["candidate_attractions"] = candidates
+            state["comparison_candidates"] = candidates
     compare_candidates = re.search(r"比较去([^。；;]+?)三个地点", text)
     if compare_candidates:
         candidates = _split_named_items(compare_candidates.group(1))
         if len(candidates) >= 2:
             state["candidate_attractions"] = candidates
+            state["comparison_candidates"] = candidates
+    anchored_comparison = re.search(
+        r"(?:比较|对比)([^。；;]+?)到[^，,。；;]{2,24}?(?:通勤|交通|路线|耗时|时间|距离|可达性)",
+        text,
+    )
+    if anchored_comparison and not state.get("comparison_candidates"):
+        values = _split_named_items(anchored_comparison.group(1))
+        if len(values) >= 2 and all(_looks_like_named_candidate(item) for item in values):
+            state["comparison_candidates"] = values
+    binary_comparison = re.search(
+        r"(?:比较|对比)?([^，。；;]{1,18}?)\s*(?:和|与|还是|vs\.?)\s*"
+        r"([^，。；;]{1,18}?)[，,]?\s*(?:"
+        r"住(?:在)?(?:哪(?:里|儿|边|个)?)?(?:更)?(?:方便|合适|好)"
+        r"|哪个|哪一个|谁|更方便|更合适|更好|的差别|的区别)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if binary_comparison and not state.get("comparison_candidates"):
+        values = [_clean_comparison_candidate(item) for item in binary_comparison.groups()]
+        if all(_looks_like_named_candidate(item) for item in values):
+            state["comparison_candidates"] = values
+
+    target_anchor = re.search(
+        r"(?:到|前往|去)([^，,。；;]{2,24}?)(?:的)?"
+        r"(?:通勤|交通|路线|耗时|时间|距离|可达性)",
+        text,
+    )
+    if target_anchor:
+        anchor_value = target_anchor.group(1).strip()
+        if not re.search(
+            r"\d{1,2}:\d{2}|不要|避免|安排|活动|高温|时段",
+            anchor_value,
+        ):
+            state["target_anchor"] = anchor_value
+    # “从 X 出发，比较去 A/B/C” is an anchored candidate comparison from X.
+    # The broad target regex above otherwise consumes the whole candidate list
+    # (and even the adjective before “交通”), which makes every route endpoint
+    # fail the evidence contract.  The origin is the shared route anchor.
+    shared_origin = re.search(
+        r"从([^，,。；;]{1,30}?)(?:出发|启程)[，,]?(?:比较|对比)去", text
+    )
+    if state.get("comparison_candidates") and shared_origin:
+        state["target_anchor"] = shared_origin.group(1).strip()
+        candidates = [str(item) for item in state.get("comparison_candidates") or []]
+        for field in ("destination", "destination_name", "destination_area"):
+            value = str(state.get(field) or "")
+            if sum(candidate in value for candidate in candidates) >= 2:
+                state.pop(field, None)
+    dimensions: list[str] = []
+    if re.search(r"交通|路线|通勤|耗时|距离|可达|方便|步行", text):
+        dimensions.append("accessibility")
+    if re.search(r"价格|预算|成本|便宜|贵|人均|元(?:以内|左右)", text):
+        dimensions.append("cost")
+    if re.search(r"安静|热闹|氛围|环境", text):
+        dimensions.append("ambience")
+    if re.search(r"适老|老人|父母|无障碍|少走", text):
+        dimensions.append("accessibility_needs")
+    if dimensions:
+        state["comparison_dimensions"] = list(dict.fromkeys(dimensions))
     max_selected = re.search(r"(?:选择|选)最多\s*(\d+)\s*个", text)
     if max_selected:
         state["max_selected"] = int(max_selected.group(1))
@@ -598,7 +1235,10 @@ def _apply_general_constraint_patterns(
             "end": window.group(2),
             "avoid": "long_outdoor_activity",
         }
-    if "有雨的话" in text or "下雨的话" in text:
+    if re.search(
+        r"(?:有雨|下雨)(?:的话|时|是否|就)|是否.{0,8}(?:有雨|下雨)|因(?:为)?下雨",
+        text,
+    ):
         state["weather_condition"] = "rain_if_true"
     if "少走露天路段" in text:
         state["preference"] = ["少走露天路段"]
@@ -610,7 +1250,12 @@ def _apply_general_constraint_patterns(
     )
     if dated_event:
         start_date = state.get("date_start")
-        year = int(str(start_date)[:4]) if start_date else (reference_date or date.today()).year
+        year_match = re.match(r"(\d{4})-\d{2}-\d{2}$", str(start_date or ""))
+        year = (
+            int(year_match.group(1))
+            if year_match
+            else (reference_date or date.today()).year
+        )
         event_date = date(year, int(dated_event.group(1)), int(dated_event.group(2))).isoformat()
         location_name = re.sub(r"讲解$", "博物馆", dated_event.group(5).strip())
         state["fixed_events"] = [{
@@ -649,10 +1294,18 @@ def _apply_general_constraint_patterns(
     if origin:
         value = origin.group(1).strip(" \"'“”")
         state["origin"] = value
+    if state.get("comparison_candidates") and state.get("origin") and not state.get("target_anchor"):
+        # Candidate ranking from a shared departure point is an anchored
+        # accessibility comparison even when “比较去” is not adjacent to the
+        # origin phrase (for example “根据从 X 出发、18:00 结束”).
+        state["target_anchor"] = state["origin"]
+        dimensions = list(state.get("comparison_dimensions") or [])
+        if "accessibility" not in dimensions:
+            state["comparison_dimensions"] = ["accessibility", *dimensions]
     if state.get("return_deadline") and re.search(r"回到([^，,。；;]+)", text):
         state["return_location"] = re.search(r"回到([^，,。；;]+)", text).group(1).strip()
     final_return = re.search(
-        r"最后一天\s*(\d{1,2})(?::(\d{2}))?点?前\s*(?:到达?|抵达)([^，,。；;]+)",
+        r"最后一天\s*(\d{1,2})(?::(\d{2}))?点?前\s*(?:到达?|抵达|回到)([^，,。；;]+)",
         text,
     )
     if final_return:
@@ -660,6 +1313,7 @@ def _apply_general_constraint_patterns(
             f"{int(final_return.group(1)):02d}:{int(final_return.group(2) or 0):02d}"
         )
         state["return_location"] = final_return.group(3).strip()
+        state["return_day_index"] = state.get("duration_days") or "last"
 
     named_venues = [] if _venues_require_verification(text) else _extract_named_venues(text)
     fixed_locations = {
@@ -670,7 +1324,7 @@ def _apply_general_constraint_patterns(
     named_venues = [
         venue
         for venue in named_venues
-        if venue not in fixed_locations or venue not in {"自由活动", "休息", "自由时间"}
+        if venue not in fixed_locations and venue not in {"自由活动", "休息", "自由时间"}
     ]
     if named_venues:
         state["must_visit"] = named_venues
@@ -695,6 +1349,8 @@ def _apply_general_constraint_patterns(
     if "全部改成公共交通和打车" in text:
         state["transport_modes"] = ["public_transport", "taxi"]
 
+    _remove_destination_cities_from_state_must_visits(state)
+
 
 def _reference_date(value: str | None) -> date | None:
     if not value:
@@ -712,6 +1368,83 @@ def _split_named_items(value: str) -> list[str]:
         for item in re.split(r"[、，,和与或]", cleaned)
         if item.strip(" \"'“”")
     ]
+
+
+def _clean_comparison_candidate(value: str) -> str:
+    """Remove request/action prefixes while preserving the named entity itself."""
+    cleaned = value.strip(" \"'“”，,")
+    prefix = re.compile(
+        r"^(?:帮我|请|麻烦(?:帮我)?|能否|可以(?:帮我)?|"
+        r"比较(?:一下|下)?|对比(?:一下|下)?|住在|住|选)\s*"
+    )
+    while True:
+        updated = prefix.sub("", cleaned, count=1).strip(" \"'“”，,")
+        if updated == cleaned:
+            return cleaned
+        cleaned = updated
+
+
+def _canonical_destination_city(value: Any) -> str | None:
+    """Return a canonical supported city only for an exact city/alias value."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    without_suffix = text[:-1] if text.endswith("市") else text
+    for alias, city in CITY_ALIASES.items():
+        if without_suffix.casefold() == alias.casefold() or without_suffix == city:
+            return city
+    return None
+
+
+def _remove_destination_city_from_patch_must_visits(
+    patches: dict[str, SlotPatch],
+) -> None:
+    destination = patches.get("destination")
+    required = patches.get("must_visit")
+    if (
+        destination is None
+        or destination.op != PatchOp.SET
+        or required is None
+        or required.op != PatchOp.SET
+    ):
+        return
+    destination_city = _canonical_destination_city(destination.value)
+    if destination_city is None:
+        return
+    values = [
+        item
+        for item in list(required.value or [])
+        if _canonical_destination_city(item) != destination_city
+    ]
+    if values:
+        patches["must_visit"] = SlotPatch(PatchOp.SET, values)
+    else:
+        patches.pop("must_visit", None)
+
+
+def _remove_destination_cities_from_state_must_visits(state: dict[str, Any]) -> None:
+    required = state.get("must_visit")
+    if not isinstance(required, list):
+        return
+    destinations = [
+        *list(state.get("destinations") or []),
+        state.get("destination"),
+        state.get("destination_city"),
+    ]
+    destination_cities = {
+        city for value in destinations if (city := _canonical_destination_city(value))
+    }
+    if not destination_cities:
+        return
+    values = [
+        item
+        for item in required
+        if _canonical_destination_city(item) not in destination_cities
+    ]
+    if values:
+        state["must_visit"] = values
+    else:
+        state.pop("must_visit", None)
 
 
 def _extract_named_venues(text: str) -> list[str]:
@@ -749,6 +1482,7 @@ def _extract_named_venues(text: str) -> list[str]:
         for value in values
         if value not in generic
         and not re.fullmatch(r"(?:每天)?(?:最多)?\s*\d+\s*个(?:主要)?(?:活动|景点|项目)", value)
+        and not re.search(r"(?:完整|最终|全部)?(?:行程|方案|计划)$", value)
         and (value.endswith(suffixes) or len(value) >= 3)
     ]
 
@@ -761,6 +1495,8 @@ def _looks_like_named_candidate(value: str) -> bool:
         return False
     return not re.search(
         r"预算|每晚|以内|每天|最多|人均|步行\d|优先|少走|地点在|公司附近|"
+        r"(?:完整|最终|全部)?(?:行程|方案|计划)|夜间项目|餐饮不要|"
+        r"^(?:但|不过|而且)?(?:不要|不能|避免)|"
         r"(?:\d+|[一二两三四五六七八九十]+)天行程|其他项目|预约冲突|(?:不要|不能|避免).{0,8}冲突",
         value,
     )
@@ -864,6 +1600,87 @@ def analyze_travel_turn(
             reference_datetime=ctx.reference_datetime,
         ),
     )
+    if (
+        task_type == TaskType.CANDIDATE_COMPARISON
+        and rule_result.constraint_state.get("specific_restaurant_recommendation")
+    ):
+        # Meal-request phrases such as “安排公司附近晚餐” describe the
+        # requested output, not a named must-visit venue.  Keeping them in
+        # must_visit would later force an impossible POI identity check.
+        meal_markers = re.compile(r"(?:早餐|午餐|晚餐|用餐|聚餐|餐厅|饭店|馆子)")
+        rule_result.constraint_state["must_visit"] = [
+            item
+            for item in rule_result.constraint_state.get("must_visit") or []
+            if not meal_markers.search(str(item))
+        ]
+        if not rule_result.constraint_state["must_visit"]:
+            rule_result.constraint_state.pop("must_visit", None)
+        patch = rule_result.patches.get("must_visit")
+        if patch is not None and patch.op == PatchOp.SET:
+            values = [
+                item for item in list(patch.value or [])
+                if not meal_markers.search(str(item))
+            ]
+            if values:
+                rule_result.patches["must_visit"] = SlotPatch(PatchOp.SET, values)
+            else:
+                rule_result.patches.pop("must_visit", None)
+    if (
+        rule_result.constraint_state.get("fixed_events")
+        and _extract_iso_date_range(user_message) is None
+        and not re.search(r"(?:出发|启程|行程开始|旅行开始)", user_message)
+    ):
+        # A dated appointment is an event date, not a replacement trip start.
+        rule_result.patches.pop("start_date", None)
+        rule_result.constraint_state.pop("date_start", None)
+    if (
+        rule_result.constraint_state.get("lodging_area")
+        and task_type != TaskType.CANDIDATE_COMPARISON
+        and not re.search(
+            r"(?:必去|必须去|务必去|必须保留|想去|想看|景点|参观|游览)",
+            user_message,
+        )
+    ):
+        # Lodging declarations occasionally look like named-venue lists to the
+        # broad profile extractor.  The structured lodging field is dominant.
+        rule_result.patches.pop("must_visit", None)
+        for field in (
+            "must_visit", "candidate_attractions", "comparison_candidates",
+        ):
+            rule_result.constraint_state.pop(field, None)
+    if (
+        ctx.store.latest_revisable_id("itinerary")
+        and _FULL_REBUILD_REQUEST_RE.search(user_message)
+        and not re.search(
+            r"(?:目的地|城市).{0,8}(?:改|换)|(?:改去|换去|改成去|改为去)",
+            user_message,
+        )
+        and not any(alias in user_message for alias in CITY_ALIASES)
+    ):
+        # Final-delivery wording must not be misread as a new destination.
+        rule_result.patches.pop("destination", None)
+        for field in ("destination", "destinations", "destination_city"):
+            rule_result.constraint_state.pop(field, None)
+    scoped_task_type = _enforce_itinerary_scope(
+        user_message,
+        ctx,
+        rule_result.task_type,
+        rule_result.patches,
+        rule_result.constraint_state,
+    )
+    if scoped_task_type != rule_result.task_type:
+        rule_result = TurnAnalysis(
+            kind=MessageKind.TRAVEL,
+            task_type=scoped_task_type,
+            patches=rule_result.patches,
+            source=rule_result.source,
+            # Local targeting directives remain useful rebuild inputs when a
+            # plan-wide constraint in the same turn widens the task to full.
+            revision_directives=rule_result.revision_directives,
+            constraint_state=rule_result.constraint_state,
+        )
+        task_type = scoped_task_type
+        kind = MessageKind.TRAVEL
     # UNKNOWN means “no supported workflow has been selected”, not “default to
     # a full plan”.  Promote it only when deterministic trip state makes that
     # workflow unambiguous: explicit destination/days start or continue a full
@@ -937,22 +1754,22 @@ def analyze_travel_turn(
             "lodging_area"
         ]
     if kind not in {MessageKind.TRAVEL, MessageKind.AMBIGUOUS}:
-        return rule_result
+        return _with_delivery_intent(rule_result, user_message, ctx)
     if not settings.llm.enabled:
-        return rule_result
+        return _with_delivery_intent(rule_result, user_message, ctx)
     if kind != MessageKind.AMBIGUOUS and not has_complex_signals(user_message):
-        return rule_result
+        return _with_delivery_intent(rule_result, user_message, ctx)
     try:
         payload = _analyze_with_llm(user_message, ctx, settings, history or [], evaluation_trace)
     except Exception:  # noqa: BLE001 - LLM 失败必须回退规则，不能阻塞主流程
-        return rule_result
-    return _merge_llm_payload(payload, rule_result)
+        return _with_delivery_intent(rule_result, user_message, ctx)
+    return _with_delivery_intent(_merge_llm_payload(payload, rule_result), user_message, ctx)
 
 
 _TURN_ANALYSIS_SYSTEM = """你是旅行规划 Agent 的轮次分析模块，对用户输入一次性输出四件事：意图类别、任务类型、出行画像字段更新、完整的结构化约束状态。
 只输出 JSON 对象，不要输出 Markdown。格式：
 {"kind": "greeting|travel|ambiguous|out_of_scope",
- "task_type": "unknown|full_trip_plan|route_query|poi_advice|itinerary_revision|day_advice",
+ "task_type": "full_itinerary|route_plan|candidate_comparison|itinerary_patch|local_adjustment_advice|clarification|constraint_negotiation|safe_decline",
  "slots": {"字段名": {"op": "set", "value": ...} 或 {"op": "clear"}},
  "constraint_state": {"约束字段": JSON值}}
 
@@ -960,12 +1777,14 @@ kind 判定：
 - greeting：纯寒暄；travel：明确的出行/规划需求；ambiguous：有旅行弱信号但不确定；out_of_scope：与旅行无关。
 
 task_type 判定：
-- unknown：无法安全归入下列任一已支持任务，或请求的能力当前不支持；
-- full_trip_plan：要求规划/生成完整多日行程；
-- route_query：问 A 到 B 怎么走、交通方式、耗时，不要求完整行程；
-- poi_advice：住哪里/选哪个区/酒店推荐等咨询，不要求完整行程；
-- itinerary_revision：对已有行程做增删改（删掉某天某站、换掉某项）；
-- day_advice：根据天气或某个具体日期问去哪玩、玩什么。
+- full_itinerary：要求规划/生成完整行程；
+- route_plan：问 A 到 B 怎么走、交通方式、耗时，不要求完整行程；
+- candidate_comparison：比较地点、住宿区域、酒店或餐厅候选；
+- itinerary_patch：系统当前确实持有结构化行程，对其中局部时段做 patch；
+- local_adjustment_advice：没有系统持有的完整行程，但局部对象、日期或条件足够时给保留/替换建议；
+- clarification：任务目标本身无法安全识别；
+- constraint_negotiation：约束冲突，需要用户取舍；
+- safe_decline：请求代执行预订、支付等超出只读建议边界的操作。
 
 slots 抽取规则：
 - 只抽本轮用户明确表达的信息，不要编造；本轮没提的字段不要出现在 slots 中；
@@ -978,7 +1797,7 @@ slots 抽取规则：
 constraint_state 规则：
 - 输出当前请求结合最近对话后的全部有效显式约束；本轮修改覆盖旧值，删除项从 must_visit 移除并记入 removed；
 - 保留用户原文语义，不把“园林/海边/历史景点”等中文要求改成英文标签；日期用 YYYY-MM-DD，时间用 HH:MM；
-- 仅记录明确表达的约束，不推测。优先使用这些通用字段：date_start,date_end,destinations,destination,origin,return_location,destination_area,destination_name,duration_days,traveler_count,child_age,elderly,wheelchair_user,travel_with_parents,budget_max_cny,budget_per_person_cny,budget_total_cny,budget_remaining_cny,prepaid_lodging_cny,hotel_budget_per_night_cny,lodging_area,lodging_flexibility,interests,must_visit,removed,optional_remove,avoid,dietary,self_driving_allowed,cycling_allowed,transport_mode,transport_modes,public_transport_required,taxi_backup,fallback_transport,return_deadline,activity_end_deadline,walking_time_max_min,max_single_walk_min,max_walking_km_per_day,max_transfers_per_day,max_major_activities_per_day,max_selected,candidate_attractions,candidate_only,fixed_events,conditional_activity,conditional_avoid_window,need_indoor_backup,night_activity_allowed,accessibility_priority,mobility,occasion,ambience,parking_preferred,top_n,diversity_required,exclude,no_live_inventory_required,need_disambiguation,trip_length,weather_condition,weekday,preference。
+- 仅记录明确表达的约束，不推测。城市与局部锚点必须分别写 destination_city 与 location_anchor。优先使用这些通用字段：date_start,date_end,destinations,destination,destination_city,location_anchor,target_anchor,comparison_candidates,comparison_dimensions,origin,return_location,destination_area,destination_name,duration_days,traveler_count,child_age,elderly,wheelchair_user,travel_with_parents,budget_max_cny,budget_per_person_cny,budget_total_cny,budget_remaining_cny,prepaid_lodging_cny,hotel_budget_per_night_cny,lodging_area,lodging_flexibility,interests,must_visit,removed,optional_remove,avoid,dietary,self_driving_allowed,cycling_allowed,transport_mode,transport_modes,public_transport_required,taxi_backup,fallback_transport,return_deadline,activity_end_deadline,activity_end_target,walking_time_max_min,max_single_walk_min,max_walking_km_per_day,max_transfers_per_day,max_major_activities_per_day,max_selected,candidate_attractions,candidate_only,fixed_events,conditional_activity,conditional_avoid_window,need_indoor_backup,night_activity_allowed,accessibility_priority,mobility,occasion,ambience,parking_preferred,top_n,diversity_required,exclude,no_live_inventory_required,need_disambiguation,trip_length,weather_condition,weekday,preference。
 """
 
 
@@ -1120,13 +1939,20 @@ def _merge_llm_payload(payload: Any, rule_result: TurnAnalysis) -> TurnAnalysis:
     if task_type == TaskType.ITINERARY_REVISION:
         for name in CORE_SLOTS:
             patch = patches.get(name)
-            if patch is not None and patch.op == PatchOp.SET:
+            if (
+                patch is not None
+                and patch.op == PatchOp.SET
+                and name not in rule_result.patches
+            ):
                 patches.pop(name)
     constraint_state = {
         **_validate_constraint_state(payload.get("constraint_state")),
         **rule_result.constraint_state,
     }
-    if "budget_max_cny" in rule_result.constraint_state:
+    if (
+        "budget_max_cny" in rule_result.constraint_state
+        and "budget_total_cny" not in rule_result.constraint_state
+    ):
         constraint_state.pop("budget_total_cny", None)
     if task_type == TaskType.ITINERARY_REVISION:
         for key in ("destination", "destinations", "date_start", "date_end", "duration_days"):
@@ -1142,6 +1968,13 @@ def _merge_llm_payload(payload: Any, rule_result: TurnAnalysis) -> TurnAnalysis:
         and "transport_mode" not in rule_result.constraint_state
     ):
         constraint_state.pop("transport_mode", None)
+    # Downgrading accommodation changes both spend and location.  The rule
+    # extractor covers explicit user consent, so a model may not infer this
+    # permission merely from a low/total budget.
+    if "lodging_flexibility" not in rule_result.constraint_state:
+        constraint_state.pop("lodging_flexibility", None)
+    _remove_destination_city_from_patch_must_visits(patches)
+    _remove_destination_cities_from_state_must_visits(constraint_state)
     candidates = constraint_state.get("candidate_attractions")
     if isinstance(candidates, list):
         cleaned_candidates = [

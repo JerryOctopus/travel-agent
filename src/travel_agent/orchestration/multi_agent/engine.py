@@ -32,7 +32,7 @@ import re
 import time
 from typing import Any
 
-from travel_agent.agent.turn_analysis import TaskType
+from travel_agent.agent.turn_analysis import DeliveryIntent, TaskType
 from travel_agent.orchestration.multi_agent.schemas import (
     SEVERITY_RECOVERABLE,
     STATUS_CLARIFICATION_REQUIRED,
@@ -93,7 +93,7 @@ VARIANT_PRESETS: dict[str, EngineCapabilities] = {
 
 # 只有生成/修改完整 TravelPlan 的任务才触发 Semantic Reviewer（V3）。
 REVIEW_REQUIRED_TASK_TYPES: frozenset[TaskType] = frozenset(
-    {TaskType.FULL_TRIP_PLAN, TaskType.ITINERARY_REVISION}
+    {TaskType.FULL_ITINERARY}
 )
 
 
@@ -119,6 +119,7 @@ class TurnOutcome:
     status: str
     reply: str = ""
     plan_artifact_id: str | None = None
+    delivery_artifact_id: str | None = None
     rework_used: int = 0
     results: list[Any] = field(default_factory=list)
     cards: list[dict[str, Any]] = field(default_factory=list)
@@ -127,6 +128,9 @@ class TurnOutcome:
     review: ReviewResult | None = None
     trace_artifact_id: str | None = None
     routing_policy_hash: str = ""
+    delivery_status: str = "no_deliverable"
+    review_repair_succeeded: bool = False
+    review_repair_preserved: bool = False
 
 
 @dataclass(frozen=True)
@@ -195,12 +199,15 @@ class MultiAgentEngine:
         rid = request_id or new_request_id()
         from travel_agent.orchestration.multi_agent.trace import (
             AgentTraceLog,
+            current_trace,
             reset_current_trace,
             set_current_trace,
         )
 
-        trace = AgentTraceLog(rid)
-        token = set_current_trace(trace)
+        inherited_trace = current_trace()
+        owns_trace = inherited_trace is None or inherited_trace.request_id != rid
+        trace = AgentTraceLog(rid) if owns_trace else inherited_trace
+        token = set_current_trace(trace) if owns_trace else None
         try:
             return self._run_turn(
                 ctx,
@@ -232,7 +239,8 @@ class MultiAgentEngine:
                     pass
             raise
         finally:
-            reset_current_trace(token)
+            if token is not None:
+                reset_current_trace(token)
 
     def _run_turn(
         self,
@@ -249,8 +257,29 @@ class MultiAgentEngine:
     ) -> TurnOutcome:
         rid = request_id or new_request_id()
         from travel_agent.orchestration.multi_agent.deadlines import TurnDeadline
+        from travel_agent.orchestration.multi_agent.trace import current_trace
 
         deadline = TurnDeadline.start(settings)
+        trace = current_trace()
+        delivery_intent = _delivery_intent_from_inputs(turn_inputs, task_type)
+        if trace is not None:
+            contract_detail = {
+                "task_type": task_type.value if task_type is not None else None,
+                "planner_required": _plan_required_for_turn(
+                    self.capabilities.dispatch, task_type, delivery_intent
+                ),
+                "artifact_reuse_audit": list(
+                    (turn_inputs or {}).get("artifact_reuse_audit") or []
+                ),
+            }
+            if (turn_inputs or {}).get("delivery_intent"):
+                contract_detail["delivery_intent"] = delivery_intent.value
+            trace.append(
+                "turn_contract",
+                agent="engine",
+                status="declared",
+                detail=contract_detail,
+            )
         if self.capabilities.mode == "single":
             outcome = self._run_v0(ctx, settings, user_message, history or [], rid)
         else:
@@ -291,7 +320,19 @@ class MultiAgentEngine:
                 outcome.results,
                 rid,
             )
-        plan_required = _plan_required_for_turn(self.capabilities.dispatch, task_type)
+            outcome.delivery_artifact_id = _specialized_artifact_id_for_request(
+                ctx, task_type, rid
+            )
+            if outcome.delivery_artifact_id:
+                specialized = ctx.store.get(outcome.delivery_artifact_id) or {}
+                outcome.delivery_status = (
+                    "partial_specialized_with_limitations"
+                    if specialized.get("limitations")
+                    else "deliverable_specialized"
+                )
+        plan_required = _plan_required_for_turn(
+            self.capabilities.dispatch, task_type, delivery_intent
+        )
         if plan_required and not outcome.plan_artifact_id:
             outcome.status = STATUS_INCOMPLETE
             if not outcome.reply:
@@ -327,6 +368,18 @@ class MultiAgentEngine:
                 "rework_used": outcome.rework_used,
                 "plan_artifact_id": outcome.plan_artifact_id,
                 "routing_policy_hash": outcome.routing_policy_hash,
+                "delivery_status": outcome.delivery_status,
+                "delivery_artifact_id": (
+                    outcome.delivery_artifact_id or outcome.plan_artifact_id
+                    if outcome.delivery_status
+                    in {
+                        "deliverable_current",
+                        "partial_current_with_limitations",
+                        "deliverable_specialized",
+                        "partial_specialized_with_limitations",
+                    }
+                    else None
+                ),
             },
         )
         if outcome.plan_artifact_id:
@@ -356,9 +409,12 @@ class MultiAgentEngine:
         from travel_agent.agent.session import reset_task_meta, set_current_task_meta
 
         task_id = new_task_id("single_agent")
-        token = set_current_task_meta(
-            {"request_id": request_id, "task_id": task_id, "agent": "single_agent"}
-        )
+        from travel_agent.artifact_policy import constraint_version
+
+        token = set_current_task_meta({
+            "request_id": request_id, "task_id": task_id, "agent": "single_agent",
+            "constraint_version": constraint_version(ctx.profile),
+        })
         try:
             reply = _run_react(user_message, ctx, history, settings)
         except Exception as exc:  # noqa: BLE001
@@ -408,19 +464,21 @@ class MultiAgentEngine:
     ) -> TurnOutcome:
         from travel_agent.orchestration.multi_agent.fixed_dispatch import run_fixed_dispatch
 
-        if task_type == TaskType.ITINERARY_REVISION and not existing_plan_artifact_id:
+        if task_type == TaskType.ITINERARY_PATCH and not existing_plan_artifact_id:
             return TurnOutcome(
                 status=STATUS_CLARIFICATION_REQUIRED,
                 reply="当前会话没有可修改的既有行程，请先生成或提供一份行程。",
             )
+        fixed_inputs = _fixed_turn_inputs(
+            task_type, existing_plan_artifact_id, turn_inputs
+        )
+        fixed_inputs["task_brief"] = task_brief
         status, results = run_fixed_dispatch(
             runner,
             request_id,
             task_type,
             task_brief=task_brief,
-            inputs=_fixed_turn_inputs(
-                task_type, existing_plan_artifact_id, turn_inputs
-            ),
+            inputs=fixed_inputs,
             deadline=deadline,
         )
         if status == STATUS_CLARIFICATION_REQUIRED:
@@ -428,8 +486,18 @@ class MultiAgentEngine:
                 status=STATUS_CLARIFICATION_REQUIRED,
                 reply="任务类型不明或信息不足，需要先补充目的地/天数等关键信息。",
             )
+        missing_hard, _missing_soft = _required_evidence(
+            ctx, task_type, results, fixed_inputs
+        )
         delivery = _fixed_delivery_status(results)
-        return TurnOutcome(status=delivery, reply=_compose_fixed_reply(results), results=results)
+        reply = _materialize_lightweight_artifact(
+            ctx, task_type, results, missing_hard, request_id=request_id,
+            existing_plan_artifact_id=existing_plan_artifact_id,
+            effective_state=(fixed_inputs.get("profile") or {}).get("constraint_state"),
+        ) if task_type != TaskType.FULL_ITINERARY else _compose_fixed_reply(results)
+        if missing_hard and task_type != TaskType.FULL_ITINERARY:
+            delivery = STATUS_INCOMPLETE
+        return TurnOutcome(status=delivery, reply=reply, results=results)
 
     # ------------------------------------------------------------------ #
     # V2/V3：动态 Orchestrator
@@ -481,6 +549,35 @@ class MultiAgentEngine:
         base_inputs = _fixed_turn_inputs(
             task_type, existing_plan_artifact_id, turn_inputs
         )
+        base_inputs["task_brief"] = task_brief or user_message
+        base_inputs["execution_budget"] = deadline.trace_detail()
+        from travel_agent.orchestration.multi_agent.dispatch_rules import agents_required_for_turn
+
+        allowed_agents = set(
+            agents_required_for_turn(task_type, task_brief=task_brief, inputs=base_inputs)
+        )
+        allowed_agents.discard("planner")
+        from travel_agent.candidate_comparison import comparison_candidates
+
+        comparison_state = dict(
+            (base_inputs.get("profile") or {}).get("constraint_state") or {}
+        )
+        if task_type == TaskType.CANDIDATE_COMPARISON and (
+            comparison_candidates(comparison_state)
+            or comparison_state.get("specific_restaurant_recommendation")
+            or comparison_state.get("compare_lodging_areas")
+        ):
+            return _run_candidate_comparison_base(
+                ctx,
+                runner,
+                deadline,
+                request_id,
+                task_brief or user_message,
+                base_inputs,
+                allowed_agents,
+                trace=current_trace(),
+                routing_policy_hash=policy_hash,
+            )
         results: list[SubagentResult] = []
         attempted: list[str] = [] # 保存已经尝试过的派工目标
         router_calls = 0
@@ -517,6 +614,8 @@ class MultiAgentEngine:
                 break
             remaining_dispatch = max_dispatches - ledger.attempts
             max_tasks = min(wave1_max if wave == 1 else 2, remaining_dispatch)
+            if deadline.usable_preplanner_time() < 2 * deadline.config.recovery_worker_useful:
+                max_tasks = min(max_tasks, 1)
             decision = route_wave(
                 ctx,
                 settings,
@@ -565,10 +664,31 @@ class MultiAgentEngine:
                         **deadline.trace_detail(),
                     },
                 )
-            if decision.clarification and not results:
+            # A named route endpoint may be ambiguous, but resolving that
+            # ambiguity is tool work when both route anchors are already in
+            # state.  Do not let a stochastic Router send the task back to the
+            # user before the deterministic transport/POI evidence fallback
+            # has had a chance to run.
+            anchored_route_request = bool(
+                task_type == TaskType.ROUTE_PLAN
+                and _route_request_has_anchored_endpoints(base_inputs)
+            )
+            full_plan_ready_for_tool_work = bool(
+                task_type == TaskType.FULL_ITINERARY
+                and _full_itinerary_required_slots_ready(ctx, base_inputs)
+            )
+            if (
+                decision.clarification
+                and not results
+                and not anchored_route_request
+                and not full_plan_ready_for_tool_work
+            ):
                 return DynamicBaseOutcome(
                     status=STATUS_CLARIFICATION_REQUIRED,
-                    reply=decision.reply or "需要补充目的地/天数等关键信息。",
+                    reply=(
+                        decision.reply
+                        or "当前信息不足以安全执行，请补充具体的旅行目标或相关条件。"
+                    ),
                     routing_policy_hash=policy_hash,
                 )
             if decision.error:
@@ -583,7 +703,10 @@ class MultiAgentEngine:
                 for result in results
                 if result.status in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}
             }
+            # Router 返回的 decision.tasks 再次校验，并转换成真正可以交给 SubagentRunner 的 SubagentTask
             for routed in decision.tasks:
+                if routed.agent not in allowed_agents:
+                    continue
                 if routed.objective_key in attempted:
                     continue
                 if any(dep not in known_task_ids for dep in routed.depends_on):
@@ -614,6 +737,58 @@ class MultiAgentEngine:
                 )
                 tasks.append(task)
                 objective_by_task[task.task_id] = routed.objective_key
+            fallback_dispatches = _missing_evidence_dispatches(
+                missing_hard,
+                allowed_agents=allowed_agents,
+                excluded_agents={task.agent for task in tasks},
+            )
+            for agent, labels in fallback_dispatches:
+                if len(tasks) >= max_tasks:
+                    break
+                objective = f"补齐硬证据：{'、'.join(labels)}"
+                limit_error = ledger.authorize(agent, objective)
+                if limit_error:
+                    continue
+                objective_key = f"{agent}:{objective.casefold()}"
+                attempted.append(objective_key)
+                inputs = dict(base_inputs)
+                artifact_ids = list(
+                    dict.fromkeys(
+                        [
+                            str(value)
+                            for value in (inputs.get("artifact_ids") or [])
+                            if value
+                        ]
+                        + _all_evidence_ids(results)
+                    )
+                )
+                if artifact_ids:
+                    inputs["artifact_ids"] = artifact_ids
+                task = SubagentTask(
+                    request_id=request_id,
+                    task_id=new_task_id(agent),
+                    agent=agent,
+                    instruction=(
+                        f"只补齐当前缺失的硬证据：{'、'.join(labels)}。"
+                        "必须使用本领域真实工具并返回结构化 artifact；空结果不得算完成。"
+                    ),
+                    inputs=inputs,
+                    attempt=ledger.counts.get(agent, 1),
+                )
+                tasks.append(task)
+                objective_by_task[task.task_id] = objective_key
+                if trace is not None:
+                    trace.append(
+                        "deterministic_dispatch_postcondition",
+                        agent="engine",
+                        status="applied",
+                        attempt=wave,
+                        detail={
+                            "target_agent": agent,
+                            "missing_evidence": labels,
+                            "planner_dispatched": False,
+                        },
+                    )
             if not tasks:
                 stop_reason = "router_ready" if decision.ready else "no_valid_delta_tasks"
                 break
@@ -649,11 +824,16 @@ class MultiAgentEngine:
                                 "agent": result.agent,
                                 "objective_key": objective_by_task.get(result.task_id, ""),
                                 "status": result.status,
+                                "error": result.error,
                             }
                             for result in last_wave_results
                         ],
                         "effective_timeout_ms": int(worker_timeout * 1000),
                         "admission": worker_admission,
+                        "failed_components": [
+                            result.agent for result in last_wave_results
+                            if result.status not in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}
+                        ],
                         **deadline.trace_detail(),
                     },
                 )
@@ -661,14 +841,20 @@ class MultiAgentEngine:
         missing_hard, missing_soft = _required_evidence(
             ctx, task_type, results, base_inputs
         )
+        # 是否需要planner
         if _task_needs_plan(task_type):
             # Route evidence remains a hard routing target so recovery waves
             # still dispatch transport. Once all waves are exhausted, the
             # planner's own estimator plus final critic can safely recover it.
+            # 没有真实路线证据，Planner 本地估算恢复，标记告警，建议出发前用地图复核
+            # 但其他关键证据不能这样放宽
             if task_type == TaskType.FULL_TRIP_PLAN:
                 missing_hard = [
                     item for item in missing_hard if item != "路线可行性"
                 ]
+            """
+            所有 Wave 完成、并且移除可由 Planner 恢复的“路线可行性”后，如果仍然缺少其他硬证据，就停止执行，不进入 Planner
+            """
             if missing_hard:
                 _trace_stop(trace, deadline, stop_reason, missing_hard, policy_hash)
                 return DynamicBaseOutcome(
@@ -691,6 +877,7 @@ class MultiAgentEngine:
                     results=tuple(results),
                     routing_policy_hash=policy_hash,
                 )
+            # 在启动 Planner 前，收集所有允许绑定给 Planner 的 Artifact ID
             artifact_ids = list(
                 dict.fromkeys(
                     [str(value) for value in (base_inputs.get("artifact_ids") or []) if value]
@@ -708,6 +895,7 @@ class MultiAgentEngine:
             planner_inputs["artifact_ids"] = artifact_ids
             if existing_plan_artifact_id:
                 planner_inputs["plan_artifact_id"] = existing_plan_artifact_id
+            # 创建plnner的任务
             planner_task = SubagentTask(
                 request_id=request_id,
                 task_id=new_task_id("planner"),
@@ -751,8 +939,10 @@ class MultiAgentEngine:
                 routing_policy_hash=policy_hash,
             )
 
-        reply = _render_lightweight_evidence_reply(
-            ctx, task_type, results, missing_hard
+        reply = _materialize_lightweight_artifact(
+            ctx, task_type, results, missing_hard, request_id=request_id,
+            existing_plan_artifact_id=existing_plan_artifact_id,
+            effective_state=(base_inputs.get("profile") or {}).get("constraint_state"),
         )
         return DynamicBaseOutcome(
             status=STATUS_COMPLETED if not missing_hard else STATUS_INCOMPLETE,
@@ -777,26 +967,72 @@ class MultiAgentEngine:
         from travel_agent.orchestration.multi_agent.render_gate import render_plan_outcome
 
         delivery = outcome.status
-        if requires_semantic_review(self.capabilities, task_type):
-            delivery = self._run_review_cycle(
-                ctx, settings, outcome, task_brief, request_id, deadline
-            )
-
         allowed_agents = (
             frozenset({"single_agent"})
             if self.capabilities.mode == "single"
             else frozenset({"planner"})
         )
+        if requires_semantic_review(self.capabilities, task_type):
+            delivery = self._run_review_cycle(
+                ctx, settings, outcome, task_brief, request_id, deadline
+            )
+
+        if delivery in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}:
+            review_notes = _review_limitations(outcome.review)
+            limitations = review_notes if outcome.review_repair_preserved else []
+            review_advisories = (
+                review_notes
+                if review_notes
+                and not outcome.review_repair_preserved
+                and not outcome.review_repair_succeeded
+                else []
+            )
+            resolved_review_issues = (
+                review_notes if outcome.review_repair_succeeded else []
+            )
+            if not _promote_selected_candidate(
+                ctx,
+                outcome.plan_artifact_id,
+                limitations=limitations,
+                review_advisories=review_advisories,
+                resolved_review_issues=resolved_review_issues,
+                allowed_agents=allowed_agents,
+                reason=(
+                    "semantic_review_warning"
+                    if delivery == STATUS_COMPLETED_WITH_WARNINGS
+                    else "semantic_review_pass"
+                    if requires_semantic_review(self.capabilities, task_type)
+                    else "deterministic_finalizer_pass"
+                ),
+            ):
+                delivery = STATUS_INCOMPLETE
+                _mark_rebuild_pending(ctx)
+        elif outcome.plan_artifact_id:
+            ctx.store.reject_itinerary_candidate(
+                outcome.plan_artifact_id,
+                reason="finalizer_delivery_blocked",
+            )
+            _mark_rebuild_pending(ctx)
+
         render_admission = deadline.trace_detail()
         render_started = time.monotonic()
         render = render_plan_outcome(
             ctx, outcome.plan_artifact_id, delivery, allowed_agents=allowed_agents
         )
+        outcome.delivery_status = str(render.get("delivery_status") or "no_deliverable")
+        if render.get("artifact_id"):
+            outcome.plan_artifact_id = str(render["artifact_id"])
         outcome.cards = render.get("cards") or []
         outcome.map_payload = render.get("map_payload")
         outcome.gate_status = render.get("gate_status") or "skipped"
-        if outcome.gate_status in {"rejected", "rendered_incomplete"}:
+        if outcome.gate_status == "rejected":
             outcome.status = STATUS_INCOMPLETE
+        elif (
+            outcome.gate_status == "rendered_incomplete"
+            and outcome.delivery_status == "partial_current_with_limitations"
+            and render.get("partial_safe") is True
+        ):
+            outcome.status = STATUS_COMPLETED_WITH_WARNINGS
         elif not render.get("rendered"):
             outcome.status = delivery if delivery in {STATUS_FAILED, STATUS_INCOMPLETE} else STATUS_INCOMPLETE
         else:
@@ -812,6 +1048,9 @@ class MultiAgentEngine:
                 duration_ms=round((time.monotonic() - render_started) * 1000, 2),
                 detail={
                     "admission": render_admission,
+                    "delivery_status": outcome.delivery_status,
+                    "artifact_id": outcome.plan_artifact_id,
+                    "route_evidence_status": render.get("route_evidence_status"),
                     **deadline.trace_detail(),
                 },
             )
@@ -900,8 +1139,23 @@ class MultiAgentEngine:
             max_rework=self.capabilities.max_rework,
             rework_used=outcome.rework_used,
         )
+        critical_route_targets = _repairable_critical_route_targets(
+            review, plan_payload
+        )
+        if (
+            not start_repair
+            and critical_route_targets
+            and outcome.rework_used < self.capabilities.max_rework
+        ):
+            # A deterministic return-route gate has already identified exact
+            # endpoint IDs.  One Transport retry can therefore repair the
+            # evidence gap without guessing or weakening the hard constraint;
+            # the repaired candidate must still pass every deterministic gate.
+            delivery = STATUS_INCOMPLETE
+            start_repair = True
         if start_repair:
-            targets = repair_targets(review)
+            original_candidate_id = outcome.plan_artifact_id
+            targets = critical_route_targets or repair_targets(review)
             domain_repair = any(target != "planner" for target in targets)
             if not deadline.admits_repair(domain_worker=domain_repair):
                 if trace is not None:
@@ -915,12 +1169,46 @@ class MultiAgentEngine:
                             **deadline.trace_detail(),
                         },
                     )
-                return STATUS_INCOMPLETE
+                return _preserve_original_candidate(
+                    ctx,
+                    outcome,
+                    original_candidate_id,
+                    review,
+                    reason="repair_admission_denied",
+                )
             # 整个修复周期只计一次 rework；修复后不再进行第二轮 Reviewer。
             delivery = self._run_repair_cycle(
                 ctx, runner, request_id, review, outcome, targets, deadline
             )
             outcome.rework_used += 1
+            repaired_candidate_id = outcome.plan_artifact_id
+            if delivery not in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}:
+                if repaired_candidate_id and repaired_candidate_id != original_candidate_id:
+                    ctx.store.reject_itinerary_candidate(
+                        repaired_candidate_id,
+                        reason="targeted_rework_failed",
+                    )
+                return _preserve_original_candidate(
+                    ctx,
+                    outcome,
+                    original_candidate_id,
+                    review,
+                    reason="targeted_rework_failed",
+                )
+            if _candidate_quality_worse(ctx, repaired_candidate_id, original_candidate_id):
+                if repaired_candidate_id:
+                    ctx.store.reject_itinerary_candidate(
+                        repaired_candidate_id,
+                        reason="targeted_rework_quality_regression",
+                    )
+                return _preserve_original_candidate(
+                    ctx,
+                    outcome,
+                    original_candidate_id,
+                    review,
+                    reason="targeted_rework_quality_regression",
+                )
+            outcome.review_repair_succeeded = True
         return delivery
 
     def _run_repair_cycle(
@@ -938,16 +1226,24 @@ class MultiAgentEngine:
         instructions = _repair_instructions_by_agent(review)
         new_artifact_ids: list[str] = []
         previous_plan = ctx.store.get(outcome.plan_artifact_id) or {}
+        parent_plan_artifact_id = outcome.plan_artifact_id
         planner_input_ids = list(previous_plan.get("source_artifact_ids") or [])
         if not domain_targets and outcome.plan_artifact_id and not planner_input_ids:
             planner_input_ids.append(outcome.plan_artifact_id)
         for agent in domain_targets:
+            repair_inputs: dict[str, Any] = {
+                "artifact_ids": list(planner_input_ids)
+            }
+            if agent == "transport":
+                route_pairs = _repair_route_pairs_for_plan(previous_plan)
+                if route_pairs:
+                    repair_inputs["repair_route_pairs"] = route_pairs
             task = SubagentTask(
                 request_id=request_id,
                 task_id=new_task_id(agent),
                 agent=agent,
                 instruction=instructions.get(agent) or "按 Reviewer 意见定向补充本领域结果。",
-                inputs={"artifact_ids": list(planner_input_ids)},
+                inputs=repair_inputs,
                 attempt=2,
             )
             worker_timeout = deadline.repair_worker_timeout()
@@ -965,16 +1261,51 @@ class MultiAgentEngine:
             if artifact_id not in planner_input_ids:
                 planner_input_ids.append(artifact_id)
 
+        repair_issues = [
+            issue for issue in review.issues
+            if issue.severity == SEVERITY_RECOVERABLE
+            or _is_critical_route_issue(issue)
+        ]
         planner_review_instructions = "\n".join(
             issue.repair_instruction
-            for issue in review.issues
-            if issue.severity == SEVERITY_RECOVERABLE and issue.repair_instruction
+            for issue in repair_issues
+            if issue.repair_instruction
         )
         planner_review_issue_types = [
             issue.issue_type
-            for issue in review.issues
-            if issue.severity == SEVERITY_RECOVERABLE
+            for issue in repair_issues
         ]
+        return_anchor = (previous_plan.get("required_route_anchors") or {}).get(
+            "last_stop_to_return_location"
+        ) or {}
+        preserve_terminal_poi_id = ""
+        preserve_terminal_poi: dict[str, Any] | None = None
+        if any(
+            "return" in str(issue_type or "").lower()
+            or "deadline" in str(issue_type or "").lower()
+            for issue_type in planner_review_issue_types
+        ):
+            preserve_terminal_poi_id = str(
+                return_anchor.get("origin_poi_id") or ""
+            ).strip()
+            preserve_terminal_poi = next((
+                stop.get("poi")
+                for day in (previous_plan.get("itinerary") or {}).get("days") or []
+                for stop in day.get("stops") or []
+                if isinstance(stop, dict)
+                and str((stop.get("poi") or {}).get("poi_id") or "")
+                == preserve_terminal_poi_id
+            ), None)
+        if (
+            preserve_terminal_poi_id
+            and parent_plan_artifact_id
+            and parent_plan_artifact_id not in planner_input_ids
+        ):
+            # A route-only revision needs the exact reviewed terminal POI from
+            # its parent candidate. The final artifact removes itinerary
+            # inputs from source evidence and records only lineage, so this
+            # does not promote the failed parent or bypass stale-state gates.
+            planner_input_ids.append(parent_plan_artifact_id)
 
         planner_task = SubagentTask(
             request_id=request_id,
@@ -993,6 +1324,10 @@ class MultiAgentEngine:
                 "revision_directives": {
                     "reviewer_instructions": planner_review_instructions,
                     "reviewer_issue_types": planner_review_issue_types,
+                    "parent_plan_artifact_id": parent_plan_artifact_id,
+                    "repair_targets": list(targets),
+                    "preserve_terminal_poi_id": preserve_terminal_poi_id or None,
+                    "preserve_terminal_poi": preserve_terminal_poi,
                 },
             },
             attempt=2,
@@ -1015,7 +1350,9 @@ class MultiAgentEngine:
             # No second semantic review, but deterministic acceptance is mandatory.
             from travel_agent.agent.toolkit import _validate_plan_gate
 
-            gate_error, _record = _validate_plan_gate(ctx, outcome.plan_artifact_id)
+            gate_error, _record = _validate_plan_gate(
+                ctx, outcome.plan_artifact_id, allow_candidate=True
+            )
             repaired = ctx.store.get(outcome.plan_artifact_id) or {}
             critic = repaired.get("critic") or {}
             critical_issues = [
@@ -1023,11 +1360,26 @@ class MultiAgentEngine:
                 for issue in (critic.get("issues") or [])
                 if str(issue.get("severity") or "").lower() in {"error", "critical"}
             ]
+            unresolved_repairs = _unresolved_review_repairs(
+                ctx,
+                review,
+                previous_plan,
+                repaired,
+            )
             if (
                 gate_error
                 or critic.get("passed") is not True
                 or critical_issues
                 or planner_result.unresolved
+                or unresolved_repairs
+                or (
+                    isinstance(repaired.get("validation_result"), dict)
+                    and (
+                        repaired["validation_result"].get("passed") is not True
+                        or repaired.get("parent_plan_artifact_id") != parent_plan_artifact_id
+                        or list(repaired.get("unresolved_changes") or [])
+                    )
+                )
             ):
                 return STATUS_INCOMPLETE
             # 修复后不再 Review；通过 hard critic/Gate 后按带告警交付。
@@ -1053,7 +1405,635 @@ class MultiAgentEngine:
         return SubagentRunner(ctx, executor)
 
 
+# --- Finalizer candidate selection ----------------------------------------- #
+
+
+def _review_limitations(review: ReviewResult | None) -> list[str]:
+    if review is None:
+        return []
+    return list(
+        dict.fromkeys(
+            issue.description.strip()
+            for issue in review.issues
+            if issue.description.strip()
+        )
+    )
+
+
+def _candidate_deterministically_valid(
+    ctx: Any,
+    artifact_id: str | None,
+    *,
+    allowed_agents: frozenset[str] = frozenset({"planner"}),
+) -> bool:
+    if not artifact_id:
+        return False
+    from travel_agent.agent.toolkit import _validate_plan_gate
+
+    error, record = _validate_plan_gate(
+        ctx,
+        artifact_id,
+        allowed_agents=allowed_agents,
+        allow_candidate=True,
+        allow_earlier_attempt=True,
+    )
+    if error or not record:
+        return False
+    payload = record.get("payload") or {}
+    critic = payload.get("critic") or {}
+    validation = payload.get("validation_result") or {}
+    if record.get("artifact_status") == "current":
+        return critic.get("passed") is True
+    return bool(
+        critic.get("passed") is True
+        and validation.get("passed") is True
+        and not payload.get("unresolved_changes")
+    )
+
+
+def _promote_selected_candidate(
+    ctx: Any,
+    artifact_id: str | None,
+    *,
+    limitations: list[str],
+    review_advisories: list[str] | None = None,
+    resolved_review_issues: list[str] | None = None,
+    reason: str,
+    allowed_agents: frozenset[str] = frozenset({"planner"}),
+) -> bool:
+    if not artifact_id or not _candidate_deterministically_valid(
+        ctx, artifact_id, allowed_agents=allowed_agents
+    ):
+        return False
+    promoted = ctx.store.promote_itinerary(
+        artifact_id,
+        limitations=limitations,
+        review_advisories=review_advisories,
+        resolved_review_issues=resolved_review_issues,
+        promotion_reason=reason,
+    )
+    if promoted:
+        state = getattr(ctx.profile, "constraint_state", {}) or {}
+        state["_plan_status"] = "current"
+        state["_revisable_parent_plan_artifact_id"] = artifact_id
+    return promoted
+
+
+def _mark_rebuild_pending(ctx: Any) -> None:
+    state = getattr(ctx.profile, "constraint_state", None)
+    if not isinstance(state, dict):
+        state = {}
+        ctx.profile.constraint_state = state
+    state["_plan_status"] = "rebuild_pending"
+
+
+def _preserve_original_candidate(
+    ctx: Any,
+    outcome: TurnOutcome,
+    original_candidate_id: str | None,
+    review: ReviewResult,
+    *,
+    reason: str,
+) -> str:
+    """Rollback selection to the same-revision candidate after failed rework."""
+    if not _candidate_deterministically_valid(ctx, original_candidate_id):
+        return STATUS_INCOMPLETE
+    outcome.plan_artifact_id = original_candidate_id
+    outcome.review_repair_preserved = True
+    from travel_agent.orchestration.multi_agent.trace import current_trace
+
+    trace = current_trace()
+    if trace is not None:
+        trace.append(
+            "candidate_preservation",
+            agent="finalizer",
+            status=STATUS_COMPLETED_WITH_WARNINGS,
+            detail={
+                "artifact_id": original_candidate_id,
+                "reason": reason,
+                "same_revision_preserved": True,
+            },
+        )
+    return STATUS_COMPLETED_WITH_WARNINGS
+
+
+def _candidate_quality_worse(
+    ctx: Any,
+    repaired_id: str | None,
+    original_id: str | None,
+) -> bool:
+    if not _candidate_deterministically_valid(ctx, repaired_id):
+        return True
+    if not original_id or not repaired_id:
+        return False
+    original = ctx.store.get(original_id) or {}
+    repaired = ctx.store.get(repaired_id) or {}
+
+    def issue_score(payload: dict[str, Any]) -> tuple[int, int]:
+        validation_issues = len((payload.get("validation_result") or {}).get("issues") or [])
+        critic_issues = len((payload.get("critic") or {}).get("issues") or [])
+        return validation_issues, critic_issues
+
+    return issue_score(repaired) > issue_score(original)
+
+
+def _unresolved_review_repairs(
+    ctx: Any,
+    review: ReviewResult,
+    parent: dict[str, Any],
+    repaired: dict[str, Any],
+) -> list[str]:
+    """Verify recoverable Reviewer requests from artifact deltas, not prose.
+
+    Deterministic hard gates still run separately.  This check only proves that
+    the targeted repair made a relevant, measurable change before the new
+    candidate can replace its parent atomically.
+    """
+    unresolved: list[str] = []
+    for issue in review.issues:
+        if issue.severity != SEVERITY_RECOVERABLE and not _is_critical_route_issue(issue):
+            continue
+        if not _review_issue_repair_resolved(
+            ctx, str(issue.issue_type or ""), parent, repaired
+        ):
+            unresolved.append(issue.description or issue.issue_type)
+    return unresolved
+
+
+_REPAIRABLE_CRITICAL_ROUTE_CODES = frozenset({
+    "return_route_missing",
+    "return_route_evidence_insufficient",
+})
+
+
+def _repair_route_pairs_for_plan(plan: dict[str, Any]) -> list[list[str]]:
+    """Bind repair evidence for exact anchors and legal tail-trim fallbacks.
+
+    A return-deadline closure may remove a late optional final stop.  Include
+    every stop on the last scheduled day against the same return endpoint so
+    the next actual terminal is not left with stale or missing evidence.
+    """
+    anchors = plan.get("required_route_anchors") or {}
+    return_leg = anchors.get("last_stop_to_return_location") or {}
+    legs = [
+        return_leg,
+        anchors.get("fixed_event_transfer"),
+        *(anchors.get("legs") or []),
+    ]
+    pairs: list[list[str]] = []
+
+    def add(origin: Any, destination: Any) -> None:
+        origin_id = str(origin or "").strip()
+        destination_id = str(destination or "").strip()
+        pair = [origin_id, destination_id]
+        if (
+            origin_id
+            and destination_id
+            and origin_id != destination_id
+            and pair not in pairs
+        ):
+            pairs.append(pair)
+
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        add(
+            leg.get("origin_poi_id"),
+            leg.get("destination_poi_id") or leg.get("event_poi_id"),
+        )
+
+    return_id = str(return_leg.get("destination_poi_id") or "").strip()
+    scheduled_days = [
+        day
+        for day in (plan.get("itinerary") or {}).get("days") or []
+        if isinstance(day, dict) and day.get("stops")
+    ]
+    if return_id and scheduled_days:
+        for stop in reversed(scheduled_days[-1].get("stops") or []):
+            if isinstance(stop, dict):
+                add((stop.get("poi") or {}).get("poi_id"), return_id)
+    return pairs[:8]
+
+
+def _is_critical_route_issue(issue: Any) -> bool:
+    kind = str(getattr(issue, "issue_type", "") or "").strip().lower()
+    return bool(
+        getattr(issue, "severity", "") == "critical"
+        and getattr(issue, "repair_target", "") in {"transport", "planner"}
+        and getattr(issue, "repair_instruction", "")
+        and any(token in kind for token in ("return_route", "return", "deadline"))
+    )
+
+
+def _repairable_critical_route_targets(
+    review: ReviewResult,
+    plan: dict[str, Any],
+) -> list[str]:
+    """Allow one exact-endpoint Transport retry for a proven return gap only."""
+    critical = list(review.critical_issues())
+    if not critical or not all(_is_critical_route_issue(issue) for issue in critical):
+        return []
+    error_codes = {
+        str(item.get("code") or "")
+        for section in (plan.get("validation_result") or {}, plan.get("critic") or {})
+        for item in section.get("issues") or []
+        if isinstance(item, dict)
+        and str(item.get("severity") or "error").lower() in {"error", "critical"}
+        and str(item.get("code") or "")
+    }
+    if not error_codes or not error_codes.issubset(_REPAIRABLE_CRITICAL_ROUTE_CODES):
+        return []
+    anchor = (plan.get("required_route_anchors") or {}).get(
+        "last_stop_to_return_location"
+    ) or {}
+    if not (
+        anchor.get("origin_poi_id")
+        and anchor.get("destination_poi_id")
+        and str(anchor.get("evidence_status") or "") != "provider_verified"
+    ):
+        return []
+    return ["transport"]
+
+
+def _review_issue_repair_resolved(
+    ctx: Any,
+    issue_type: str,
+    parent: dict[str, Any],
+    repaired: dict[str, Any],
+) -> bool:
+    kind = issue_type.strip().lower()
+    parent_itinerary = parent.get("itinerary") or {}
+    repaired_itinerary = repaired.get("itinerary") or {}
+
+    if any(token in kind for token in ("transport", "route", "walking")):
+        return _route_repair_score(repaired) > _route_repair_score(parent)
+
+    if "return" in kind or "deadline" in kind:
+        return _return_repair_score(repaired) > _return_repair_score(parent)
+
+    if "lodging" in kind or "hotel" in kind:
+        return _lodging_repair_score(repaired) > _lodging_repair_score(parent)
+
+    if "budget" in kind:
+        return _budget_repair_score(repaired) > _budget_repair_score(parent)
+
+    if any(token in kind for token in ("accessibility", "mobility", "elderly")):
+        return _accessibility_repair_score(repaired) > _accessibility_repair_score(parent)
+
+    if "must_visit" in kind:
+        from travel_agent.plan_invariants import validate_plan_artifact
+
+        validation = validate_plan_artifact(repaired, ctx.profile)
+        return validation.get("passed") is True and not any(
+            "must_visit" in str(item.get("code") or "")
+            for item in validation.get("issues") or []
+            if isinstance(item, dict)
+        )
+
+    if any(token in kind for token in ("interest", "category", "activity_sparsity")):
+        return _activity_repair_score(repaired_itinerary) > _activity_repair_score(
+            parent_itinerary
+        )
+
+    if any(token in kind for token in ("schedule", "pace", "meal")):
+        return _schedule_signature(repaired_itinerary) != _schedule_signature(
+            parent_itinerary
+        )
+
+    return repaired_itinerary != parent_itinerary
+
+
+def _iter_plan_routes(payload: dict[str, Any]):
+    for day in (payload.get("itinerary") or {}).get("days") or []:
+        for stop in day.get("stops") or []:
+            route = stop.get("route_from_previous")
+            if isinstance(route, dict) and route:
+                yield route
+    anchors = payload.get("required_route_anchors") or {}
+    for leg in anchors.get("legs") or []:
+        if not isinstance(leg, dict):
+            continue
+        if isinstance(leg.get("route"), dict):
+            yield leg["route"]
+        for route in leg.get("routes") or []:
+            if isinstance(route, dict):
+                yield route
+
+
+def _route_repair_score(payload: dict[str, Any]) -> tuple[int, int, int]:
+    routes = list(_iter_plan_routes(payload))
+    provider = sum(
+        str(route.get("evidence_status") or "") == "provider_verified"
+        or str(route.get("source") or "").lower() in {"amap", "provider"}
+        for route in routes
+    )
+    walk_known = sum(route.get("walking_distance_km") is not None for route in routes)
+    return provider, walk_known, len(routes)
+
+
+def _return_repair_score(payload: dict[str, Any]) -> tuple[int, int]:
+    plan = payload.get("return_plan") or {}
+    segment = plan.get("intercity_segment") or {}
+    verified = int(
+        str(plan.get("status") or "").lower() in {"verified", "provider_verified"}
+        or str(segment.get("status") or "").lower() == "verified_route"
+    )
+    evidence = int(bool(segment.get("route_evidence") or plan.get("route_evidence")))
+    return verified, evidence
+
+
+def _lodging_repair_score(payload: dict[str, Any]) -> tuple[int, float]:
+    plan = payload.get("lodging_plan") or {}
+    status = str(plan.get("status") or "").lower()
+    verified = int(status not in {"", "evidence_unavailable", "unavailable", "missing"})
+    anchors = payload.get("lodging_route_anchors") or {}
+    distance = anchors.get("average_outbound_distance_km")
+    proximity = -float(distance) if distance is not None else float("-inf")
+    return verified, proximity
+
+
+def _budget_repair_score(payload: dict[str, Any]) -> tuple[int, float]:
+    plan = payload.get("budget_plan") or {}
+    within = int(plan.get("within_user_limit") is True)
+    total = plan.get("expected_total")
+    affordability = -float(total) if total is not None else float("-inf")
+    return within, affordability
+
+
+def _accessibility_repair_score(payload: dict[str, Any]) -> tuple[int, int]:
+    verification = payload.get("candidate_verification") or {}
+    mobility = payload.get("mobility_plan") or {}
+    text = json.dumps([verification, mobility], ensure_ascii=False).lower()
+    evidence_terms = sum(
+        text.count(token)
+        for token in ("verified", "wheelchair", "accessible", "无障碍", "电梯")
+    )
+    unknown_terms = text.count("unknown") + text.count("unavailable")
+    return evidence_terms, -unknown_terms
+
+
+def _activity_repair_score(itinerary: dict[str, Any]) -> tuple[int, int]:
+    stops = [
+        stop
+        for day in itinerary.get("days") or []
+        for stop in day.get("stops") or []
+        if isinstance(stop, dict)
+    ]
+    categories = {
+        str((stop.get("poi") or {}).get("category") or "").strip().lower()
+        for stop in stops
+        if str((stop.get("poi") or {}).get("category") or "").strip()
+    }
+    return len(stops), len(categories)
+
+
+def _schedule_signature(itinerary: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        (
+            day.get("day_index"),
+            tuple(
+                (
+                    (stop.get("poi") or {}).get("poi_id"),
+                    stop.get("start_time"),
+                    stop.get("duration_min"),
+                )
+                for stop in day.get("stops") or []
+                if isinstance(stop, dict)
+            ),
+        )
+        for day in itinerary.get("days") or []
+        if isinstance(day, dict)
+    )
+
+
 # --- 辅助 ------------------------------------------------------------------- #
+
+
+def _run_candidate_comparison_base(
+    ctx: Any,
+    runner: Any,
+    deadline: Any,
+    request_id: str,
+    task_brief: str,
+    base_inputs: dict[str, Any],
+    allowed_agents: set[str],
+    *,
+    trace: Any,
+    routing_policy_hash: str,
+) -> DynamicBaseOutcome:
+    """Execute the deterministic evidence contract for candidate comparison.
+
+    Candidate and dimension extraction is already complete before this point.
+    A model Router may not declare the turn ready without evidence, so this
+    specialized production path dispatches only the workers required by the
+    declared dimensions.  Planner is structurally absent.
+    """
+    from travel_agent.candidate_comparison import (
+        collect_comparison_evidence,
+        comparison_candidates,
+        comparison_dimensions,
+    )
+
+    state = dict((base_inputs.get("profile") or {}).get("constraint_state") or {})
+    # Accessibility is relative to a target. Normalize the common local-area
+    # wording before dispatch as well as during materialization, otherwise the
+    # evidence gate can retain a stale unanchored limitation after route
+    # evidence has already covered every candidate.
+    if not state.get("target_anchor") and (
+        state.get("walking_time_max_min") is not None
+        or state.get("location_anchor")
+    ):
+        state["target_anchor"] = state.get("location_anchor") or state.get("location")
+        profile_inputs = dict(base_inputs.get("profile") or {})
+        profile_inputs["constraint_state"] = state
+        base_inputs = {**base_inputs, "profile": profile_inputs}
+    candidates = comparison_candidates(state)
+    dimensions = comparison_dimensions(state)
+    ordered_agents = [
+        agent
+        for agent in ("attraction", "hotel", "restaurant", "transport")
+        if agent in allowed_agents
+    ]
+    results: list[SubagentResult] = []
+    # Recommendation requests such as "find restaurants near X" discover
+    # their candidates from a worker rather than declaring names up front.
+    # Run exactly one bounded discovery worker first, then bind route/cost
+    # evidence to the discovered entities in the normal candidate matrix.
+    if not candidates:
+        discovery_agent = next(
+            (
+                agent
+                for agent in ("restaurant", "hotel", "attraction")
+                if agent in ordered_agents
+            ),
+            None,
+        )
+        if discovery_agent is not None:
+            timeout = deadline.effective_preplanner_timeout(
+                _component_timeout(discovery_agent)
+            )
+            if timeout > 0:
+                discovery_task = SubagentTask(
+                    request_id=request_id,
+                    task_id=new_task_id(discovery_agent),
+                    agent=discovery_agent,
+                    instruction=(
+                        "发现满足当前地点、预算、场景和硬约束的候选；"
+                        "必须使用本领域真实工具并返回结构化 artifact。"
+                    ),
+                    inputs=dict(base_inputs),
+                )
+                discovery = _run_with_optional_timeout(
+                    runner, discovery_task, timeout
+                )
+                results.append(discovery)
+                records: list[tuple[str, str, dict[str, Any]]] = []
+                for item in discovery.evidence:
+                    artifact_id = str(item.get("artifact_id") or "")
+                    record = ctx.store.get_record(artifact_id) or {}
+                    payload = record.get("payload")
+                    if artifact_id and isinstance(payload, dict):
+                        records.append(
+                            (artifact_id, str(record.get("kind") or ""), payload)
+                        )
+                candidates = _discovered_candidate_names(records, state)
+                if state.get("top_n") is not None:
+                    try:
+                        candidates = candidates[: max(1, int(state["top_n"]))]
+                    except (TypeError, ValueError):
+                        pass
+                if candidates:
+                    state["comparison_candidates"] = candidates
+                    profile_inputs = dict(base_inputs.get("profile") or {})
+                    profile_inputs["constraint_state"] = state
+                    base_inputs = {**base_inputs, "profile": profile_inputs}
+    # One bounded task owns one candidate and one worker-specific set of
+    # dimensions.  After every result, recompute the shared coverage matrix
+    # and skip any cell already covered by grounded evidence, regardless of
+    # which eligible evidence worker produced it.
+    dimension_owner: dict[str, str] = {}
+    for dimension in dimensions:
+        preferred = (
+            ("transport", "attraction", "hotel", "restaurant")
+            if dimension in {"accessibility", "accessibility_needs"}
+            else ("hotel", "restaurant", "attraction", "transport")
+            if dimension == "cost"
+            else ("attraction", "hotel", "restaurant", "transport")
+        )
+        owner = next((agent for agent in preferred if agent in ordered_agents), None)
+        if owner:
+            dimension_owner[dimension] = owner
+    dimensions_by_agent = {
+        agent: [dimension for dimension in dimensions if dimension_owner.get(dimension) == agent]
+        for agent in ordered_agents
+    }
+    max_tasks = max(1, min(16, len(candidates) * max(1, len(ordered_agents))))
+    dispatched = len(results)
+    # Non-transport workers run first so endpoint/area artifacts can be bound
+    # into the transport task when a fixed anchor comparison needs routes.
+    stages = [
+        [agent for agent in ordered_agents if agent != "transport"],
+        ["transport"] if "transport" in ordered_agents else [],
+    ]
+    for stage_index, agents in enumerate(stages, start=1):
+        if not agents:
+            continue
+        for agent in agents:
+            owned_dimensions = dimensions_by_agent.get(agent) or []
+            if not owned_dimensions:
+                continue
+            for candidate_index, candidate in enumerate(candidates):
+                current = collect_comparison_evidence(
+                    ctx.store, results, state, request_id=request_id
+                )
+                covered_cells = {
+                    (item["candidate"], item["dimension"])
+                    for item in current.evidence
+                }
+                missing_dimensions = [
+                    dimension
+                    for dimension in owned_dimensions
+                    if (candidate, dimension) not in covered_cells
+                ]
+                if not missing_dimensions:
+                    continue
+                if dispatched >= max_tasks:
+                    break
+                timeout = deadline.effective_preplanner_timeout(_component_timeout(agent))
+                if timeout <= 0:
+                    break
+                inputs = dict(base_inputs)
+                artifact_ids = list(dict.fromkeys(
+                    [str(value) for value in (inputs.get("artifact_ids") or []) if value]
+                    + _all_evidence_ids(results)
+                ))
+                if artifact_ids:
+                    inputs["artifact_ids"] = artifact_ids
+                inputs["comparison_candidate"] = candidate
+                inputs["comparison_dimensions"] = missing_dimensions
+                inputs["comparison_finalize_routes"] = not any(
+                    (later_candidate, dimension) not in covered_cells
+                    for later_candidate in candidates[candidate_index + 1:]
+                    for dimension in owned_dimensions
+                )
+                task = SubagentTask(
+                    request_id=request_id,
+                    task_id=new_task_id(agent),
+                    agent=agent,
+                    instruction=(
+                        f"为 Candidate Comparison 独立调研候选「{candidate}」；"
+                        f"只补缺失维度 {missing_dimensions}。每条证据必须来自本任务真实工具 artifact，"
+                        "并绑定到该候选；空结果、无关实体或模型文字不能算证据。"
+                        + (
+                            " 用户明确不需要具体酒店库存，不得推荐或检索具体酒店库存。"
+                            if state.get("no_live_inventory_required")
+                            else ""
+                        )
+                    ),
+                    inputs=inputs,
+                )
+                result = _run_with_optional_timeout(runner, task, timeout)
+                result.payload = dict(result.payload or {})
+                result.payload["comparison_scope"] = {
+                    "candidate": candidate,
+                    "dimensions": missing_dimensions,
+                }
+                results.append(result)
+                dispatched += 1
+                if trace is not None:
+                    trace.append(
+                        "comparison_dispatch",
+                        agent="engine",
+                        status="completed",
+                        attempt=stage_index,
+                        detail={
+                            "candidate": candidate,
+                            "dimensions": missing_dimensions,
+                            "agent": agent,
+                            "planner_dispatched": False,
+                            "result": {"agent": result.agent, "status": result.status},
+                            "dispatch_count": dispatched,
+                            "dispatch_limit": max_tasks,
+                        },
+                    )
+            if dispatched >= max_tasks:
+                break
+
+    missing, _soft = _required_evidence(ctx, TaskType.CANDIDATE_COMPARISON, results, base_inputs)
+    reply = _materialize_lightweight_artifact(
+        ctx,
+        TaskType.CANDIDATE_COMPARISON,
+        results,
+        missing,
+        request_id=request_id,
+        effective_state=(base_inputs.get("profile") or {}).get("constraint_state"),
+    )
+    return DynamicBaseOutcome(
+        status=STATUS_COMPLETED if not missing else STATUS_INCOMPLETE,
+        reply=reply,
+        results=tuple(results),
+        routing_policy_hash=routing_policy_hash,
+    )
 
 
 def _component_timeout(agent: str) -> float:
@@ -1109,8 +2089,18 @@ def _all_evidence_ids(results: list[SubagentResult]) -> list[str]:
         dict.fromkeys(
             artifact_id
             for result in results
-            if result.status in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}
-            for artifact_id in _evidence_ids(result)
+            for item in result.evidence
+            if isinstance(item, dict)
+            and item.get("artifact_id")
+            and (
+                result.status in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}
+                # A deterministic budget artifact remains independently usable
+                # when the Transport worker later exhausts its route/search
+                # steps.  This does not promote that worker or any candidate;
+                # route readiness is still evaluated separately.
+                or str(item.get("kind") or "") == "budget"
+            )
+            for artifact_id in [str(item["artifact_id"])]
         )
     )
 
@@ -1145,6 +2135,87 @@ def _task_needs_plan(task_type: TaskType | None) -> bool:
     return task_type in REVIEW_REQUIRED_TASK_TYPES
 
 
+def _route_request_has_anchored_endpoints(base_inputs: dict[str, Any]) -> bool:
+    profile = base_inputs.get("profile") or {}
+    state = profile.get("constraint_state") or {}
+    origin = state.get("origin") or state.get("start_location")
+    destination = next(
+        (
+            state.get(key)
+            for key in (
+                "destination_name", "destination_area", "destination",
+                "return_location", "target_anchor", "location_anchor",
+            )
+            if state.get(key) not in (None, "", [], {})
+        ),
+        None,
+    )
+    return bool(origin and destination)
+
+
+def _full_itinerary_required_slots_ready(ctx, base_inputs: dict[str, Any]) -> bool:
+    """Ignore Router requests for optional preferences after slot gating passed."""
+    profile = dict(base_inputs.get("profile") or {})
+    state = dict(profile.get("constraint_state") or {})
+    destination = (
+        profile.get("destination")
+        or state.get("destination_city")
+        or state.get("destination")
+        or (state.get("destinations") or [None])[0]
+        or getattr(getattr(ctx, "profile", None), "destination", None)
+    )
+    days = (
+        profile.get("days")
+        or state.get("duration_days")
+        or getattr(getattr(ctx, "profile", None), "days", None)
+    )
+    try:
+        valid_days = int(days) > 0
+    except (TypeError, ValueError):
+        valid_days = False
+    return bool(destination and valid_days)
+
+
+def _missing_evidence_dispatches(
+    missing_hard: list[str],
+    *,
+    allowed_agents: set[str],
+    excluded_agents: set[str] | None = None,
+) -> list[tuple[str, list[str]]]:
+    """Map hard-evidence labels to bounded domain workers, never Planner."""
+    excluded = excluded_agents or set()
+    grouped: dict[str, list[str]] = {}
+    for label in missing_hard:
+        text = str(label)
+        if any(marker in text for marker in ("餐厅", "用餐", "饮食")):
+            agent = "restaurant"
+        elif any(marker in text for marker in ("住宿", "酒店")):
+            agent = "hotel"
+        elif any(
+            marker in text.casefold()
+            for marker in (
+                "路线",
+                "预算",
+                "步行",
+                "距离",
+                "可达",
+                "交通",
+                "accessibility",
+            )
+        ):
+            agent = "transport"
+        elif any(marker in text for marker in ("景点", "候选", "室内备选", "poi")):
+            agent = "attraction"
+        elif len(allowed_agents) == 1:
+            agent = next(iter(allowed_agents))
+        else:
+            continue
+        if agent not in allowed_agents or agent in excluded:
+            continue
+        grouped.setdefault(agent, []).append(text)
+    return [(agent, labels) for agent, labels in grouped.items()]
+
+
 def _required_evidence(
     ctx: Any,
     task_type: TaskType | None,
@@ -1154,7 +2225,6 @@ def _required_evidence(
     """Return deterministic (hard_missing, soft_missing) evidence labels."""
     kinds: set[str] = set()
     nonempty_kinds: set[str] = set()
-    restaurant_keys: set[str] = set()
 
     def register_record(record: dict[str, Any] | None) -> None:
         if not record or not record.get("kind"):
@@ -1162,25 +2232,28 @@ def _required_evidence(
         kind = str(record["kind"])
         kinds.add(kind)
         payload = record.get("payload") or {}
-        if kind in {"restaurants", "hotels"}:
-            collection = payload.get(kind) or payload.get("items")
+        if kind in {"candidates", "pois", "restaurants", "hotels"}:
+            collection = (
+                payload.get("pois")
+                if kind in {"candidates", "pois"}
+                else payload.get(kind)
+            ) or payload.get("items")
             if collection:
                 nonempty_kinds.add(kind)
-                if kind == "restaurants":
-                    for item in collection:
-                        if isinstance(item, dict):
-                            key = item.get("poi_id") or item.get("name")
-                            if key:
-                                restaurant_keys.add(str(key))
         else:
             nonempty_kinds.add(kind)
 
     for result in results:
-        if result.status not in {STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS}:
-            continue
         for item in result.evidence:
             if isinstance(item, dict) and item.get("kind"):
                 kind = str(item["kind"])
+                if (
+                    result.status not in {
+                        STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS,
+                    }
+                    and kind != "budget"
+                ):
+                    continue
                 record = ctx.store.get_record(str(item.get("artifact_id") or ""))
                 if record is not None:
                     register_record(record)
@@ -1198,7 +2271,11 @@ def _required_evidence(
         nonempty_kinds.add("candidates")
 
     # 当前用户已经明确提出的结构化约束
-    state = dict(getattr(getattr(ctx, "profile", None), "constraint_state", {}) or {})
+    state = dict(
+        (base_inputs.get("profile") or {}).get("constraint_state")
+        or getattr(getattr(ctx, "profile", None), "constraint_state", {})
+        or {}
+    )
     hard: list[str] = []
     soft: list[str] = []
 
@@ -1209,18 +2286,21 @@ def _required_evidence(
         if label not in target:
             target.append(label)
 
-    if task_type == TaskType.FULL_TRIP_PLAN:
+    if task_type == TaskType.FULL_ITINERARY:
         require("candidates", "景点候选")
         require("routes", "路线可行性")
         hotel_explicit = bool(
-            getattr(getattr(ctx, "profile", None), "hotel_area", None)
-            or any(
+            re.search(
+                r"(?:酒店|住宿).{0,8}(?:降档|经济|便宜|省预算)",
+                str(base_inputs.get("task_brief") or "").lower(),
+            )
+            or
+            any(
                 state.get(key) not in (None, "", [], {})
                 for key in (
-                    "lodging_area",
                     "compare_lodging_areas",
                     "hotel_budget_per_night_cny",
-                    "prepaid_lodging_cny",
+                    "lodging_area",
                 )
             )
         )
@@ -1239,41 +2319,56 @@ def _required_evidence(
             )
         )
         require("budget", "预算证据", hard_required=budget_explicit)
-        raw_dietary = state.get("dietary") or []
-        food_explicit = bool(
-            getattr(getattr(ctx, "profile", None), "food_preference", None)
-            or raw_dietary
-            or "food" in (getattr(getattr(ctx, "profile", None), "interests", None) or [])
+        from travel_agent.orchestration.multi_agent.dispatch_rules import (
+            specific_restaurant_recommendation_requested,
         )
-        # A missing meal is a completeness warning for a generic itinerary,
-        # but only explicit cuisine/dietary requirements justify blocking the
-        # planner. This keeps evidence strict without turning provider sparsity
-        # into a total delivery failure.
-        require("restaurants", "餐饮证据", hard_required=food_explicit)
-        required_meals = max(1, int(getattr(getattr(ctx, "profile", None), "days", 1) or 1))
-        if len(restaurant_keys) < required_meals:
-            target = hard if food_explicit else soft
-            if "餐饮证据" not in target:
-                target.append("餐饮证据")
-    elif task_type == TaskType.ITINERARY_REVISION:
+
+        profile_payload = dict(base_inputs.get("profile") or {})
+        food_explicit = specific_restaurant_recommendation_requested(
+            str(base_inputs.get("task_brief") or ""), profile_payload, state
+        )
+        if food_explicit:
+            require("restaurants", "具体餐厅证据")
+    elif task_type == TaskType.ITINERARY_PATCH:
         require("itinerary", "既有行程")
-    elif task_type == TaskType.ROUTE_QUERY:
+    elif task_type == TaskType.LOCAL_ADJUSTMENT_ADVICE:
+        if state.get("date_start") or state.get("resolved_date") or state.get("weather_condition"):
+            require("weather", "天气")
+        if state.get("need_indoor_backup"):
+            require("candidates", "室内备选")
+    elif task_type == TaskType.ROUTE_PLAN:
         require("routes", "路线耗时/距离")
-    elif task_type == TaskType.POI_ADVICE:
-        if not kinds.intersection({"candidates", "restaurants", "hotels"}):
-            hard.append("候选地点")
-        if state.get("walking_time_max_min") is not None:
-            require("routes", "步行时间")
-        elif state.get("location"):
-            require("routes", "与指定位置的距离")
-        extra = _lightweight_missing_payload_fields(results, ctx.profile)
-        for label in extra:
-            if label not in hard:
-                hard.append(label)
-    elif task_type == TaskType.DAY_ADVICE:
-        require("weather", "天气")
-        require("candidates", "活动候选")
-    elif task_type is None or task_type == TaskType.UNKNOWN:
+    elif task_type == TaskType.CANDIDATE_COMPARISON:
+        from travel_agent.candidate_comparison import (
+            collect_comparison_evidence,
+            comparison_candidates,
+            comparison_hard_missing,
+        )
+
+        if comparison_candidates(state):
+            current_request_id = next(
+                (str(result.request_id) for result in results if result.request_id),
+                None,
+            )
+            comparison = collect_comparison_evidence(
+                ctx.store,
+                results,
+                state,
+                request_id=current_request_id,
+            )
+            hard.extend(comparison_hard_missing(state, comparison))
+        else:
+            if not nonempty_kinds.intersection({"candidates", "restaurants", "hotels"}):
+                hard.append("候选地点")
+            if state.get("walking_time_max_min") is not None:
+                require("routes", "步行时间")
+            elif state.get("location"):
+                require("routes", "与指定位置的距离")
+            extra = _lightweight_missing_payload_fields(results, ctx.profile)
+            for label in extra:
+                if label not in hard:
+                    hard.append(label)
+    elif task_type is None or task_type == TaskType.CLARIFICATION:
         hard.append("可识别的任务目标")
     return hard, soft
 
@@ -1343,7 +2438,9 @@ def _planner_delivery_status(
         return STATUS_INCOMPLETE
     from travel_agent.agent.toolkit import _validate_plan_gate
 
-    gate_error, record = _validate_plan_gate(ctx, plan_artifact_id)
+    gate_error, record = _validate_plan_gate(
+        ctx, plan_artifact_id, allow_candidate=True
+    )
     payload = (record or {}).get("payload") or {}
     critic = payload.get("critic") or {}
     critical_issues = [
@@ -1391,11 +2488,41 @@ def _evidence_ids(result: SubagentResult) -> list[str]:
     return ids
 
 
-def _plan_required_for_turn(dispatch: str, task_type: TaskType | None) -> bool:
-    """完整规划/修改必须有 Planner；动态未知任务也按 fail-closed 处理。"""
-    if task_type in {TaskType.ROUTE_QUERY, TaskType.POI_ADVICE, TaskType.DAY_ADVICE}:
-        return False
-    return task_type in REVIEW_REQUIRED_TASK_TYPES or dispatch == "dynamic"
+def _delivery_intent_from_inputs(
+    turn_inputs: dict[str, Any] | None,
+    task_type: TaskType | None,
+) -> DeliveryIntent:
+    raw = (turn_inputs or {}).get("delivery_intent")
+    try:
+        return raw if isinstance(raw, DeliveryIntent) else DeliveryIntent(str(raw))
+    except ValueError:
+        return (
+            DeliveryIntent.REBUILD_NOW
+            if task_type == TaskType.FULL_ITINERARY
+            else DeliveryIntent.LOCAL_PATCH
+            if task_type == TaskType.ITINERARY_PATCH
+            else DeliveryIntent.LIGHTWEIGHT_ADVICE
+        )
+
+
+def _plan_required_for_turn(
+    dispatch: str,
+    task_type: TaskType | None,
+    delivery_intent: DeliveryIntent | str | None = None,
+) -> bool:
+    """Planner admission is a delivery decision; task type is compatibility fallback."""
+    del dispatch
+    if delivery_intent is not None:
+        try:
+            intent = (
+                delivery_intent
+                if isinstance(delivery_intent, DeliveryIntent)
+                else DeliveryIntent(str(delivery_intent))
+            )
+            return intent == DeliveryIntent.REBUILD_NOW
+        except ValueError:
+            pass
+    return task_type == TaskType.FULL_ITINERARY
 
 
 def _lightweight_missing_payload_fields(
@@ -1433,6 +2560,355 @@ def _results_have_field(results: list[SubagentResult], keys: set[str]) -> bool:
         return False
 
     return any(has(result.payload) for result in results)
+
+
+def _discovered_candidate_names(
+    records: list[tuple[str, str, dict[str, Any]]],
+    state: dict[str, Any],
+) -> list[str]:
+    """Promote grounded retrieval rows into a bounded candidate set.
+
+    Discovery requests intentionally have no names before tool execution.
+    Candidate identity therefore comes only from current-turn artifacts.  The
+    selector performs entity-level deduplication and, when requested, spreads
+    picks across semantic categories before filling remaining slots.
+    """
+    rows: list[dict[str, Any]] = []
+    restaurant_request = bool(state.get("specific_restaurant_recommendation"))
+    for _artifact_id, kind, payload in records:
+        if restaurant_request and kind != "restaurants":
+            continue
+        if not restaurant_request and kind not in {"candidates", "pois", "hotels"}:
+            continue
+        keys = (
+            ("restaurants", "items")
+            if kind == "restaurants"
+            else ("hotels", "items")
+            if kind == "hotels"
+            else ("pois", "items")
+        )
+        for key in keys:
+            for item in payload.get(key) or []:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("canonical_name") or item.get("name") or "").strip()
+                if not name:
+                    continue
+                verification = str(item.get("verification_status") or "verified")
+                if verification not in {"", "verified"}:
+                    continue
+                rows.append({**item, "_candidate_name": name})
+
+    def identity(item: dict[str, Any]) -> str:
+        parent = item.get("parent_poi_id") or item.get("parent_canonical_name")
+        if parent:
+            return "parent:" + str(parent).strip().casefold()
+        value = str(item.get("_candidate_name") or "").casefold()
+        value = re.sub(r"[\s\-—–_·•:：,，。/\\()（）\[\]【】]+", "", value)
+        value = re.sub(
+            r"(?:[东南西北上下内外\dA-Za-z一二三四五六七八九十]+号?)?(?:门|入口|出口)$",
+            "",
+            value,
+        )
+        return value
+
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in rows:
+        key = identity(item)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+
+    try:
+        requested = int(state.get("top_n") or 0)
+    except (TypeError, ValueError):
+        requested = 0
+    limit = max(1, min(8, requested or 5))
+
+    def semantic_bucket(item: dict[str, Any]) -> str:
+        text = " ".join(
+            str(value or "")
+            for value in (
+                item.get("entity_type"),
+                item.get("category"),
+                item.get("_candidate_name"),
+                " ".join(str(tag) for tag in item.get("tags") or []),
+            )
+        ).casefold()
+        patterns = (
+            ("museum", r"museum|博物馆|展览|美术馆|科技馆"),
+            ("park", r"park|公园|绿地|植物园|动物园"),
+            ("historic", r"historic|历史街区|古镇|古城|遗址|寺|祠"),
+            ("nature", r"nature|自然|山|湖|湿地|海滩|森林"),
+            ("retail", r"shopping|retail|商场|购物"),
+            ("food", r"food|restaurant|餐厅|饭店|咖啡"),
+        )
+        return next((label for label, pattern in patterns if re.search(pattern, text)), text.split(" ", 1)[0])
+
+    if not state.get("diversity_required"):
+        selected = unique[:limit]
+    else:
+        selected = []
+        deferred: list[dict[str, Any]] = []
+        buckets: set[str] = set()
+        for item in unique:
+            bucket = semantic_bucket(item)
+            if bucket and bucket not in buckets:
+                selected.append(item)
+                buckets.add(bucket)
+            else:
+                deferred.append(item)
+            if len(selected) >= limit:
+                break
+        if len(selected) < limit:
+            selected.extend(deferred[: limit - len(selected)])
+    return [str(item["_candidate_name"]) for item in selected]
+
+
+def _materialize_lightweight_artifact(
+    ctx: Any,
+    task_type: TaskType | None,
+    results: list[SubagentResult],
+    missing: list[str],
+    *,
+    request_id: str,
+    existing_plan_artifact_id: str | None = None,
+    effective_state: dict[str, Any] | None = None,
+) -> str:
+    """Build the requested non-itinerary deliverable from bound evidence."""
+    records: list[tuple[str, str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for result in results:
+        for item in result.evidence:
+            artifact_id = str(item.get("artifact_id") or "") if isinstance(item, dict) else ""
+            if not artifact_id or artifact_id in seen:
+                continue
+            record = ctx.store.get_record(artifact_id) or {}
+            payload = record.get("payload")
+            if isinstance(payload, dict):
+                records.append((artifact_id, str(record.get("kind") or item.get("kind") or ""), payload))
+                seen.add(artifact_id)
+
+    state = dict(
+        effective_state
+        or getattr(ctx.profile, "constraint_state", {})
+        or {}
+    )
+    evidence = [
+        {"artifact_id": artifact_id, "kind": kind}
+        for artifact_id, kind, _payload in records
+    ]
+    limitations = list(dict.fromkeys(str(item) for item in missing if item))
+
+    if task_type == TaskType.CANDIDATE_COMPARISON:
+        from travel_agent.candidate_comparison import (
+            accessibility_contract,
+            accessibility_mode,
+            collect_comparison_evidence,
+            comparison_candidates,
+            comparison_core_dimensions,
+            comparison_dimensions,
+            supported_recommendation,
+        )
+
+        names = comparison_candidates(state) or _discovered_candidate_names(records, state)
+        comparison_state = dict(state)
+        if names and not comparison_candidates(comparison_state):
+            comparison_state["comparison_candidates"] = names
+        if not comparison_state.get("target_anchor") and (
+            comparison_state.get("walking_time_max_min") is not None
+            or comparison_state.get("location_anchor")
+        ):
+            comparison_state["target_anchor"] = (
+                comparison_state.get("location_anchor")
+                or comparison_state.get("location")
+            )
+        target = str(comparison_state.get("target_anchor") or "").strip()
+        dimensions = comparison_dimensions(comparison_state)
+        core_dimensions = comparison_core_dimensions(comparison_state)
+        comparison = collect_comparison_evidence(
+            ctx.store,
+            results,
+            comparison_state,
+            request_id=request_id,
+        )
+        covered_cells = comparison.covered_cells()
+        limitations.extend(item for item in comparison.missing if item not in limitations)
+        recommendation = supported_recommendation(
+            names,
+            dimensions,
+            comparison,
+            core_dimensions=core_dimensions,
+        )
+        accessibility = accessibility_contract(
+            names,
+            comparison,
+            target_anchor=target,
+        )
+        if (
+            "accessibility_needs" in dimensions
+            and "accessibility_needs" not in comparison.complete_dimensions(names, dimensions)
+        ):
+            limitations.append(
+                "accessibility_needs 未覆盖全部候选，不据此声称适老或无障碍优势"
+            )
+        artifact = {
+            "artifact_type": "candidate_comparison",
+            "subject": {
+                "destination_city": state.get("destination_city") or ctx.profile.destination,
+                "target_anchor": target or None,
+                "accessibility_mode": accessibility_mode(target),
+            },
+            "candidates": [{"name": name} for name in names],
+            "comparison_dimensions": dimensions,
+            "core_dimensions": core_dimensions,
+            "evidence": comparison.evidence,
+            "recommendation": recommendation,
+            "limitations": list(dict.fromkeys(limitations)),
+            "accessibility_contract": accessibility,
+            "coverage_matrix": {
+                name: {
+                    dimension: (name, dimension) in covered_cells
+                    for dimension in dimensions
+                }
+                for name in names
+            },
+            "coverage": {
+                "required": len(names) * len(dimensions),
+                "covered": len({
+                    (item["candidate"], item["dimension"])
+                    for item in comparison.evidence
+                }),
+                "complete": comparison.complete,
+            },
+        }
+        ctx.store.put("candidate_comparison", artifact, request_id=request_id, task_id="artifact", agent="engine")
+        return _render_specialized_artifact(artifact)
+
+    if task_type in {TaskType.ITINERARY_PATCH, TaskType.LOCAL_ADJUSTMENT_ADVICE}:
+        subject = state.get("conditional_activity") or (
+            f"第{state['referenced_day_index']}天" if state.get("referenced_day_index") else state.get("location_anchor")
+        )
+        candidate_names = [
+            str(item.get("name") or "").strip()
+            for _artifact_id, kind, payload in records
+            if kind in {"candidates", "restaurants", "hotels"}
+            for item in (
+                payload.get("pois") or payload.get("restaurants")
+                or payload.get("hotels") or payload.get("items") or []
+            )
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+            and (
+                not state.get("need_indoor_backup")
+                or _is_indoor_candidate(item)
+            )
+        ]
+        alternatives = [name for name in dict.fromkeys(candidate_names) if not _entity_matches(str(subject or ""), name)]
+        weather_payloads = [payload for _aid, kind, payload in records if kind == "weather"]
+        adverse = any(
+            re.search(r"雨|雪|暴|大风|高温", str(payload.get("condition") or ""))
+            for payload in weather_payloads
+        )
+        recommendation = (
+            "替换，并优先采用室内备选" if adverse and alternatives
+            else "保留，但出发前复核实时条件" if not adverse
+            else "条件不利，但尚无已核验备选"
+        )
+        if task_type == TaskType.LOCAL_ADJUSTMENT_ADVICE:
+            artifact = {
+                "artifact_type": "local_adjustment_advice",
+                "subject": subject,
+                "recommendation": recommendation,
+                "alternatives": alternatives[:5],
+                "evidence": evidence,
+                "limitations": list(dict.fromkeys(limitations)),
+                "apply_status": "advice_only_no_itinerary_modified",
+            }
+            ctx.store.put("local_adjustment_advice", artifact, request_id=request_id, task_id="artifact", agent="engine")
+            return _render_specialized_artifact(artifact)
+
+        plan = ctx.store.get(existing_plan_artifact_id) if existing_plan_artifact_id else None
+        itinerary = (plan or {}).get("itinerary") or {}
+        days = list(itinerary.get("days") or [])
+        day_index = int(state.get("referenced_day_index") or 0)
+        before = days[day_index - 1] if day_index and day_index <= len(days) else {"subject": subject}
+        after = dict(before) if isinstance(before, dict) else {"subject": subject}
+        after["local_adjustment"] = {
+            "recommendation": recommendation,
+            "replacement": alternatives[0] if adverse and alternatives else None,
+        }
+        artifact = {
+            "artifact_type": "itinerary_patch",
+            "subject": subject or "局部行程时段",
+            "before": before,
+            "after": after,
+            "affected_periods": [day_index if day_index else str(subject or "local_segment")],
+            "constraint_checks": [
+                {"constraint": "original_itinerary_present", "passed": bool(days)},
+                {"constraint": "scope_is_local", "passed": True},
+            ],
+            "evidence": evidence,
+            "limitations": list(dict.fromkeys(limitations)),
+            "apply_status": "proposed_patch",
+            "source_itinerary_artifact_id": existing_plan_artifact_id,
+        }
+        ctx.store.put("itinerary_patch", artifact, request_id=request_id, task_id="artifact", agent="engine")
+        return _render_specialized_artifact(artifact)
+
+    if task_type == TaskType.ROUTE_PLAN:
+        routes = [payload for _aid, kind, payload in records if kind == "routes"]
+        if routes:
+            route = routes[0]
+            artifact = {
+                "artifact_type": "route_plan",
+                "origin": route.get("origin_name") or route.get("origin_poi_id"),
+                "destination": route.get("destination_name") or route.get("destination_poi_id"),
+                "evidence": evidence,
+                "limitations": list(dict.fromkeys(limitations)),
+                "routes": routes,
+            }
+            ctx.store.put(
+                "route_plan",
+                artifact,
+                request_id=request_id,
+                task_id="artifact",
+                agent="engine",
+            )
+            return _render_specialized_artifact(artifact)
+    return _render_lightweight_evidence_reply(ctx, task_type, results, missing)
+
+
+def _is_indoor_candidate(item: dict[str, Any]) -> bool:
+    description = " ".join(str(value or "") for value in (
+        item.get("name"),
+        item.get("category"),
+        item.get("entity_type"),
+        " ".join(str(tag) for tag in item.get("tags") or []),
+    )).casefold()
+    return any(marker in description for marker in (
+        "museum", "gallery", "indoor", "aquarium",
+        "博物馆", "美术馆", "展览馆", "室内", "科技馆", "海洋馆",
+    ))
+
+
+def _entity_matches(expected: str, actual: str) -> bool:
+    left = _canonical_candidate_entity(expected)
+    right = _canonical_candidate_entity(actual)
+    return bool(left and right and (left in right or right in left))
+
+
+def _render_specialized_artifact(artifact: dict[str, Any]) -> str:
+    kind = str(artifact.get("artifact_type") or "artifact")
+    lines = [f"Artifact：{kind}", f"- subject：{artifact.get('subject')}"]
+    for field in (
+        "candidates", "comparison_dimensions", "before", "after", "affected_periods",
+        "constraint_checks", "recommendation", "alternatives", "evidence", "limitations", "apply_status",
+    ):
+        if field in artifact:
+            lines.append(f"- {field}：{artifact.get(field)}")
+    return "\n".join(lines)
 
 
 def _render_lightweight_evidence_reply(
@@ -1607,7 +3083,9 @@ def _fixed_turn_inputs(
     turn_inputs: dict[str, Any],
 ) -> dict[str, Any]:
     inputs = dict(turn_inputs)
-    if task_type == TaskType.ITINERARY_REVISION and existing_plan_artifact_id:
+    if task_type is not None:
+        inputs["task_type"] = task_type.value
+    if task_type == TaskType.ITINERARY_PATCH and existing_plan_artifact_id:
         ids = [str(item) for item in (inputs.get("artifact_ids") or []) if item]
         if existing_plan_artifact_id not in ids:
             ids.insert(0, existing_plan_artifact_id)
@@ -1642,6 +3120,32 @@ def _plan_artifact_id_from_results(
             ):
                 return artifact_id
     return None
+
+
+def _specialized_artifact_id_for_request(
+    ctx: Any,
+    task_type: TaskType | None,
+    request_id: str,
+) -> str | None:
+    """Return only a valid structured artifact produced for this exact request."""
+    kinds = {
+        TaskType.ROUTE_PLAN: "route_plan",
+        TaskType.CANDIDATE_COMPARISON: "candidate_comparison",
+        TaskType.LOCAL_ADJUSTMENT_ADVICE: "local_adjustment_advice",
+        TaskType.ITINERARY_PATCH: "itinerary_patch",
+    }
+    kind = kinds.get(task_type)
+    if kind is None:
+        return None
+    artifact_id = ctx.store.latest_id_for_request(request_id, kind)
+    if not artifact_id:
+        return None
+    payload = ctx.store.get(artifact_id)
+    from travel_agent.evaluation.artifact_contract import artifact_content_valid
+
+    if not isinstance(payload, dict) or not artifact_content_valid(kind, payload):
+        return None
+    return artifact_id
 
 
 def _repair_instructions_by_agent(review: ReviewResult) -> dict[str, str]:

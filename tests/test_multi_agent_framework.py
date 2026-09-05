@@ -177,20 +177,20 @@ def test_engine_default_is_production():
 def test_fixed_dispatch_map_covers_all_task_types_without_full_fallback():
     # 每个映射目标都是小集合，绝不允许“未识别任务统一回退 full_itinerary”
     assert resolve_task_batches(TaskType.ROUTE_QUERY) == (("transport",),)
-    assert resolve_task_batches(TaskType.DAY_ADVICE) == (("attraction",),)
+    assert resolve_task_batches(TaskType.DAY_ADVICE) == (("attraction",), ("transport",))
     assert resolve_task_batches(None) is None
     assert resolve_task_batches(TaskType.UNKNOWN) is None
     assert needs_clarification(None)
     assert needs_clarification(TaskType.UNKNOWN)
     full = resolve_task_batches(TaskType.FULL_TRIP_PLAN)
-    assert full == (("attraction", "hotel", "restaurant"), ("transport",), ("planner",))
+    assert full == (("attraction",), ("transport",), ("planner",))
 
 
 def test_build_fixed_tasks_expands_batches_with_dependencies():
     tasks = build_fixed_tasks("req_1", TaskType.FULL_TRIP_PLAN, task_brief="杭州两日游")
-    assert isinstance(tasks, list) and len(tasks) == 5
+    assert isinstance(tasks, list) and len(tasks) == 3
     first_batch = [task for task in tasks if not task.depends_on]
-    assert {task.agent for task in first_batch} == {"attraction", "hotel", "restaurant"}
+    assert {task.agent for task in first_batch} == {"attraction"}
     transport = next(task for task in tasks if task.agent == "transport")
     assert set(transport.depends_on) == {task.task_id for task in first_batch}
     planner = next(task for task in tasks if task.agent == "planner")
@@ -201,6 +201,30 @@ def test_build_fixed_tasks_expands_batches_with_dependencies():
 
 def test_build_fixed_tasks_unknown_type_returns_clarification_sentinel():
     assert build_fixed_tasks("req_1", None) == STATUS_CLARIFICATION_REQUIRED
+
+
+def test_fixed_dispatch_adds_hotel_and_restaurant_only_when_explicit() -> None:
+    tasks = build_fixed_tasks(
+        "req_explicit",
+        TaskType.FULL_ITINERARY,
+        task_brief="规划两日行程，并推荐酒店；全程只吃清真餐厅",
+        inputs={"profile": {"constraint_state": {"dietary": ["仅清真餐厅"]}}},
+    )
+    assert isinstance(tasks, list)
+    assert {task.agent for task in tasks} == {
+        "attraction", "hotel", "restaurant", "transport", "planner"
+    }
+
+
+def test_fixed_dispatch_respects_self_arranged_and_excluded_domains() -> None:
+    tasks = build_fixed_tasks(
+        "req_arranged",
+        TaskType.FULL_ITINERARY,
+        task_brief="酒店已经订好，用餐自行安排，不要推荐餐厅",
+        inputs={"profile": {"constraint_state": {"exclude": ["餐厅推荐"]}}},
+    )
+    assert isinstance(tasks, list)
+    assert {task.agent for task in tasks} == {"attraction", "transport", "planner"}
 
 
 def test_dispatch_map_only_uses_registered_subagents():
@@ -342,7 +366,12 @@ def test_delivery_status_rules_by_severity():
 
     critical = _review(
         "failed",
-        [{"issue_type": "budget", "severity": "critical", "description": "预算冲突"}],
+        [{
+            "issue_type": "budget",
+            "severity": "critical",
+            "description": "预算冲突",
+            "evidence": ["validation_result.issues[0]: budget_hard_limit_exceeded"],
+        }],
     )
     status, repair = resolve_delivery_status(
         critical, reviewer_enabled=True, max_rework=1, rework_used=0
@@ -355,8 +384,9 @@ def test_delivery_status_rules_by_severity():
             {
                 "issue_type": "pace",
                 "severity": "recoverable",
-                "description": "节奏",
-                "repair_target": "planner",
+                    "description": "节奏",
+                    "evidence": ["itinerary.day2"],
+                    "repair_target": "planner",
                 "repair_instruction": "降低行程强度",
             }
         ],
@@ -390,6 +420,7 @@ def test_repair_targets_ordered_with_planner_last():
                 "repair_instruction": "修复 a",
                 "issue_type": "a",
                 "description": "a issue",
+                "evidence": ["itinerary.day2"],
             },
             {
                 "severity": "recoverable",
@@ -397,12 +428,14 @@ def test_repair_targets_ordered_with_planner_last():
                 "repair_instruction": "修复 b",
                 "issue_type": "b",
                 "description": "b issue",
+                "evidence": ["return_deadline=21:30"],
             },
             {
                 "severity": "critical",
                 "repair_target": "hotel",
                 "issue_type": "c",
                 "description": "c issue",
+                "evidence": ["validation_result.issues[0]: critical"],
             },
         ],
     )
@@ -417,6 +450,7 @@ def test_reviewer_prompt_contains_context_and_no_tools():
     assert "不要求把酒店塞进 itinerary.days[].stops" in text
     assert "candidate_attractions 是待核验/比较的候选集合" in text
     assert "不要求每种方式都必须出现在最终路线" in text
+    assert "用户自有但未指定具体场所" in text
 
 
 def test_reviewer_downgrades_unsupported_candidate_omission():
@@ -448,6 +482,34 @@ def test_reviewer_downgrades_unsupported_candidate_omission():
     assert resolve_delivery_status(
         review, reviewer_enabled=True, max_rework=1, rework_used=0
     ) == ("completed_with_warnings", False)
+
+
+def test_reviewer_downgrades_explained_closed_candidate_substitution() -> None:
+    ctx = ReviewContext(
+        request_id="req_candidate_substitution",
+        plan={"critic": {"passed": True}, "validation_result": {"passed": True}},
+        profile_brief={
+            "must_visit": [],
+            "constraint_state": {"candidate_attractions": ["甲博物馆"]},
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "attraction_substitution",
+                "severity": "recoverable",
+                "description": "候选甲博物馆因闭馆被省略，替代为开放的乙公园。",
+                "evidence": ["candidate_verification.results[0].status='closed'"],
+                "repair_target": "planner",
+                "repair_instruction": "补充替代说明",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
 
 
 def test_reviewer_downgrades_inferred_weekday_and_preserved_fixed_event_claims():
@@ -514,12 +576,485 @@ def test_reviewer_does_not_treat_missing_meal_as_dietary_violation():
     assert review.issues[0].severity == "noncritical"
 
 
+def test_reviewer_downgrades_unverified_dietary_guess_when_plan_is_fail_closed():
+    ctx = ReviewContext(
+        request_id="req_dietary_uncertainty",
+        plan={
+            "meal_strategy": {
+                "dietary_constraints": ["不吃海鲜"],
+                "dietary_policy": {
+                    "mode": "confirm_or_replace",
+                    "requirements": ["不吃海鲜"],
+                    "instruction": "下单前确认；无法确认则更换。",
+                },
+            },
+            "critic": {"passed": True},
+            "validation_result": {"passed": True},
+        },
+        profile_brief={"constraint_state": {"dietary": ["不吃海鲜"]}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "dietary_compliance",
+                "severity": "recoverable",
+                "description": "候选是否包含海鲜未提供任何证据，需要确认。",
+                "evidence": ["meal_strategy.dietary_policy.mode=confirm_or_replace"],
+                "repair_target": "restaurant",
+                "repair_instruction": "替换餐厅",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_downgrades_self_contradictory_correct_lodging_gap():
+    ctx = ReviewContext(
+        request_id="req_correct_lodging",
+        plan={
+            "lodging_plan": {"nights": 1},
+            "critic": {"passed": True},
+            "validation_result": {"passed": True},
+        },
+        profile_brief={
+            "constraint_state": {
+                "date_start": "2026-10-17",
+                "date_end": "2026-10-18",
+                "lodging_area": "市中心",
+            },
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "lodging_plan_gap",
+                "severity": "recoverable",
+                "description": "两天行程住宿一晚，nights=1是正确的，但需要确认住宿日期。",
+                "evidence": ["lodging_plan.nights=1"],
+                "repair_target": "planner",
+                "repair_instruction": "确认日期",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_downgrades_soft_gap_and_unrequested_lodging_omission():
+    ctx = ReviewContext(
+        request_id="req_soft_quality",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True},
+        },
+        profile_brief={"constraint_state": {}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [
+                {
+                    "issue_type": "pace",
+                    "severity": "recoverable",
+                    "description": "There is a six-hour unaccounted gap in day 1.",
+                    "evidence": ["itinerary.day1"],
+                    "repair_target": "planner",
+                    "repair_instruction": "Fill the gap.",
+                },
+                {
+                    "issue_type": "lodging",
+                    "severity": "recoverable",
+                    "description": "No accommodation evidence was provided.",
+                    "evidence": ["lodging_plan: evidence_unavailable"],
+                    "repair_target": "hotel",
+                    "repair_instruction": "Find a hotel.",
+                },
+            ],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert {issue.severity for issue in review.issues} == {"noncritical"}
+
+
+def test_reviewer_keeps_lodging_gap_recoverable_when_area_is_explicit():
+    ctx = ReviewContext(
+        request_id="req_required_lodging",
+        plan={"lodging_plan": {"status": "evidence_unavailable"}},
+        profile_brief={"constraint_state": {"lodging_area": "湖畔区"}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "lodging",
+                "severity": "recoverable",
+                "description": "No accommodation evidence was provided.",
+                "evidence": ["lodging_plan: evidence_unavailable"],
+                "repair_target": "hotel",
+                "repair_instruction": "Find area evidence.",
+            }],
+        },
+    )
+
+    assert review.verdict == "rework"
+    assert review.issues[0].severity == "recoverable"
+
+
+def test_reviewer_downgrades_soft_route_limit_and_budget_risk_band():
+    ctx = ReviewContext(
+        request_id="req_soft_risk",
+        plan={
+            "critic": {"passed": True, "issues": [{"code": "route_too_long", "severity": "warning"}]},
+            "budget_plan": {
+                "expected_total": 5305,
+                "user_limit_cny": 6000,
+                "within_user_limit": True,
+                "risk_high_exceeds_limit": True,
+            },
+        },
+        profile_brief={"pace": "standard", "constraint_state": {}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [
+                {
+                    "issue_type": "schedule_feasibility",
+                    "severity": "recoverable",
+                    "description": "A route exceeds the standard pace suggested limit.",
+                    "evidence": ["critic.issues[0].code=route_too_long"],
+                    "repair_target": "planner",
+                    "repair_instruction": "Shorten it.",
+                },
+                {
+                    "issue_type": "budget_consistency",
+                    "severity": "recoverable",
+                    "description": "The high risk band exceeds the limit.",
+                    "evidence": ["budget_plan.risk_high_exceeds_limit=true"],
+                    "repair_target": "planner",
+                    "repair_instruction": "Reduce uncertainty.",
+                },
+            ],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert {issue.severity for issue in review.issues} == {"noncritical"}
+
+
+def test_reviewer_treats_unrequested_internal_accessibility_as_advisory():
+    ctx = ReviewContext(
+        request_id="req_bounded_mobility",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "mobility_plan": {
+                "required": True,
+                "status": "bounded_with_taxi_fallback",
+                "max_walking_km_per_day": 6.0,
+                "days": [{
+                    "day_index": 1,
+                    "known_walking_km": 0.0,
+                    "unknown_walking_legs": ["上一站→下一站"],
+                    "taxi_fallback_required": True,
+                }],
+            },
+        },
+        profile_brief={
+            "constraint_state": {
+                "elderly": True,
+                "max_walking_km_per_day": 6.0,
+            },
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [
+                {
+                    "issue_type": "elderly_accessibility",
+                    "severity": "recoverable",
+                    "description": "景区内部步行距离未知，无法确认是否超过老人每日限制。",
+                    "evidence": ["mobility_plan.days[0].known_walking_km=0.0"],
+                    "repair_target": "planner",
+                    "repair_instruction": "补充内部步行距离。",
+                },
+                {
+                    "issue_type": "route_evidence_gap",
+                    "severity": "recoverable",
+                    "description": "普通景点间路线证据缺失，仅有直线距离估算。",
+                    "evidence": ["itinerary.days[0].stops route_evidence 缺失"],
+                    "repair_target": "transport",
+                    "repair_instruction": "补充路线证据。",
+                },
+            ],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert any(
+        issue.issue_type == "elderly_accessibility" and issue.severity == "noncritical"
+        for issue in review.issues
+    )
+    assert any(
+        issue.issue_type == "route_evidence_gap" and issue.severity == "noncritical"
+        for issue in review.issues
+    )
+
+
+def test_reviewer_accepts_bounded_unknown_walking_legs_with_taxi_fallback() -> None:
+    ctx = ReviewContext(
+        request_id="req_bounded_walking",
+        plan={
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True},
+            "mobility_plan": {
+                "status": "bounded_with_taxi_fallback",
+                "max_walking_km_per_day": 6.0,
+                "days": [{
+                    "day_index": 1,
+                    "known_walking_km": 0.0,
+                    "unknown_walking_legs": ["上一站→下一站"],
+                    "taxi_fallback_required": True,
+                }],
+            },
+        },
+        profile_brief={
+            "constraint_state": {"elderly": True, "max_walking_km_per_day": 6.0},
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "walking_distance_evidence_gap",
+                "severity": "recoverable",
+                "description": "每日 known_walking_km 为 0，步行距离未知，无法确认。",
+                "evidence": ["mobility_plan.days[0].unknown_walking_legs"],
+                "repair_target": "transport",
+                "repair_instruction": "补充步行证据",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_keeps_internal_accessibility_gap_for_explicit_stair_avoidance():
+    ctx = ReviewContext(
+        request_id="req_explicit_stairs",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+        },
+        profile_brief={
+            "constraint_state": {"elderly": True, "avoid": ["长楼梯"]},
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "elderly_accessibility",
+                "severity": "recoverable",
+                "description": "景区内部台阶信息未知，不能证明符合长楼梯避让要求。",
+                "evidence": ["constraint_state.avoid: 长楼梯"],
+                "repair_target": "attraction",
+                "repair_instruction": "补充无台阶证据或替换候选。",
+            }],
+        },
+    )
+
+    assert review.verdict == "rework"
+    assert review.issues[0].severity == "recoverable"
+
+
+def test_reviewer_keeps_unknown_route_recoverable_for_hard_timed_event():
+    ctx = ReviewContext(
+        request_id="req_hard_timed_route",
+        plan={
+            "critic": {"passed": True, "issues": []},
+            "required_route_anchors": {
+                "fixed_event_transfer": {"evidence_status": "unavailable"},
+            },
+            "mobility_plan": {
+                "required": True,
+                "status": "bounded_with_taxi_fallback",
+                "max_walking_km_per_day": 6.0,
+                "days": [{"day_index": 1, "taxi_fallback_required": True}],
+            },
+        },
+        profile_brief={
+            "constraint_state": {
+                "max_walking_km_per_day": 6.0,
+                "fixed_events": [
+                    {"day": 1, "start": "18:00", "end": "20:00", "location": "会场"}
+                ],
+            },
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "route_evidence_gap",
+                "severity": "recoverable",
+                "description": "到固定预约会场的路线证据缺失。",
+                "evidence": ["required_route_anchors.fixed_event_transfer: unavailable"],
+                "repair_target": "transport",
+                "repair_instruction": "补充固定预约路线。",
+            }],
+        },
+    )
+
+    assert review.verdict == "rework"
+    assert review.issues[0].severity == "recoverable"
+
+
+def test_reviewer_downgrades_schedule_tightness_after_deterministic_validation():
+    ctx = ReviewContext(
+        request_id="req_schedule_advisory",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+        },
+        profile_brief={"constraint_state": {}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "schedule_feasibility",
+                "severity": "recoverable",
+                "description": "景点衔接较紧，建议增加午餐缓冲。",
+                "evidence": ["itinerary.days[0].stops"],
+                "repair_target": "planner",
+                "repair_instruction": "调整普通游览节奏。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_downgrades_nonfixed_schedule_conflict_after_validation():
+    ctx = ReviewContext(
+        request_id="req_schedule_boundary",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+        },
+        profile_brief={"constraint_state": {}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "schedule_conflict",
+                "severity": "recoverable",
+                "description": "餐段结束时间恰好等于下一活动开始时间，被误判为重叠。",
+                "evidence": ["itinerary.days[0].stops"],
+                "repair_target": "planner",
+                "repair_instruction": "调整普通游览节奏。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_keeps_schedule_conflict_recoverable_with_fixed_event():
+    ctx = ReviewContext(
+        request_id="req_schedule_fixed_event",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+        },
+        profile_brief={
+            "constraint_state": {
+                "fixed_events": [
+                    {"day": 1, "start": "14:00", "end": "15:00", "location": "会场"}
+                ],
+            },
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "schedule_conflict",
+                "severity": "recoverable",
+                "description": "活动与固定预约时间发生冲突。",
+                "evidence": ["itinerary.days[0].stops"],
+                "repair_target": "planner",
+                "repair_instruction": "调整预约前活动。",
+            }],
+        },
+    )
+
+    assert review.verdict == "rework"
+    assert review.issues[0].severity == "recoverable"
+
+
+def test_reviewer_does_not_turn_uncovered_soft_preference_into_rework():
+    ctx = ReviewContext(
+        request_id="req_soft_preference",
+        plan={"critic": {"passed": True}},
+        profile_brief={
+            "interests": ["咖啡店"],
+            "must_visit": [],
+            "constraint_state": {"interests": ["咖啡店"]},
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "soft_preference_mismatch",
+                "severity": "recoverable",
+                "description": "用户偏好咖啡店，但行程未覆盖该偏好。",
+                "evidence": ["profile.interests: 咖啡店"],
+                "repair_target": "planner",
+                "repair_instruction": "补充咖啡店。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
 # --- Reviewer 触发判定 ----------------------------------------------------------- #
 
 
 def test_requires_semantic_review_only_for_full_plan_tasks():
     assert requires_semantic_review(FULL_CONFIG, TaskType.FULL_TRIP_PLAN)
-    assert requires_semantic_review(FULL_CONFIG, TaskType.ITINERARY_REVISION)
+    assert not requires_semantic_review(FULL_CONFIG, TaskType.ITINERARY_REVISION)
     assert not requires_semantic_review(FULL_CONFIG, TaskType.ROUTE_QUERY)
     assert not requires_semantic_review(FULL_CONFIG, TaskType.POI_ADVICE)
     assert not requires_semantic_review(V2_CONFIG, TaskType.FULL_TRIP_PLAN)

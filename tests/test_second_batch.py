@@ -53,10 +53,17 @@ def test_revision_preflight_freezes_existing_plan_and_directives() -> None:
         [("user", "帮我做杭州两日行程"), ("assistant", "已生成")],
     )
 
-    assert prepared.analysis.task_type == TaskType.ITINERARY_REVISION
-    assert prepared.existing_plan_artifact_id == plan_id
-    assert prepared.turn_inputs["plan_artifact_id"] == plan_id
-    assert prepared.turn_inputs["artifact_ids"] == [plan_id, source_id]
+    # The day-level target is local, but the same request also changes global
+    # pace.  It must therefore rebuild the full itinerary while keeping the
+    # stale plan only as revision context.
+    assert prepared.analysis.task_type == TaskType.FULL_ITINERARY
+    assert prepared.existing_plan_artifact_id is None
+    assert prepared.revisable_parent_artifact_id == plan_id
+    assert prepared.turn_inputs["plan_artifact_id"] is None
+    assert prepared.turn_inputs["parent_plan_artifact_id"] == plan_id
+    # Legacy ancestors without a current constraint fingerprint are not
+    # silently rebound into a revision.
+    assert prepared.turn_inputs["artifact_ids"] == [plan_id]
     assert prepared.turn_inputs["revision_directives"] == {
         "indoor_days": [2],
         "preserve_hotel": True,

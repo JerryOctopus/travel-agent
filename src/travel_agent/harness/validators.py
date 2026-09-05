@@ -3,8 +3,13 @@ from __future__ import annotations
 from typing import Any
 
 from travel_agent.evaluation.plan_eval import evaluate_plan_artifact
+from travel_agent.evaluation.artifact_contract import (
+    effective_required_tools,
+    expected_artifact_type,
+)
 from travel_agent.harness.cases import HarnessCase
 from travel_agent.harness.production_evaluators import (
+    _compatible_with_audit,
     build_structured_state,
     evaluate_constraints_tree,
     evaluate_production_case,
@@ -43,10 +48,15 @@ def validate_case_result(
         _canonical_tool_name(name) for turn in result.turns for name in turn.tool_trace
     ]
     all_tool_calls = [call for turn in result.turns for call in turn.tool_calls]
+    artifact_type = expected_artifact_type(case)
     expected_tools = list(
         dict.fromkeys(
             _canonical_tool_name(name)
-            for name in (case.required_tools or case.expected_tools)
+            for name in effective_required_tools(
+                case,
+                expected=artifact_type,
+                profile=(last.profile if last else result.final_profile),
+            )
         )
     )
     required_hits = sum(tool in all_tool_trace for tool in expected_tools)
@@ -75,8 +85,18 @@ def validate_case_result(
         else all(text in reply_text for text in case.required_behaviors)
     )
     structured_state = build_structured_state(result)
+    annotation_context = {
+        **case.hard_constraints,
+        **structured_state,
+        "reference_datetime": (case.metadata or {}).get("reference_datetime"),
+    }
     hard_annotation_results = [
-        _matches_annotation(structured_state.get(field), expected)
+        _compatible_with_audit(
+            expected,
+            structured_state.get(field),
+            context=annotation_context,
+            field=field,
+        )[0]
         for field, expected in case.hard_constraints.items()
     ]
     soft_annotation_results = [
@@ -169,6 +189,15 @@ def validate_case_result(
     metrics.update(
         {
             "strict_task_success": production["strict_task_success"],
+            "expected_artifact_type": production["expected_artifact_type"],
+            "actual_artifact_type": production["actual_artifact_type"],
+            "artifact_type_match": production["artifact_type_match"],
+            "failure_reason": production["failure_reason"],
+            "task_completion_judge": production["task_completion_judge"],
+            # This is deterministic applicability/routing metadata.  Persist it
+            # even when no independent Judge is invoked so product artifacts can
+            # distinguish not_applicable from not_run (and invocation errors).
+            "llm_judge": production["llm_judge"],
             "actual_outcome": production["actual_outcome"],
             "expected_outcome_match": production["expected_outcome_match"],
             "constraint_tree_score": production["hard_constraint_satisfaction"]["score"],

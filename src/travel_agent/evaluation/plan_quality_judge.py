@@ -8,10 +8,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from travel_agent.settings import JudgeSettings
+from travel_agent.evaluation.artifact_contract import (
+    actual_artifact_type,
+    expected_artifact_type,
+    itinerary_judge_route,
+)
 
 
 RUBRIC_VERSION = "travel-plan-quality-v1"
-PROMPT_VERSION = "travel-plan-judge-v2"
+PARTIAL_RUBRIC_VERSION = "travel-partial-plan-diagnostic-v1"
+PROMPT_VERSION = "travel-plan-judge-v3"
 SCHEMA_VERSION = "travel-plan-judge-output-v1"
 REASONABLE_THRESHOLD = 70
 DIMENSIONS = {
@@ -27,6 +33,51 @@ DIMENSIONS = {
 
 class JudgeOutputError(ValueError):
     pass
+
+
+def preflight_judge(
+    settings: JudgeSettings,
+    *,
+    invoke: Callable[[list[dict[str, str]]], Any] | None = None,
+) -> dict[str, Any]:
+    """Validate the Judge's independent credential, endpoint, model, and quota."""
+    if not settings.enabled:
+        return {
+            "ok": False,
+            "provider": settings.provider,
+            "model": settings.model,
+            "base_url": settings.base_url,
+            "detail": "Judge API key is not configured",
+        }
+    try:
+        call = invoke or PlanQualityJudge(
+            settings, Path("."), sleeper=lambda _seconds: None
+        ).invoke
+        response = call(
+            [
+                {"role": "system", "content": "Connectivity check."},
+                {"role": "user", "content": "Reply with pong."},
+            ]
+        )
+        content, _usage = _response_content_and_usage(response)
+        if not str(content or "").strip():
+            raise RuntimeError("Judge preflight returned an empty response")
+        return {
+            "ok": True,
+            "provider": settings.provider,
+            "model": settings.model,
+            "base_url": settings.base_url,
+            "temperature": settings.temperature,
+            "thinking_enabled": settings.thinking_enabled,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "provider": settings.provider,
+            "model": settings.model,
+            "base_url": settings.base_url,
+            "detail": _safe_error(exc),
+        }
 
 
 class PlanQualityJudge:
@@ -51,19 +102,31 @@ class PlanQualityJudge:
         tested_model: str | None = None,
         resume: bool = False,
     ) -> dict[str, Any]:
-        itinerary = case_output.get("final_itinerary")
-        if not itinerary:
+        expected = expected_artifact_type(case_output.get("case") or {})
+        actual = actual_artifact_type(case_output, expected)
+        system_error = bool(case_output.get("errors"))
+        route = itinerary_judge_route(expected, actual, system_error=system_error)
+        if route["status"] in {"not_applicable", "not_run"}:
             return {
-                "status": "not_applicable",
+                **route,
                 "rubric_version": RUBRIC_VERSION,
                 "prompt_version": PROMPT_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "model": self.settings.model,
                 "experimental": True,
-                "reason": "no itinerary was generated",
+                "expected_artifact_type": expected,
+                "actual_artifact_type": actual,
             }
+        rubric = str(route["rubric"])
+        rubric_version = PARTIAL_RUBRIC_VERSION if rubric == "partial_itinerary" else RUBRIC_VERSION
         payload = _judge_payload(case_output)
-        cache_key = _cache_key(payload, self.settings)
+        payload["artifact_contract"] = {
+            "expected_artifact_type": expected,
+            "actual_artifact_type": actual,
+            "rubric": rubric,
+            "diagnostic_only": bool(route.get("diagnostic_only")),
+        }
+        cache_key = _cache_key(payload, self.settings, rubric_version=rubric_version)
         cache_path = self.cache_dir / f"{cache_key}.json"
         if resume and cache_path.exists():
             cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -74,7 +137,9 @@ class PlanQualityJudge:
         for attempt in (1, 2):
             try:
                 self._rate_limit()
-                response = self.invoke(_messages(payload, repair=attempt == 2))
+                response = self.invoke(
+                    _messages(payload, repair=attempt == 2, rubric=rubric)
+                )
                 content, usage = _response_content_and_usage(response)
                 parsed = parse_judge_output(content)
                 hard_pass = bool(
@@ -89,7 +154,11 @@ class PlanQualityJudge:
                 same_model = bool(tested_model and tested_model == self.settings.model)
                 result = {
                     "status": "ok",
-                    "rubric_version": RUBRIC_VERSION,
+                    "rubric_version": rubric_version,
+                    "rubric": rubric,
+                    "diagnostic_only": bool(route.get("diagnostic_only")),
+                    "expected_artifact_type": expected,
+                    "actual_artifact_type": actual,
                     "prompt_version": PROMPT_VERSION,
                     "schema_version": SCHEMA_VERSION,
                     "provider": self.settings.provider,
@@ -126,8 +195,12 @@ class PlanQualityJudge:
                     if retry_after is not None:
                         self.sleeper(retry_after)
         return {
-            "status": "missing",
-            "rubric_version": RUBRIC_VERSION,
+            "status": "error",
+            "rubric_version": rubric_version,
+            "rubric": rubric,
+            "diagnostic_only": bool(route.get("diagnostic_only")),
+            "expected_artifact_type": expected,
+            "actual_artifact_type": actual,
             "prompt_version": PROMPT_VERSION,
             "schema_version": SCHEMA_VERSION,
             "provider": self.settings.provider,
@@ -254,13 +327,29 @@ def parse_judge_output(content: str) -> dict[str, Any]:
 def aggregate_judge_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     completed = [item for item in results if item.get("status") == "ok"]
     applicable = [item for item in results if item.get("status") != "not_applicable"]
-    scores = [float(item["total_score"]) for item in completed]
+    by_rubric: dict[str, list[dict[str, Any]]] = {}
+    for item in completed:
+        by_rubric.setdefault(str(item.get("rubric") or "full_itinerary"), []).append(item)
+    average_by_rubric = {
+        rubric: sum(float(item["total_score"]) for item in items) / len(items)
+        for rubric, items in by_rubric.items()
+    }
+    full_completed = by_rubric.get("full_itinerary", [])
     return {
         "applicable_count": len(applicable),
         "completed_count": len(completed),
         "missing_count": sum(item.get("status") == "missing" for item in results),
+        "not_applicable_count": sum(item.get("status") == "not_applicable" for item in results),
+        "not_run_count": sum(item.get("status") == "not_run" for item in results),
+        "error_count": sum(item.get("status") == "error" for item in results),
         "completion_rate": len(completed) / len(applicable) if applicable else None,
-        "judge_average_score": sum(scores) / len(scores) if scores else None,
+        # Compatibility field remains full-itinerary-only; heterogeneous
+        # partial/full 100-point rubrics are never pooled.
+        "judge_average_score": (
+            sum(float(item["total_score"]) for item in full_completed) / len(full_completed)
+            if full_completed else None
+        ),
+        "judge_average_by_rubric": average_by_rubric,
         "judge_reasonable_rate": (
             sum(bool(item.get("reasonable")) for item in completed) / len(completed)
             if completed
@@ -298,7 +387,8 @@ def _judge_payload(case_output: dict[str, Any]) -> dict[str, Any]:
     if isinstance(final_plan, dict) and isinstance(itinerary_artifact, dict):
         for key in (
             "return_plan", "lodging_plan", "budget_plan", "fixed_event_plan",
-            "candidate_verification", "mobility_plan",
+            "candidate_verification", "mobility_plan", "meal_strategy",
+            "required_route_anchors", "lodging_route_anchors", "validation_result",
         ):
             structured_plan = itinerary_artifact.get(key)
             if isinstance(structured_plan, dict):
@@ -481,16 +571,23 @@ def _compact_evidence_collection(
     if list_key is None:
         return _pick_fields(value, ("city", "query", "source", "summary"))
     items = [item for item in value[list_key] if isinstance(item, dict)]
-    selected = [
+    referenced = [
         item
         for item in items
         if str(item.get("poi_id") or item.get("id") or "") in referenced_ids
         or str(item.get("name") or "") in referenced_names
-        or (
+    ]
+    referenced_object_ids = {id(item) for item in referenced}
+    mentioned = [
+        item
+        for item in items
+        if id(item) not in referenced_object_ids
+        and (
             bool(str(item.get("name") or ""))
             and str(item.get("name")) in final_answer
         )
     ]
+    selected = [*referenced, *mentioned[:max(0, 8 - len(referenced))]]
     if not selected:
         selected = items[:5]
     return {
@@ -510,7 +607,7 @@ def _compact_evidence_collection(
                     "source",
                 ),
             )
-            for item in selected[:8]
+            for item in selected
         ],
     }
 
@@ -521,14 +618,26 @@ def _pick_fields(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     return {key: value[key] for key in fields if key in value and value[key] is not None}
 
 
-def _messages(payload: dict[str, Any], *, repair: bool) -> list[dict[str, str]]:
+def _messages(
+    payload: dict[str, Any], *, repair: bool, rubric: str = "full_itinerary"
+) -> list[dict[str, str]]:
     repair_note = "上一次响应格式不合法。本次只能输出合法JSON，不要使用Markdown。" if repair else ""
+    rubric_version = PARTIAL_RUBRIC_VERSION if rubric == "partial_itinerary" else RUBRIC_VERSION
+    scope_note = (
+        "这是有限方案的诊断性 Partial Rubric：只评价其明确覆盖的范围、限制披露、局部可执行性和证据；"
+        "不得把它当作完整行程通过结论。"
+        if rubric == "partial_itinerary"
+        else "这是完整行程 Rubric，应检查逐日安排、路线、约束与完整性。"
+    )
     system = f"""你是独立旅行行程质量评审。只根据给定需求、行程和工具事实评分，不补充外部事实。
-Rubric版本：{RUBRIC_VERSION}。分值上限：{json.dumps(DIMENSIONS, ensure_ascii=False)}。
+Rubric版本：{rubric_version}。{scope_note} 分值上限：{json.dumps(DIMENSIONS, ensure_ascii=False)}。
 输出JSON必须包含 scores、critical_issues、insufficient_evidence、reason。
 critical_issues元素包含 code、severity(info/warning/critical)、evidence。
 住宿候选与选定住宿通过 tool_facts.hotels 独立呈现，不要求把酒店伪装成 itinerary.days[].stops；
 不得仅因酒店未出现在每日景点 stops 中判 critical。只有明确住宿硬约束且 tool_facts.hotels 也无合规证据时，才可判住宿约束失败。
+固定事件通过 itinerary.fixed_event_plan 和 required_route_anchors 保留时，属于完整行程的一部分；
+对用户自有、但系统没有可核验 POI 实体的事件，只能保留时段和转场计划，不得要求伪造 itinerary stop。
+饮食限制及预留用餐时段应结合 itinerary.meal_strategy 判断，不能只搜索景点 stops。
 不要输出total_score，系统会根据分项计算。证据不足必须记录，不得猜测。{repair_note}"""
     return [
         {"role": "system", "content": system},
@@ -536,13 +645,15 @@ critical_issues元素包含 code、severity(info/warning/critical)、evidence。
     ]
 
 
-def _cache_key(payload: dict[str, Any], settings: JudgeSettings) -> str:
+def _cache_key(
+    payload: dict[str, Any], settings: JudgeSettings, *, rubric_version: str = RUBRIC_VERSION
+) -> str:
     encoded = json.dumps(
         {
             "payload": payload,
             "provider": settings.provider,
             "model": settings.model,
-            "rubric": RUBRIC_VERSION,
+            "rubric": rubric_version,
             "prompt": PROMPT_VERSION,
             "schema": SCHEMA_VERSION,
         },

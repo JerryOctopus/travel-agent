@@ -31,9 +31,14 @@ def test_long_horizon_dataset_has_balanced_5_8_12_turn_bands() -> None:
     assert validation.valid is True, validation.errors
     assert validation.turn_counts == EXPECTED_TURN_BANDS
     assert validation.split_counts == EXPECTED_SPLIT_COUNTS
+    assert validation.frozen_warnings == []
     long_cases = [case for case in cases if case.subset == "long_horizon_state"]
     assert len(long_cases) == 12
     assert all(len(case.turn_expectations) == len(case.turns) for case in long_cases)
+    target = next(case for case in long_cases if case.case_id == "lh_12_001")
+    assert target.turns[0] == "杭州五天，两个人，总预算5000元。"
+    assert "date_start" not in target.turn_expectations[0]["constraints"]
+    assert target.gold_constraints_tree["return_deadline"] == "2026-10-05T17:00:00+08:00"
 
 
 def test_turn_expectations_score_each_checkpoint_not_only_final_state() -> None:

@@ -36,7 +36,13 @@ def estimate_route_minutes(
         "taxi": 25.0,
         "drive": 28.0,
     }[mode]
-    duration_min = max(5, round(distance_km / speed_kmh * 60))
+    overhead_min = {
+        "walk": 0,
+        "public_transport": 12,
+        "taxi": 8,
+        "drive": 8,
+    }[mode]
+    duration_min = max(5, round(distance_km / speed_kmh * 60) + overhead_min)
     return round(distance_km, 2), duration_min
 
 

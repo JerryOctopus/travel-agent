@@ -345,10 +345,10 @@ def run_agent_for_case_with_diagnostics(
     ctx = build_session(session_id=f"ct_{case.query_id}", persist=False)
     ctx.provider = build_chinatravel_provider(chinatravel_root, allow_synthetic=False)
     reply = run_production_turn(case.query, ctx=ctx, settings=settings, user_id="chinatravel_eval")
-    artifact = ctx.store.latest("itinerary")
+    artifact = ctx.store.latest_current("itinerary")
     if not artifact and reply.clarification and not ctx.profile.missing_required_fields():
         reply = run_production_turn("你推荐，按默认偏好规划", ctx=ctx, settings=settings, user_id="chinatravel_eval")
-        artifact = ctx.store.latest("itinerary")
+        artifact = ctx.store.latest_current("itinerary")
     trace_payload = ctx.store.latest("agent_trace") or {}
     trace_items = list(trace_payload.get("items") or [])
     subagent_items = [item for item in trace_items if item.get("kind") == "subagent"]

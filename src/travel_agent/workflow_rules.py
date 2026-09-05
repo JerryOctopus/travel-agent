@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import re
 
+from travel_agent.hybrid_planning.taxonomy import (
+    CANONICAL_INTERESTS,
+    INTEREST_KEYWORDS,
+)
 from travel_agent.schemas import Pace, TravelProfile
 
 
@@ -39,35 +43,6 @@ CITY_ALIASES = {
     "三亚": "三亚",
 }
 
-INTEREST_KEYWORDS = {
-    "自然": "nature",
-    "风景": "nature",
-    "风光": "nature",
-    "自然风光": "nature",
-    "海边": "nature",
-    "园林": "nature",
-    "美食": "food",
-    "吃": "food",
-    "咖啡店": "food",
-    "文化": "culture",
-    "历史文化": "culture",
-    "历史": "history",
-    "历史景点": "history",
-    "主要历史景点": "history",
-    "博物馆": "museum",
-    "情侣": "couple",
-    "城市漫步": "citywalk",
-    "城市景观": "citywalk",
-    "经典城市景观": "citywalk",
-    "经典景观": "citywalk",
-    "citywalk": "citywalk",
-    "亲子": "family",
-    "夜生活": "nightlife",
-    "购物": "shopping",
-}
-
-CANONICAL_INTERESTS = frozenset(INTEREST_KEYWORDS.values())
-
 INTEREST_DISPLAY_LABELS: dict[str, str] = {
     "nature": "自然",
     "food": "美食",
@@ -79,6 +54,14 @@ INTEREST_DISPLAY_LABELS: dict[str, str] = {
     "family": "亲子",
     "nightlife": "夜生活",
     "shopping": "购物",
+    "local_life": "本地生活",
+    "architecture": "建筑",
+    "industrial_heritage": "工业遗产",
+    "urban_renewal": "城市更新",
+    "photography": "摄影",
+    "hands_on": "动手体验",
+    "cafe": "咖啡馆",
+    "commercialized": "商业化体验",
 }
 
 PACE_DISPLAY_LABELS: dict[str, str] = {
@@ -148,7 +131,9 @@ def extract_profile_rule_based(user_message: str) -> TravelProfile:
     )
 
 
-_NEGATION_MARKERS = ("不喜欢", "不想", "不要", "不再喜欢", "避开", "排除")
+_NEGATION_MARKERS = (
+    "不喜欢", "不想", "不要", "不再喜欢", "不吃", "不能吃", "忌口", "避开", "排除",
+)
 
 
 def extract_preference_removals(user_message: str) -> list[str]:
@@ -157,7 +142,12 @@ def extract_preference_removals(user_message: str) -> list[str]:
     for keyword, tag in INTEREST_KEYWORDS.items():
         for match in re.finditer(re.escape(keyword), user_message, re.IGNORECASE):
             prefix = user_message[max(0, match.start() - 6) : match.start()]
-            if any(marker in prefix for marker in _NEGATION_MARKERS):
+            local_phrase = user_message[max(0, match.start() - 4) : match.end()]
+            if any(marker in prefix for marker in _NEGATION_MARKERS) or re.search(
+                rf"(?:不|不能|别|忌|避免)\s*{re.escape(keyword)}$",
+                local_phrase,
+                re.IGNORECASE,
+            ):
                 if tag not in removed:
                     removed.append(tag)
                 break

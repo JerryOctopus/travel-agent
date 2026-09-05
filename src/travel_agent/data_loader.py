@@ -28,4 +28,13 @@ def _poi_from_dict(item: dict[str, Any]) -> POI:
         indoor=bool(item.get("indoor", False)),
         opening_hours=item.get("opening_hours"),
         source=item.get("source", "seed"),
+        canonical_name=item.get("canonical_name") or item["name"],
+        entity_type=item.get("entity_type", "venue"),
+        parent_poi_id=item.get("parent_poi_id"),
+        source_poi_id=item.get("source_poi_id") or item["poi_id"],
+        verification_status=item.get("verification_status", "verified"),
+        verification_reason=item.get("verification_reason"),
+        aliases=list(item.get("aliases") or []),
+        parent_canonical_name=item.get("parent_canonical_name"),
+        coverage_relation=item.get("coverage_relation", "none"),
     )

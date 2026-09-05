@@ -38,7 +38,10 @@ _ROUTER_PROMPT_TEMPLATE = """你是旅行规划 Router。你每次只决定一�
 3. 不重复 attempted_objectives 中已完成的目标；已有 evidence 足够时返回 ready=true、tasks=[]。
 4. Wave 1 最多四个独立任务；后续 wave 只返回缺失 hard evidence 所需的 delta tasks。
 5. 信息不足以安全派工时 clarification=true，不猜测目的地或天数。
-6. 只输出 JSON，不输出 markdown。格式：
+6. 严格遵循“用户明确需求 > 必要信息 > 可选增值推荐”。hotel / restaurant 仅在用户明确要求、
+   路线/预算/硬约束确有必要时派发；用户已订好或自行安排、或明确排除时不得重复推荐。
+7. 非 full_itinerary 任务不得为了凑完整行程扩大派工；route_plan 只派 transport。
+8. 只输出 JSON，不输出 markdown。格式：
 {{"ready": false, "clarification": false, "reply": "", "missing_evidence": [],
   "reason": "", "tasks": [{{"agent": "attraction", "instruction": "...",
   "objective": "...", "depends_on": []}}]}}
@@ -185,6 +188,7 @@ def route_wave(
         "attempted_objectives": attempted_objectives or [],
         "engine_missing_hard_evidence": missing_evidence or [],
         "max_tasks": max_tasks,
+        "execution_budget": (turn_inputs or {}).get("execution_budget", {}),
     }
     messages = [
         SystemMessage(content=build_orchestrator_prompt()),

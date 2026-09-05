@@ -8,6 +8,7 @@ from travel_agent.agent.session import DEFAULT_POI_PATH
 from travel_agent.settings import AmapSettings, LLMSettings, Settings
 
 HarnessMode = Literal["offline", "real_agent"]
+ToolProviderMode = Literal["configured", "local"]
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class HarnessEnvironment:
     persist: bool = False
     user_id: str = "harness_eval"
     variant: str | None = None
+    tool_provider: ToolProviderMode = "configured"
 
     def apply(self, settings: Settings) -> Settings:
         if self.mode == "real_agent":

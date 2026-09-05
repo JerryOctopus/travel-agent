@@ -2,10 +2,22 @@ from __future__ import annotations
 
 import math
 import re
+from dataclasses import replace
 from datetime import date, timedelta
 from typing import Protocol
 
 from travel_agent.critic import poi_complies_with_dietary, poi_matches_must_visit
+from travel_agent.poi_evidence import (
+    is_verified_plannable_poi,
+    normalize_candidate_requirement,
+    normalize_entity_name,
+    poi_covers_requirement,
+)
+from travel_agent.route_evidence import (
+    canonical_route_evidence_status,
+    normalize_route_evidence,
+    route_supports_endpoints,
+)
 from travel_agent.schemas import (
     Itinerary,
     ItineraryDay,
@@ -30,8 +42,13 @@ class RouteEstimator(Protocol):
 
 START_TIMES = ["09:30", "11:30", "14:30", "18:00"]
 ACTIVITY_TIMES = ["09:30", "14:30", "16:30"]
+# Hard named venues must fit before an explicit same-day deadline.  Optional
+# activities keep the more leisurely public schedule above, while required
+# venues use compact, evenly spaced anchors and are still subject to route,
+# opening-hours, and final deadline validation below.
+REQUIRED_ACTIVITY_TIMES = ["09:00", "12:00", "15:00", "17:00"]
 MEAL_TIMES = ["11:30", "18:00"]
-MEAL_TIME_WINDOWS = ["11:30", "12:00", "12:30", "13:00", "17:30", "18:00", "19:00"]
+MEAL_TIME_WINDOWS = ["11:30", "12:00", "12:30", "12:45", "17:30", "18:00", "19:00"]
 TRANSFER_BUFFER_MIN = 15
 
 
@@ -49,6 +66,10 @@ def build_simple_itinerary(
 
     stops_per_day = _stops_per_day(profile)
     total_stops = profile.days * stops_per_day
+    ranked_pois = [
+        item for item in ranked_pois
+        if item.poi.category == "food" or is_verified_plannable_poi(item.poi)
+    ]
     selected = _select_plan_candidates(
         ranked_pois,
         profile,
@@ -101,6 +122,21 @@ def _select_plan_candidates(
             selected.append(item)
 
     state = profile.constraint_state or {}
+    unspecified_fixed_locations = {
+        normalize_entity_name(item)
+        for item in state.get("user_owned_unspecified_fixed_event_locations") or []
+        if normalize_entity_name(item)
+    }
+    fixed_location_terms = list(dict.fromkeys(
+        str(event.get("location") or "").strip()
+        for event in state.get("fixed_events") or []
+        if isinstance(event, dict)
+        and str(event.get("location") or "").strip()
+        and normalize_entity_name(event.get("location"))
+        not in unspecified_fixed_locations
+        and str(event.get("location") or "").strip()
+        not in {"自由活动", "休息", "自由时间"}
+    ))
     raw_candidate_terms = state.get("candidate_attractions") or []
     candidate_terms = (
         [raw_candidate_terms]
@@ -111,25 +147,80 @@ def _select_plan_candidates(
         item
         for item in ranked_pois
         if item.poi.category != "food" or poi_complies_with_dietary(item.poi, profile)
-        if not any(
-            _matches_candidate_attraction(item.poi, str(term))
-            and not _is_suitable_for_requested_weekday(item.poi, state.get("weekday"))
-            for term in candidate_terms
-        )
+        if _is_suitable_for_requested_weekday(item.poi, state.get("weekday"))
     ]
-    eligible = _dedupe_semantic_venues(eligible)
+    eligible = _dedupe_semantic_venues(
+        eligible,
+        required_terms=[str(term) for term in candidate_terms],
+    )
+    # A named fixed appointment is a hard venue constraint even when the user
+    # did not repeat it in must_visit.  Reserve the evidenced venue before
+    # score fill so geographic clustering can keep a feasible nearby stop on
+    # that day and the final schedule can prove the transfer.
+    for term in fixed_location_terms:
+        match = min(
+            (
+                item for item in eligible
+                if poi_matches_must_visit(item.poi, term)
+            ),
+            key=lambda item: _named_venue_priority(item.poi, term),
+            default=None,
+        )
+        if match is not None:
+            add(match)
+            event = next(
+                (
+                    item for item in state.get("fixed_events") or []
+                    if isinstance(item, dict)
+                    and normalize_entity_name(item.get("location"))
+                    == normalize_entity_name(term)
+                ),
+                {},
+            )
+            try:
+                event_start = _time_to_minutes(str(event.get("start")))
+            except (TypeError, ValueError):
+                event_start = 0
+            if event_start >= _time_to_minutes("12:00"):
+                nearby = min(
+                    (
+                        item for item in eligible
+                        if item.poi.poi_id != match.poi.poi_id
+                        and item.poi.category not in {"food", "hotel", "transport"}
+                        and _haversine_km(
+                            item.poi.lng,
+                            item.poi.lat,
+                            match.poi.lng,
+                            match.poi.lat,
+                        ) <= 15.0
+                    ),
+                    key=lambda item: (
+                        _haversine_km(
+                            item.poi.lng,
+                            item.poi.lat,
+                            match.poi.lng,
+                            match.poi.lat,
+                        ),
+                        -item.score,
+                    ),
+                    default=None,
+                )
+                if nearby is not None:
+                    add(nearby)
     # Hard must-visits own capacity before completeness preferences.  Previously
     # meals were reserved first, so a small one-day plan could consume its last
     # slot with food and silently drop an evidenced must-visit.
     if preserve_must_visit_capacity:
         for term in profile.must_visit:
-            match = next(
-                (
-                    item
-                    for item in eligible
-                    if poi_matches_must_visit(item.poi, term)
-                ),
-                None,
+            matches = [
+                item
+                for item in eligible
+                if poi_matches_must_visit(item.poi, term)
+            ]
+            match = min(
+                matches,
+                key=lambda item: _named_venue_priority(item.poi, term),
+                default=None,
             )
             if match is not None:
                 add(match)
@@ -139,21 +230,22 @@ def _select_plan_candidates(
     # Only reserve a place when the bound evidence represents the venue itself
     # and does not explicitly say it is closed on the requested weekday.
     for term in candidate_terms:
-        match = next(
+        match = min(
             (
                 item
                 for item in eligible
                 if _matches_candidate_attraction(item.poi, str(term))
                 and _is_suitable_for_requested_weekday(item.poi, state.get("weekday"))
             ),
-            None,
+            key=lambda item: _named_venue_priority(item.poi, str(term)),
+            default=None,
         )
         if match is not None:
             add(match)
 
-    # A deliverable day plan needs at least one evidenced meal when restaurant
-    # candidates exist.  This is schedule completeness, not an inferred food
-    # preference; dietary filtering above still fails closed.
+    # Concrete restaurant stops are optional unless the user requested food or
+    # supplied a dietary hard constraint. Generic itineraries reserve meal time
+    # in prose/rendering instead of inventing a restaurant recommendation.
     selected_food_brands: set[str] = set()
     food_candidates = [entry for entry in eligible if entry.poi.category == "food"]
     meal_anchors = [entry.poi for entry in selected if entry.poi.category != "food"]
@@ -172,7 +264,16 @@ def _select_plan_candidates(
                 -item.score,
             )
         )
-    for item in food_candidates:
+    meal_requested = bool(
+        profile.food_preference
+        or "food" in profile.interests
+        or state.get("specific_restaurant_recommendation")
+        # Dietary-only wording does not trigger restaurant retrieval, but if
+        # verified restaurant evidence is already bound, use compatible meals
+        # instead of discarding that evidence.
+        or (state.get("dietary") and food_candidates)
+    )
+    for item in food_candidates if meal_requested else []:
         if len(selected) >= total_stops:
             break
         brand = _food_brand_key(item.poi.name)
@@ -185,7 +286,7 @@ def _select_plan_candidates(
 
     # If the provider only returned one brand, completeness is preferable to
     # omitting meals.  Duplicate branches remain visible to the critic.
-    for item in food_candidates:
+    for item in food_candidates if meal_requested else []:
         if len(selected) >= total_stops or sum(
             entry.poi.category == "food" for entry in selected
         ) >= profile.days:
@@ -199,7 +300,7 @@ def _select_plan_candidates(
     # candidate path above.
     food_count = sum(entry.poi.category == "food" for entry in selected)
     repeat_index = 0
-    while food_candidates and food_count < profile.days and len(selected) < total_stops:
+    while meal_requested and food_candidates and food_count < profile.days and len(selected) < total_stops:
         selected.append(food_candidates[repeat_index % len(food_candidates)])
         repeat_index += 1
         food_count += 1
@@ -207,9 +308,9 @@ def _select_plan_candidates(
     # Fill remaining capacity with activities before optional extra meals.  A
     # distant second restaurant must not displace a viable attraction after
     # the daily evidenced-meal requirement has already been satisfied.
-    fill_order = [item for item in eligible if item.poi.category != "food"] + [
-        item for item in eligible if item.poi.category == "food"
-    ]
+    fill_order = [item for item in eligible if item.poi.category != "food"]
+    if meal_requested:
+        fill_order += [item for item in eligible if item.poi.category == "food"]
     for item in fill_order:
         if len(selected) >= total_stops:
             break
@@ -225,12 +326,31 @@ def apply_structured_schedule_constraints(
 ) -> list[ItineraryDay]:
     """Apply literal fixed events and end-time limits without inventing POIs."""
     state = profile.constraint_state or {}
+    conditional_avoid = state.get("conditional_avoid_window") or {}
+    conditional_outdoor_window: tuple[int, int] | None = None
+    if (
+        isinstance(conditional_avoid, dict)
+        and conditional_avoid.get("avoid") == "long_outdoor_activity"
+    ):
+        try:
+            avoid_start = _time_to_minutes(str(conditional_avoid.get("start")))
+            avoid_end = _time_to_minutes(str(conditional_avoid.get("end")))
+        except (TypeError, ValueError):
+            pass
+        else:
+            if avoid_end > avoid_start:
+                conditional_outdoor_window = (avoid_start, avoid_end)
     raw_events = state.get("fixed_events") or []
     candidate_terms = state.get("candidate_attractions") or []
     if isinstance(candidate_terms, str):
         candidate_terms = [candidate_terms]
     events_by_day: dict[int, list[tuple[int, int, ScoredPOI]]] = {}
     reserved_windows_by_day: dict[int, list[tuple[int, int]]] = {}
+    unspecified_locations = {
+        normalize_entity_name(item)
+        for item in state.get("user_owned_unspecified_fixed_event_locations") or []
+        if normalize_entity_name(item)
+    }
     for raw in raw_events if isinstance(raw_events, list) else []:
         if not isinstance(raw, dict):
             continue
@@ -252,17 +372,22 @@ def apply_structured_schedule_constraints(
         location = str(raw.get("location") or "").strip()
         if day_index < 1 or day_index > len(days) or end <= start or not location:
             continue
-        match = next(
-            (
-                item
-                for item in ranked_pois
-                if (
-                    location in item.poi.name
-                    or item.poi.name in location
-                    or location in str(item.poi.address or "")
-                )
-            ),
-            None,
+        if normalize_entity_name(location) in unspecified_locations:
+            reserved_windows_by_day.setdefault(day_index, []).append((start, end))
+            continue
+        location_matches = [
+            item
+            for item in ranked_pois
+            if (
+                location in item.poi.name
+                or item.poi.name in location
+                or location in str(item.poi.address or "")
+            )
+        ]
+        match = min(
+            location_matches,
+            key=lambda item: _named_venue_priority(item.poi, location),
+            default=None,
         )
         if match is not None:
             if start >= _time_to_minutes("17:00"):
@@ -298,6 +423,13 @@ def apply_structured_schedule_constraints(
         deadline = _time_to_minutes(str(deadline_text)) if deadline_text else None
     except (TypeError, ValueError):
         deadline = None
+    target_text = state.get("activity_end_target")
+    try:
+        activity_end_target = (
+            _time_to_minutes(str(target_text)) if target_text else None
+        )
+    except (TypeError, ValueError):
+        activity_end_target = None
     # A return deadline is arrival at the return location, not the end of the
     # last attraction.  When that location is outside the destination city and
     # no inventory-backed timetable is available, reserve a conservative
@@ -355,7 +487,11 @@ def apply_structured_schedule_constraints(
                 (required if is_required and not entry[3] else optional).append(entry)
             required = [
                 (
-                    _time_to_minutes(ACTIVITY_TIMES[min(index, len(ACTIVITY_TIMES) - 1)]),
+                    _time_to_minutes(
+                        REQUIRED_ACTIVITY_TIMES[
+                            min(index, len(REQUIRED_ACTIVITY_TIMES) - 1)
+                        ]
+                    ),
                     end,
                     stop,
                     fixed,
@@ -384,8 +520,13 @@ def apply_structured_schedule_constraints(
                 )
             )
             retimed_required = {
-                entry[2].poi.poi_id: _time_to_minutes(
-                    ACTIVITY_TIMES[min(index, len(ACTIVITY_TIMES) - 1)]
+                entry[2].poi.poi_id: max(
+                    _time_to_minutes(
+                        REQUIRED_ACTIVITY_TIMES[
+                            min(index, len(REQUIRED_ACTIVITY_TIMES) - 1)
+                        ]
+                    ),
+                    _preferred_activity_start_minutes(entry[2].poi, 0),
                 )
                 for index, entry in enumerate(required_flexible)
             }
@@ -448,9 +589,37 @@ def apply_structured_schedule_constraints(
                 if earliest > requested_start:
                     continue
             actual_start = requested_start if is_fixed else _round_up_to_quarter(earliest)
+            is_hard_required = any(
+                poi_matches_must_visit(stop.poi, term)
+                for term in profile.must_visit
+            )
+            if not is_fixed and stop.poi.category == "food":
+                actual_start = _next_meal_time_minutes(actual_start)
+            elif (
+                not is_fixed
+                and not is_hard_required
+                and _time_to_minutes("11:30") <= actual_start < _time_to_minutes("13:00")
+            ):
+                # Do not turn the only plausible lunch window into a second
+                # major activity.  Meal metadata must describe a usable break,
+                # not claim a 17:30 "lunch" after a continuous sightseeing day.
+                actual_start = _time_to_minutes("13:00")
             duration = (fixed_end - requested_start) if is_fixed and fixed_end else stop.duration_min
+            if (
+                not is_fixed
+                and conditional_outdoor_window is not None
+                and not stop.poi.indoor
+                and duration >= 90
+            ):
+                avoid_start, avoid_end = conditional_outdoor_window
+                if actual_start < avoid_end and actual_start + duration > avoid_start:
+                    # The condition may not be knowable for a future trip.  A
+                    # conservative schedule that reserves the user's avoidance
+                    # window works in both branches and does not invent weather.
+                    actual_start = avoid_end
             if not is_fixed and any(
-                actual_start < reserved_end and actual_start + duration > reserved_start
+                actual_start < reserved_end
+                and actual_start + duration + TRANSFER_BUFFER_MIN > reserved_start
                 for reserved_start, reserved_end in reserved_windows_by_day.get(day.day_index, [])
             ):
                 continue
@@ -497,6 +666,51 @@ def apply_structured_schedule_constraints(
                     route_from_previous=route,
                 )
             )
+        if activity_end_target is not None and scheduled:
+            last = scheduled[-1]
+            current_start = _time_to_minutes(last.start_time)
+            current_end = current_start + last.duration_min
+            proposed_start = activity_end_target - last.duration_min
+            route_duration = (
+                last.route_from_previous.duration_min
+                if last.route_from_previous is not None else 0
+            )
+            earliest = 0
+            if len(scheduled) > 1:
+                previous = scheduled[-2]
+                earliest = (
+                    _time_to_minutes(previous.start_time)
+                    + previous.duration_min
+                    + route_duration
+                    + TRANSFER_BUFFER_MIN
+                )
+            opening_window = _daily_opening_window(last.poi.opening_hours)
+            opens_late_enough = (
+                opening_window is None
+                or (
+                    proposed_start >= opening_window[0]
+                    and activity_end_target <= opening_window[1]
+                )
+            )
+            overlaps_reserved = any(
+                proposed_start < reserved_end
+                and activity_end_target + TRANSFER_BUFFER_MIN > reserved_start
+                for reserved_start, reserved_end in reserved_windows_by_day.get(
+                    day.day_index, []
+                )
+            )
+            if (
+                last.poi.poi_id not in fixed_poi_ids
+                and last.poi.category != "food"
+                and current_end < activity_end_target
+                and proposed_start >= earliest
+                and (deadline is None or activity_end_target <= deadline)
+                and opens_late_enough
+                and not overlaps_reserved
+            ):
+                scheduled[-1] = replace(
+                    last, start_time=_minutes_to_time(proposed_start)
+                )
         constrained_days.append(
             ItineraryDay(
                 day_index=day.day_index,
@@ -507,12 +721,58 @@ def apply_structured_schedule_constraints(
     return constrained_days
 
 
+def _named_venue_priority(poi: POI, required_name: str) -> tuple[int, int]:
+    """Prefer the requested venue itself over a loosely related child POI."""
+    required = normalize_entity_name(required_name)
+    names = [
+        normalize_entity_name(value)
+        for value in (poi.name, poi.canonical_name, *poi.aliases)
+        if str(value or "").strip()
+    ]
+    city = normalize_entity_name(poi.city)
+    city_prefixes = {
+        prefix
+        for prefix in (city, city.removesuffix("市"), city.removesuffix("地区"))
+        if prefix
+    }
+    names.extend(
+        name[len(prefix):]
+        for name in list(names)
+        for prefix in city_prefixes
+        if name.startswith(prefix) and len(name) > len(prefix)
+    )
+    if required in names:
+        return 0, len(normalize_entity_name(poi.name))
+    venue_suffix_priority = {
+        "文化旅游区": 1,
+        "风景名胜区": 1,
+        "风景区": 2,
+        "景区": 2,
+        "旅游区": 2,
+        "公园": 3,
+    }
+    suffix_match = min(
+        (
+            priority
+            for suffix, priority in venue_suffix_priority.items()
+            for name in names
+            if name == required + suffix
+        ),
+        default=None,
+    )
+    if suffix_match is not None:
+        return suffix_match, len(normalize_entity_name(poi.name))
+    if poi.coverage_relation == "child_covers_parent":
+        return 3, len(normalize_entity_name(poi.name))
+    return 2, len(normalize_entity_name(poi.name))
+
+
 def _daily_opening_window(value: str | None) -> tuple[int, int] | None:
     """Return a simple same-day opening window when the evidence is explicit."""
     text = str(value or "").strip()
     if not text or text.lower() in {"all_day", "24h"} or "24:00" in text:
         return None
-    match = re.search(r"(\d{1,2}):(\d{2})\s*[-至到]\s*(\d{1,2}):(\d{2})", text)
+    match = re.search(r"(\d{1,2}):(\d{2})\s*[-—–至到]\s*(\d{1,2}):(\d{2})", text)
     if match is None:
         return None
     opens = int(match.group(1)) * 60 + int(match.group(2))
@@ -521,13 +781,7 @@ def _daily_opening_window(value: str | None) -> tuple[int, int] | None:
 
 
 def _matches_candidate_attraction(poi: POI, term: str) -> bool:
-    name = str(poi.name or "").strip()
-    target = str(term or "").strip()
-    if not name or not target or poi.category in {"food", "hotel", "transport"}:
-        return False
-    if any(marker in name for marker in ("服务中心", "游客中心", "停车场", "售票处")):
-        return False
-    return target in name or name in target
+    return poi_covers_requirement(poi, normalize_candidate_requirement(term))
 
 
 def _is_suitable_for_requested_weekday(poi: POI, weekday: object) -> bool:
@@ -537,6 +791,7 @@ def _is_suitable_for_requested_weekday(poi: POI, weekday: object) -> bool:
         return True
     return not (
         f"{requested}全天不开放" in hours
+        or f"{requested}全天关闭" in hours
         or f"{requested}闭馆" in hours
         or (requested == "周一" and "周一闭馆" in hours)
     )
@@ -561,9 +816,53 @@ def _estimate_stop_route(
 ) -> RouteInfo | None:
     if origin is None or route_estimator is None:
         return None
+    route: RouteInfo | None = None
     try:
-        return route_estimator.estimate_route(origin, destination, profile.transport_mode)
+        route = normalize_route_evidence(
+            route_estimator.estimate_route(origin, destination, profile.transport_mode)
+        )
     except Exception:
+        route = None
+
+    route_is_bound = route is not None and route_supports_endpoints(
+        route, origin.poi_id, destination.poi_id
+    )
+    state = profile.constraint_state or {}
+    has_walking_cap = any(
+        state.get(key) is not None
+        for key in ("max_walking_km_per_day", "max_single_walk_km")
+    )
+    transit_walk_is_unknown = bool(
+        route_is_bound
+        and route is not None
+        and route.mode == "public_transport"
+        and route.walking_distance_km is None
+    )
+    if (
+        has_walking_cap
+        and profile.transport_mode not in {"taxi", "drive"}
+        and (
+            not route_is_bound
+            or canonical_route_evidence_status(route) != "provider_verified"
+            or transit_walk_is_unknown
+        )
+    ):
+        try:
+            taxi_route = normalize_route_evidence(
+                route_estimator.estimate_route(origin, destination, "taxi")
+            )
+            if (
+                route_supports_endpoints(taxi_route, origin.poi_id, destination.poi_id)
+                and canonical_route_evidence_status(taxi_route) == "provider_verified"
+            ):
+                return taxi_route
+        except Exception:
+            pass
+
+    if route_is_bound:
+        return route
+
+    try:
         from travel_agent.tools import estimate_route_minutes
 
         distance_km, duration_min = estimate_route_minutes(
@@ -571,14 +870,41 @@ def _estimate_stop_route(
             destination,
             profile.transport_mode,
         )
-        return RouteInfo(
+        return normalize_route_evidence(RouteInfo(
             origin_poi_id=origin.poi_id,
             destination_poi_id=destination.poi_id,
             distance_km=distance_km,
             duration_min=duration_min,
             mode=profile.transport_mode,
             source="haversine_recovery_estimate",
-        )
+        ), provider_explicit=False)
+    except Exception:
+        return None
+
+
+def rebind_itinerary_routes(
+    itinerary: Itinerary,
+    profile: TravelProfile,
+    route_estimator: RouteEstimator | None,
+) -> Itinerary:
+    """Invalidate every old adjacent leg and bind routes to final POI ids."""
+    days: list[ItineraryDay] = []
+    for day in itinerary.days:
+        stops: list[ItineraryStop] = []
+        for stop in day.stops:
+            previous = stops[-1].poi if stops else None
+            existing = stop.route_from_previous
+            route = (
+                normalize_route_evidence(existing)
+                if previous is not None
+                and existing is not None
+                and route_supports_endpoints(existing, previous.poi_id, stop.poi.poi_id)
+                and canonical_route_evidence_status(existing) == "provider_verified"
+                else _estimate_stop_route(previous, stop.poi, profile, route_estimator)
+            )
+            stops.append(replace(stop, route_from_previous=route))
+        days.append(replace(day, stops=stops))
+    return replace(itinerary, days=days)
 
 
 def _haversine_km(lng1: float, lat1: float, lng2: float, lat2: float) -> float:
@@ -657,12 +983,36 @@ def _semantic_venue_key(name: str) -> str:
     value = re.sub(r"[（(][^）)]*[）)]", "", str(name or ""))
     value = re.sub(r"^(?:成都|天津|武汉|西安|北京|上海)", "", value)
     value = re.sub(r"(?:景区|公园|博物馆|博物院|文化旅游区)$", "", value)
+    # Provider parent/child records commonly expose an ancestral-hall plaza
+    # and the hall itself as separate POIs. They are one itinerary stop unless
+    # the user explicitly asks for a subvenue-specific artifact.
+    value = re.sub(r"(?<=祠)(?:堂|广场)$", "", value)
     return re.sub(r"[\s·._-]", "", value)
 
 
-def _dedupe_semantic_venues(items: list[ScoredPOI]) -> list[ScoredPOI]:
+def _dedupe_semantic_venues(
+    items: list[ScoredPOI],
+    *,
+    required_terms: list[str] | None = None,
+) -> list[ScoredPOI]:
+    required_terms = required_terms or []
+    indexed = list(enumerate(items))
+
+    def request_priority(entry: tuple[int, ScoredPOI]) -> tuple[int, tuple[int, int], int]:
+        index, item = entry
+        priorities = [
+            _named_venue_priority(item.poi, term)
+            for term in required_terms
+            if _matches_candidate_attraction(item.poi, term)
+        ]
+        return (
+            0 if priorities else 1,
+            min(priorities, default=(99, 99)),
+            index,
+        )
+
     selected: list[ScoredPOI] = []
-    for item in items:
+    for _index, item in sorted(indexed, key=request_priority):
         if item.poi.category in {"food", "hotel", "transport"}:
             selected.append(item)
             continue
@@ -670,14 +1020,47 @@ def _dedupe_semantic_venues(items: list[ScoredPOI]) -> list[ScoredPOI]:
         duplicate = next(
             (
                 prior for prior in selected
-                if key and (
-                    key == _semantic_venue_key(prior.poi.name)
-                    or key in _semantic_venue_key(prior.poi.name)
-                    or _semantic_venue_key(prior.poi.name) in key
+                if (
+                    (
+                        (
+                        item.poi.parent_poi_id
+                        and prior.poi.source_poi_id
+                        and item.poi.parent_poi_id == prior.poi.source_poi_id
+                        )
+                        or (
+                        prior.poi.parent_poi_id
+                        and item.poi.source_poi_id
+                        and prior.poi.parent_poi_id == item.poi.source_poi_id
+                        )
+                        or (
+                        item.poi.parent_poi_id
+                        and prior.poi.parent_poi_id
+                        and item.poi.parent_poi_id == prior.poi.parent_poi_id
+                        )
+                    )
+                    and (
+                        item.poi.category == prior.poi.category
+                        or (
+                            key
+                            and _semantic_venue_key(prior.poi.name)
+                            and (
+                                key in _semantic_venue_key(prior.poi.name)
+                                or _semantic_venue_key(prior.poi.name) in key
+                            )
+                        )
+                    )
+                    or (
+                        key
+                        and (
+                            key == _semantic_venue_key(prior.poi.name)
+                            or key in _semantic_venue_key(prior.poi.name)
+                            or _semantic_venue_key(prior.poi.name) in key
+                        )
+                        and _haversine_km(
+                            item.poi.lng, item.poi.lat, prior.poi.lng, prior.poi.lat
+                        ) < 1.0
+                    )
                 )
-                and _haversine_km(
-                    item.poi.lng, item.poi.lat, prior.poi.lng, prior.poi.lat
-                ) < 1.0
             ),
             None,
         )
@@ -728,6 +1111,56 @@ def _cluster_scored_pois_by_day(
         groups = new_groups
 
     groups = _spread_hard_must_visit_anchors(groups, profile)
+
+    # K-means is allowed to produce 1/2/3 activity splits, but a complete
+    # multi-day itinerary should not leave a half-empty day when the selected,
+    # grounded supply is already sufficient for two activities per day.
+    minimum_activities = 2
+    if max_per_day >= minimum_activities and len(sorted_pois) >= days * minimum_activities:
+        state = profile.constraint_state or {}
+        fixed_terms = [
+            str(event.get("location") or "").strip()
+            for event in (state.get("fixed_events") or [])
+            if isinstance(event, dict)
+            and str(event.get("location") or "").strip()
+            not in {"自由活动", "休息", "自由时间"}
+        ]
+        hard_terms = [*(profile.must_visit or []), *fixed_terms]
+
+        def hard_required(item: ScoredPOI) -> bool:
+            return any(
+                poi_matches_must_visit(item.poi, term)
+                for term in hard_terms
+            )
+
+        for target_index in sorted(range(days), key=lambda index: len(groups[index])):
+            while len(groups[target_index]) < minimum_activities:
+                donors = [
+                    index
+                    for index in range(days)
+                    if index != target_index and len(groups[index]) > minimum_activities
+                ]
+                if not donors:
+                    break
+                target_center = _centroid(groups[target_index]) if groups[target_index] else None
+                donor_index, moved = min(
+                    (
+                        (source_index, item)
+                        for source_index in donors
+                        for item in groups[source_index]
+                    ),
+                    key=lambda pair: (
+                        hard_required(pair[1]),
+                        _haversine_km(
+                            pair[1].poi.lng,
+                            pair[1].poi.lat,
+                            target_center[0],
+                            target_center[1],
+                        ) if target_center is not None else -pair[1].score,
+                    ),
+                )
+                groups[donor_index].remove(moved)
+                groups[target_index].append(moved)
 
     remaining_food = list(food_pois)
     if len(remaining_food) >= days:
@@ -799,13 +1232,27 @@ def _spread_hard_must_visit_anchors(
     group during capacity balancing.  Exchange an extra mandatory venue with
     a non-mandatory activity from an unanchored day, preserving group sizes.
     """
-    if len(groups) < 2 or not profile.must_visit:
+    state = profile.constraint_state or {}
+    unspecified = {
+        normalize_entity_name(item)
+        for item in state.get("user_owned_unspecified_fixed_event_locations") or []
+        if normalize_entity_name(item)
+    }
+    fixed_locations = [
+        str(event.get("location") or "").strip()
+        for event in state.get("fixed_events") or []
+        if isinstance(event, dict)
+        and str(event.get("location") or "").strip()
+        and normalize_entity_name(event.get("location")) not in unspecified
+    ]
+    required_terms = [*(profile.must_visit or []), *fixed_locations]
+    if len(groups) < 2 or not required_terms:
         return groups
 
     def required(item: ScoredPOI) -> bool:
         return any(
             poi_matches_must_visit(item.poi, term)
-            for term in profile.must_visit
+            for term in required_terms
         )
 
     result = [list(group) for group in groups]
@@ -855,7 +1302,7 @@ def _spread_hard_must_visit_anchors(
 
 def _stops_per_day(profile: TravelProfile) -> int:
     if profile.pace == "relaxed":
-        return 3 if int(profile.days or 1) > 1 else 2
+        return 2
     if profile.pace == "intensive":
         return 4
     return 3
@@ -873,11 +1320,15 @@ def _build_day_stops(
         earliest_minutes = _time_to_minutes(start_time)
         if route_estimator and stops:
             try:
-                route_from_previous = route_estimator.estimate_route(
+                route_from_previous = normalize_route_evidence(route_estimator.estimate_route(
                     stops[-1].poi,
                     item.poi,
                     profile.transport_mode,
-                )
+                ))
+                if not route_supports_endpoints(
+                    route_from_previous, stops[-1].poi.poi_id, item.poi.poi_id
+                ):
+                    route_from_previous = None
             except Exception:  # 路线服务异常时使用可核验的直线距离估算，避免整单失败
                 from travel_agent.tools import estimate_route_minutes
 
@@ -886,14 +1337,14 @@ def _build_day_stops(
                     item.poi,
                     profile.transport_mode,
                 )
-                route_from_previous = RouteInfo(
+                route_from_previous = normalize_route_evidence(RouteInfo(
                     origin_poi_id=stops[-1].poi.poi_id,
                     destination_poi_id=item.poi.poi_id,
                     distance_km=distance_km,
                     duration_min=duration_min,
                     mode=profile.transport_mode,
                     source="haversine_recovery_estimate",
-                )
+                ), provider_explicit=False)
         if stops:
             previous = stops[-1]
             previous_end = (
@@ -905,6 +1356,8 @@ def _build_day_stops(
             earliest_minutes = max(earliest_minutes, _round_up_to_quarter(previous_end))
         if item.poi.category == "food":
             earliest_minutes = _next_meal_time_minutes(earliest_minutes)
+        elif _time_to_minutes("11:30") <= earliest_minutes < _time_to_minutes("13:00"):
+            earliest_minutes = _time_to_minutes("13:00")
         actual_start_time = _minutes_to_time(earliest_minutes)
         stops.append(
             ItineraryStop(
@@ -941,7 +1394,12 @@ def _schedule_day_candidates(day_candidates: list[ScoredPOI]) -> list[tuple[Scor
     food_index = 0
 
     for item in activity_items[:1]:
-        scheduled.append((item, ACTIVITY_TIMES[activity_index]))
+        scheduled.append((
+            item,
+            _minutes_to_time(_preferred_activity_start_minutes(
+                item.poi, _time_to_minutes(ACTIVITY_TIMES[activity_index])
+            )),
+        ))
         activity_index += 1
 
     if food_items:
@@ -950,7 +1408,12 @@ def _schedule_day_candidates(day_candidates: list[ScoredPOI]) -> list[tuple[Scor
 
     for item in activity_items[1:]:
         time = ACTIVITY_TIMES[min(activity_index, len(ACTIVITY_TIMES) - 1)]
-        scheduled.append((item, time))
+        scheduled.append((
+            item,
+            _minutes_to_time(_preferred_activity_start_minutes(
+                item.poi, _time_to_minutes(time)
+            )),
+        ))
         activity_index += 1
 
     for item in food_items[1:]:
@@ -968,14 +1431,30 @@ def _is_evening_only(poi: POI) -> bool:
     return window is not None and window[0] >= _time_to_minutes("17:00")
 
 
+def _preferred_activity_start_minutes(poi: POI, default: int) -> int:
+    """Respect explicit experience semantics even when a venue is open all day."""
+    identity = " ".join(
+        str(value or "")
+        for value in (poi.name, poi.canonical_name, *poi.aliases, *poi.tags)
+    ).casefold()
+    night_markers = (
+        "夜景", "灯光秀", "灯光表演", "夜游", "不夜城", "夜市",
+        "light show", "night view", "night cruise", "night market",
+    )
+    if any(marker in identity for marker in night_markers):
+        return max(default, _time_to_minutes("18:00"))
+    return default
+
+
 def _time_sort_key(value: str) -> tuple[int, int]:
     hour, minute = value.split(":", 1)
     return int(hour), int(minute)
 
 
 def _time_to_minutes(value: str) -> int:
-    hour, minute = _time_sort_key(value)
-    return hour * 60 + minute
+    from travel_agent.constraint_events import clock_minutes
+
+    return clock_minutes(value)
 
 
 def _minutes_to_time(value: int) -> str:

@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextvars
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -59,27 +60,13 @@ class ReviewContext:
 
     def to_prompt_text(self) -> str:
         """渲染为 Reviewer prompt 的上下文段（纯文本，无工具）。"""
-        plan = {
-            key: self.plan.get(key)
-            for key in (
-                "itinerary",
-                "critic",
-                "revision_notes",
-                "final_issue_count",
-                "source_artifact_ids",
-                "revision_directives",
-            )
-            if key in self.plan
-        }
+        plan = _review_artifact_snapshot(self.plan, self.profile_brief)
         if isinstance(plan.get("itinerary"), dict):
             plan["itinerary"] = _compact_itinerary(plan["itinerary"])
         payload = {
             "request_id": self.request_id,
             "task_brief": self.task_brief,
             "profile": self.profile_brief,
-            # Do not duplicate original_itinerary or full domain payloads.  The
-            # reviewer needs the final plan plus evidence identities, and some
-            # providers enforce a ~30k input-character boundary.
             "plan": plan,
             "subagent_results": [
                 {
@@ -102,7 +89,8 @@ REVIEWER_MAX_OUTPUT_TOKENS = 1024
 REVIEWER_TIMEOUT_SECONDS = 90
 
 _REVIEWER_INSTRUCTION = """你是行程语义复核者（Semantic Reviewer）。你不拥有任何工具，也不重新生成计划。
-只基于给定的 TravelPlan、用户画像与领域调研证据，检查：软偏好匹配、行程节奏、
+必须完整读取 artifact 中的 itinerary、budget_plan、lodging_plan、route_evidence、
+meal_strategy、validation_result 与 active_constraints，再结合领域调研证据检查：软偏好匹配、行程节奏、
 适老性/无障碍、跨领域一致性（交通耗时与景点安排、预算与档位等）。
 对每个问题输出 JSON：issue_type / severity(critical|recoverable|noncritical) /
 description / evidence / repair_target(attraction|hotel|restaurant|transport|planner) /
@@ -119,9 +107,16 @@ repair_instruction。严重度必须遵循：
   只能判 noncritical；不得把“可能”“疑似”或常识猜测作为 critical/recoverable 的相反证据；
 - 只以 profile 中的显式约束判定硬冲突，不要把 task_brief 的自然语言候选或领域缺席自行升级为硬约束；
 - 饮食限制约束的是已安排餐饮必须合规；某天没有餐厅/餐饮 stop 本身不代表吃了不合规食物，
-  最多是行程完整性优化。只有计划明确安排了与 dietary 冲突的餐厅或菜系，才能判硬冲突；
+  未明确要求具体餐厅时只检查是否合理预留用餐时间，缺少具体餐厅不是问题、不得触发返工。
+  只有明确餐厅需求/饮食硬约束缺少可靠证据，或计划明确安排了冲突餐厅，才能判硬冲突；
+- 用户自有但未指定具体场所的用餐预约，以 fixed_event_plan 中保留的日期、时间和区域为准；
+  其区域记录在 user_owned_unspecified_fixed_event_locations 时不得要求虚构餐厅 POI，但仍应检查到该区域的路线证据；
 - 住宿由 hotel 领域 evidence、住宿区域与补充卡片承载，不要求把酒店塞进 itinerary.days[].stops；
-  酒店没有作为每日游玩停靠点本身不是缺失，也不得据此要求 Planner 添加酒店 stop；
+  用户未明确要求具体酒店时，住宿区域即可；不得强制推荐具体酒店或要求 Planner 添加酒店 stop；
+- noncritical/warning 只作交付注释，不得改变 verdict/outcome，也不得阻止交付；
+- 每个问题的 evidence 必须绑定 artifact 的具体字段路径（如 budget_plan.expected_total）
+  或给定的工具/Artifact evidence id；没有绑定证据的推测只能是 noncritical；
+- validation_result/critic 的确定性通过结论优先于无相反工具证据的推测性建议；
 - verdict=pass 时 issues 必须为空；verdict=rework 时不得含 critical；存在 critical 时 verdict=failed。
 整体给出 verdict：pass | rework | failed。"""
 
@@ -301,6 +296,37 @@ def _review_contract_shape_valid(raw: Any) -> bool:
         return False
     if verdict == VERDICT_PASS:
         return not issues
+    allowed_targets = {
+        "",
+        "none",
+        "null",
+        "n/a",
+        "无",
+        "attraction",
+        "hotel",
+        "restaurant",
+        "transport",
+        "planner",
+    }
+    for item in issues:
+        if not isinstance(item, dict):
+            return False
+        severity = str(item.get("severity") or "")
+        repair_target = str(item.get("repair_target") or "").strip().lower()
+        if (
+            not str(item.get("issue_type") or "").strip()
+            or not str(item.get("description") or "").strip()
+            or severity not in SEVERITIES
+            or repair_target not in allowed_targets
+        ):
+            return False
+        if severity == SEVERITY_RECOVERABLE and (
+            repair_target not in {
+                "attraction", "hotel", "restaurant", "transport", "planner"
+            }
+            or not str(item.get("repair_instruction") or "").strip()
+        ):
+            return False
     severities = {
         str(item.get("severity") or "")
         for item in issues
@@ -309,6 +335,66 @@ def _review_contract_shape_valid(raw: Any) -> bool:
     if verdict == VERDICT_REWORK:
         return SEVERITY_RECOVERABLE in severities and SEVERITY_CRITICAL not in severities
     return SEVERITY_CRITICAL in severities
+
+
+def _review_artifact_snapshot(
+    plan: dict[str, Any],
+    profile_brief: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the complete semantic artifact contract without map-only bloat."""
+    snapshot = {
+        key: plan.get(key)
+        for key in (
+            "itinerary",
+            "budget_plan",
+            "lodging_plan",
+            "meal_strategy",
+            "validation_result",
+            "critic",
+            "return_plan",
+            "fixed_event_plan",
+            "mobility_plan",
+            "candidate_verification",
+            "revision_notes",
+            "final_issue_count",
+            "source_artifact_ids",
+            "revision_directives",
+            "state_version",
+        )
+        if key in plan
+    }
+    active_constraints = (
+        profile_brief.get("constraint_state")
+        if isinstance(profile_brief.get("constraint_state"), dict)
+        else {}
+    )
+    snapshot["active_constraints"] = active_constraints
+    snapshot["route_evidence"] = {
+        "required_route_anchors": plan.get("required_route_anchors"),
+        "lodging_route_anchors": plan.get("lodging_route_anchors"),
+        "return_plan": plan.get("return_plan"),
+        "transport_artifacts": [
+            {
+                "artifact_id": item.get("artifact_id"),
+                "payload": item.get("payload"),
+            }
+            for item in ((plan.get("domain_inputs") or {}).get("transport") or [])
+            if isinstance(item, dict)
+        ],
+    }
+    if not snapshot.get("meal_strategy"):
+        snapshot["meal_strategy"] = {
+            "dietary_constraints": active_constraints.get("dietary"),
+            "restaurant_artifacts": [
+                {
+                    "artifact_id": item.get("artifact_id"),
+                    "payload": item.get("payload"),
+                }
+                for item in ((plan.get("domain_inputs") or {}).get("restaurants") or [])
+                if isinstance(item, dict)
+            ],
+        }
+    return snapshot
 
 
 def _compact_itinerary(itinerary: dict[str, Any]) -> dict[str, Any]:
@@ -517,15 +603,118 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
         "根据常识",
         "推断",
         "缺乏明确证据",
+        "未提供任何证据",
         "未指定",
         "需考虑",
     )
-    omission_markers = ("未包含", "未安排", "遗漏", "缺失", "未提供替代")
+    omission_markers = ("未包含", "未安排", "遗漏", "缺失", "省略", "未提供替代")
     fixed_events = [
         event for event in (state.get("fixed_events") or []) if isinstance(event, dict)
     ]
+    plan = review_ctx.plan or {}
+    source_ids = {
+        str(item)
+        for item in plan.get("source_artifact_ids") or []
+        if str(item).strip()
+    }
+    for result in review_ctx.subagent_results:
+        for evidence in result.evidence:
+            if isinstance(evidence, dict) and evidence.get("artifact_id"):
+                source_ids.add(str(evidence["artifact_id"]))
+    known_fields = {
+        key for key, value in plan.items() if value not in (None, "", [], {})
+    } | {"active_constraints", "profile", "constraint_state"}
+    contract_fields = {
+        "itinerary", "budget_plan", "lodging_plan", "route_evidence",
+        "meal_strategy", "validation_result", "critic", "active_constraints",
+        "constraint_state", "profile", "return_deadline", "fixed_events",
+        "must_visit", "budget_max_cny", "lodging_area", "dietary",
+        "transport_mode", "public_transport_required", "mobility",
+    }
+    mobility_plan = plan.get("mobility_plan") or {}
+    mobility_days = [
+        item for item in mobility_plan.get("days") or [] if isinstance(item, dict)
+    ]
+    mobility_limit = mobility_plan.get("max_walking_km_per_day")
+    try:
+        mobility_limit_value = float(mobility_limit)
+    except (TypeError, ValueError):
+        mobility_limit_value = None
+    bounded_taxi_fallback = bool(
+        mobility_plan.get("status") == "bounded_with_taxi_fallback"
+        and mobility_limit_value is not None
+        and mobility_days
+        and all(
+            float(day.get("known_walking_km") or 0) <= mobility_limit_value
+            and (
+                not day.get("unknown_walking_legs")
+                or day.get("taxi_fallback_required") is True
+            )
+            for day in mobility_days
+        )
+        and (plan.get("critic") or {}).get("passed") is True
+    )
+    hard_timed_route_state = bool(
+        state.get("return_deadline") or state.get("fixed_events")
+    )
+    hard_mobility_evidence_required = bool(
+        state.get("wheelchair_user")
+        or state.get("accessibility_priority")
+        or state.get("elderly")
+        or state.get("max_walking_km_per_day") is not None
+        or state.get("walking_time_max_min") is not None
+        or state.get("max_single_walk_min") is not None
+        or any(
+            marker in str(value).casefold()
+            for value in (state.get("avoid") or [], state.get("mobility") or [])
+            for marker in (
+                "台阶", "楼梯", "爬坡", "上坡", "stairs", "hills", "wheelchair"
+            )
+        )
+    )
+    hard_internal_accessibility_required = bool(
+        state.get("wheelchair_user")
+        or state.get("accessibility_priority")
+        or any(
+            marker in str(value).casefold()
+            for value in (state.get("avoid") or [], state.get("mobility") or [])
+            for marker in (
+                "台阶", "楼梯", "爬坡", "上坡", "stairs", "hills", "wheelchair"
+            )
+        )
+    )
+
+    def evidence_bound(issue: ReviewIssue) -> bool:
+        for raw in issue.evidence:
+            item = str(raw).strip()
+            lowered = item.lower()
+            if not item:
+                continue
+            if any(source_id in item for source_id in source_ids):
+                return True
+            if lowered.startswith(("tool:", "artifact:", "artifact_id:")):
+                return True
+            field_binding = re.match(
+                r"^(?:profile\.|active_constraints\.|constraint_state\.)?"
+                r"([a-z][a-z0-9_]*)(?:\[[^]]+\]|\.[a-z0-9_]+)*\s*(?:=|:)",
+                lowered,
+            )
+            if field_binding and field_binding.group(1) in contract_fields | known_fields:
+                return True
+            if any(
+                re.search(rf"(?:^|[.\[\s]){re.escape(field)}(?:$|[.\[=:\s])", item)
+                for field in known_fields
+            ):
+                return True
+            if (plan.get("itinerary") or "days" in plan) and re.search(
+                r"(?:itinerary|day\s*\d+|day\d+|第\d+天)", lowered
+            ):
+                return True
+        return False
+
     for issue in review.issues:
         combined = " ".join([issue.description, *issue.evidence])
+        combined_lower = combined.casefold()
         unsupported_guess = any(marker in combined for marker in uncertainty_markers)
         omitted_candidate_only = (
             any(candidate in combined for candidate in candidates)
@@ -536,8 +725,117 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             bool(fixed_events)
             and any(term in combined for term in ("预约", "固定事件", "晚饭", "晚餐", "午饭", "午餐"))
             and any(marker in combined for marker in omission_markers)
+            and not any(
+                marker in combined_lower
+                for marker in ("route_evidence", "路线证据", "transport evidence")
+            )
         )
-        soft_gap_claim = "空档" in combined or "时间浪费" in combined
+        soft_gap_claim = any(
+            marker in combined_lower
+            for marker in (
+                "空档", "空白", "过于稀疏", "仅安排", "时间浪费",
+                "unaccounted gap", "long gap", "six-hour gap", "sparse",
+            )
+        )
+        lodging_claim = any(
+            marker in combined_lower
+            for marker in ("住宿", "酒店", "lodging", "hotel", "accommodation")
+        )
+        explicit_lodging = bool(
+            profile.get("hotel_area")
+            or state.get("lodging_area")
+            or state.get("hotel_area")
+            or state.get("hotel_budget_per_night_cny") is not None
+        )
+        unrequested_lodging_gap = lodging_claim and not explicit_lodging
+        hard_route_state = any(
+            state.get(key) not in (None, "", [], {})
+            for key in (
+                "return_deadline", "walking_time_max_min",
+                "max_single_walk_min", "max_walking_km_per_day",
+                "max_transfers_per_day", "accessibility_priority", "wheelchair_user",
+            )
+        ) or (
+            bool(state.get("fixed_events"))
+            and any(marker in combined_lower for marker in ("fixed_event", "固定", "预约"))
+        )
+        critic_warnings = {
+            str(item.get("code") or "")
+            for item in (plan.get("critic") or {}).get("issues") or []
+            if isinstance(item, dict)
+            and str(item.get("severity") or "warning").lower() == "warning"
+        }
+        soft_route_pace_claim = (
+            "route_too_long" in combined_lower
+            and "route_too_long" in critic_warnings
+            and not hard_route_state
+        )
+        soft_route_evidence_gap = (
+            any(
+                marker in combined_lower
+                for marker in ("route_evidence", "路线证据", "transport evidence")
+            )
+            and (
+                not hard_route_state
+                or (
+                    bounded_taxi_fallback
+                    and not hard_timed_route_state
+                )
+            )
+            and (plan.get("critic") or {}).get("passed") is True
+        )
+        bounded_mobility_evidence_gap = bool(
+            bounded_taxi_fallback
+            and not state.get("wheelchair_user")
+            and not state.get("accessibility_priority")
+            and any(
+                token in str(issue.issue_type or "").casefold()
+                for token in ("accessibility", "mobility", "elderly", "walking")
+            )
+            and any(
+                marker in combined_lower
+                for marker in (
+                    "known_walking_km", "unknown_walking_legs", "步行距离未知",
+                    "无法确认", "内部步行", "步行距离证据",
+                )
+            )
+        )
+        nonrequired_internal_accessibility_claim = bool(
+            not hard_internal_accessibility_required
+            and (
+                "accessibility" in str(issue.issue_type or "").casefold()
+                or any(
+                    marker in combined_lower
+                    for marker in ("无障碍", "台阶", "电梯", "适老", "内部步行")
+                )
+            )
+        )
+        deterministic_schedule_advisory = bool(
+            any(
+                marker in str(issue.issue_type or "").casefold()
+                for marker in ("schedule_feasibility", "schedule_conflict")
+            )
+            and (plan.get("critic") or {}).get("passed") is True
+            and (plan.get("validation_result") or {}).get("passed") is True
+            and not hard_timed_route_state
+        )
+        soft_interest_gap = (
+            "interest" in str(issue.issue_type or "").casefold()
+            and not any(required in combined for required in must_visit)
+        )
+        soft_preference_gap = (
+            "preference" in str(issue.issue_type or "").casefold()
+            and not any(required in combined for required in must_visit)
+        )
+        budget_plan = plan.get("budget_plan") or {}
+        uncertain_budget_band_only = bool(
+            budget_plan.get("within_user_limit") is True
+            and budget_plan.get("risk_high_exceeds_limit") is True
+            and any(
+                marker in combined_lower
+                for marker in ("risk_high_exceeds_limit", "high risk band", "风险区间", "超预算风险")
+            )
+        )
         missing_meal_only = any(
             marker in combined
             for marker in (
@@ -553,12 +851,49 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             marker in combined
             for marker in ("安排了非清真", "安排非清真", "与饮食限制冲突的餐厅")
         )
+        false_composite_omission = any((
+            bool(plan.get("budget_plan"))
+            and any(term in combined for term in ("缺少预算", "未提供预算", "没有预算")),
+            bool(plan.get("lodging_plan"))
+            and any(term in combined for term in ("缺少住宿", "未提供住宿", "没有住宿", "未安排酒店")),
+            bool(
+                plan.get("required_route_anchors")
+                or plan.get("lodging_route_anchors")
+                or plan.get("return_plan")
+                or (plan.get("domain_inputs") or {}).get("transport")
+            )
+            and any(term in combined for term in ("缺少路线", "未提供路线", "没有路线", "缺少交通")),
+        ))
+        unbound_material_issue = (
+            issue.severity in {SEVERITY_CRITICAL, SEVERITY_RECOVERABLE}
+            and not evidence_bound(issue)
+        )
+        self_acknowledged_correctness = bool(
+            any(
+                marker in combined_lower
+                for marker in ("是正确的", "为正确", "is correct", "correct, but")
+            )
+            and (plan.get("critic") or {}).get("passed") is True
+            and (plan.get("validation_result") or {}).get("passed") is True
+        )
         if issue.severity != SEVERITY_NONCRITICAL and (
             unsupported_guess
             or omitted_candidate_only
             or fixed_event_claim
             or soft_gap_claim
+            or unrequested_lodging_gap
+            or soft_route_pace_claim
+            or soft_route_evidence_gap
+            or bounded_mobility_evidence_gap
+            or nonrequired_internal_accessibility_claim
+            or deterministic_schedule_advisory
+            or soft_interest_gap
+            or soft_preference_gap
+            or uncertain_budget_band_only
             or missing_meal_only
+            or false_composite_omission
+            or unbound_material_issue
+            or self_acknowledged_correctness
         ):
             issue.severity = SEVERITY_NONCRITICAL
             issue.repair_target = ""

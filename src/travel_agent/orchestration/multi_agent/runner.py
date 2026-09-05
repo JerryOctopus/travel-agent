@@ -79,6 +79,13 @@ class SubagentRunner:
 
         trace = current_trace()
         if trace is not None:
+            timeout_reason = (
+                "deadline_exhausted_before_dispatch"
+                if "effective timeout exhausted" in str(result.error or "")
+                else "component_timeout"
+                if "timeout after" in str(result.error or "")
+                else None
+            )
             trace.append(
                 "subagent",
                 agent=result.agent,
@@ -97,6 +104,9 @@ class SubagentRunner:
                     "evidence": list(result.evidence),
                     "warnings": list(result.warnings),
                     "unresolved": list(result.unresolved),
+                    "stage": "planner" if result.agent == "planner" else "worker",
+                    "responsible_component": result.agent,
+                    "timeout_reason": timeout_reason,
                 },
             )
         return result
@@ -195,6 +205,10 @@ class SubagentRunner:
             from langchain_core.runnables.config import var_child_runnable_config
 
             runnable_token = var_child_runnable_config.set({})
+            from travel_agent.artifact_policy import constraint_version
+
+            isolated_profile = getattr(isolated_ctx, "profile", None)
+
             token = set_current_task_meta(
                 {
                     "request_id": task.request_id,
@@ -203,6 +217,18 @@ class SubagentRunner:
                     "artifact_ids": artifact_ids,
                     "revision_directives": dict(
                         task.inputs.get("revision_directives") or {}
+                    ),
+                    "parent_plan_artifact_id": task.inputs.get("parent_plan_artifact_id")
+                    or task.inputs.get("plan_artifact_id"),
+                    "constraint_state": dict(
+                        (task.inputs.get("profile") or {}).get("constraint_state")
+                        or getattr(getattr(isolated_ctx, "profile", None), "constraint_state", {})
+                        or {}
+                    ),
+                    "constraint_version": (
+                        constraint_version(isolated_profile)
+                        if isolated_profile is not None
+                        else None
                     ),
                 }
             )
@@ -292,19 +318,62 @@ def _build_result(
             record = store.get_record(artifact_id)
             if record is None:
                 continue
-            evidence.append(
-                {
-                    "artifact_id": artifact_id,
-                    "kind": record.get("kind"),
-                    "agent": record.get("agent") or task.agent,
-                    "request_id": record.get("request_id") or task.request_id,
-                    "task_id": record.get("task_id") or task.task_id,
-                    "data_source": record.get("data_source"),
+            evidence_item = {
+                "artifact_id": artifact_id,
+                "kind": record.get("kind"),
+                "agent": record.get("agent") or task.agent,
+                "request_id": record.get("request_id") or task.request_id,
+                "task_id": record.get("task_id") or task.task_id,
+                "data_source": record.get("data_source"),
+            }
+            record_payload = record.get("payload") or {}
+            if record.get("kind") == "routes":
+                evidence_item["route_summary"] = {
+                    key: record_payload.get(key)
+                    for key in (
+                        "origin_poi_id",
+                        "destination_poi_id",
+                        "origin_name",
+                        "destination_name",
+                        "mode",
+                        "source",
+                        "evidence_status",
+                    )
                 }
-            )
+            elif record.get("kind") == "itinerary":
+                days = (record_payload.get("itinerary") or {}).get("days") or []
+                scheduled_days = [day for day in days if day.get("stops")]
+                terminal = (
+                    scheduled_days[-1]["stops"][-1].get("poi", {})
+                    if scheduled_days
+                    else {}
+                )
+                evidence_item["itinerary_summary"] = {
+                    "artifact_status": record_payload.get("artifact_status"),
+                    "parent_plan_artifact_id": record_payload.get(
+                        "parent_plan_artifact_id"
+                    ),
+                    "revision_directives": record_payload.get("revision_directives"),
+                    "terminal_poi_id": terminal.get("poi_id"),
+                    "terminal_name": terminal.get("name"),
+                    "validation_issue_codes": [
+                        str(issue.get("code") or "")
+                        for issue in (
+                            (record_payload.get("validation_result") or {}).get("issues")
+                            or []
+                        )
+                        if isinstance(issue, dict) and issue.get("code")
+                    ],
+                    "critic_issue_codes": [
+                        str(issue.get("code") or "")
+                        for issue in (record_payload.get("critic") or {}).get("issues") or []
+                        if isinstance(issue, dict) and issue.get("code")
+                    ],
+                }
+            evidence.append(evidence_item)
             kind = record.get("kind")
             if kind:
-                artifacts_by_kind[kind] = record.get("payload") or {}
+                artifacts_by_kind[kind] = record_payload
         if not isinstance(payload, dict) or not payload:
             payload = {"artifacts": artifacts_by_kind}
     return SubagentResult(

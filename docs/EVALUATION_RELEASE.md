@@ -1,13 +1,13 @@
 # Agent Release Evaluation Report
 
 - status: `pass`
-- suites: chinatravel-mini
+- suites: agent-product
 
 ## Gates
 
 | gate | passed | detail |
 | --- | --- | --- |
-| chinatravel-mini | True | delivery=1.0, schema=100.0, fpr>0 when available |
+| agent-product | True | Product suite must record one fixed model/provider and contain samples |
 
 ## Blockers
 

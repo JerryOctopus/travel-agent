@@ -21,6 +21,8 @@ class DeadlineConfig:
     base_timeout: float = 210.0
     planner_reserve: float = 25.0
     reviewer_reserve: float = 85.0
+    deterministic_gate_reserve: float = 5.0
+    render_reserve: float = 5.0
     router_timeout: float = 80.0
     router_useful: float = 35.0
     worker_timeout: float = 60.0
@@ -48,6 +50,12 @@ class DeadlineConfig:
             ),
             reviewer_reserve=_positive(
                 getattr(orchestration, "reviewer_reserve_seconds", None), 85.0
+            ),
+            deterministic_gate_reserve=_positive(
+                getattr(orchestration, "deterministic_gate_reserve_seconds", None), 5.0
+            ),
+            render_reserve=_positive(
+                getattr(orchestration, "render_reserve_seconds", None), 5.0
             ),
             router_timeout=_positive(
                 getattr(orchestration, "router_timeout_seconds", None), 80.0
@@ -115,6 +123,8 @@ class TurnDeadline:
             self.started_at + self.config.base_timeout,
             self.turn_deadline
             - self.config.reviewer_reserve
+            - self.config.deterministic_gate_reserve
+            - self.config.render_reserve
             - self.config.admission_guard,
         )
 
@@ -192,7 +202,10 @@ class TurnDeadline:
             0.0,
             min(
                 self.config.reviewer_timeout,
-                self.turn_remaining(now) - self.config.admission_guard,
+                self.turn_remaining(now)
+                - self.config.deterministic_gate_reserve
+                - self.config.render_reserve
+                - self.config.admission_guard,
             ),
         )
 
@@ -235,5 +248,7 @@ class TurnDeadline:
             "usable_preplanner_ms": int(self.usable_preplanner_time(timestamp) * 1000),
             "planner_reserved_ms": int(self.config.planner_reserve * 1000),
             "reviewer_reserved_ms": int(self.config.reviewer_reserve * 1000),
+            "deterministic_gate_reserved_ms": int(self.config.deterministic_gate_reserve * 1000),
+            "render_reserved_ms": int(self.config.render_reserve * 1000),
             "sla_180_exceeded": self.sla_exceeded(timestamp),
         }

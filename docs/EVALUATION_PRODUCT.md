@@ -24,6 +24,21 @@
 
 主指标 **`strict_task_success`** = 七项合取：
 
+评测在选择 evaluator 前先执行 artifact contract：先推断
+`expected_artifact_type`，再识别 `actual_artifact_type`，最后选择相应 evaluator。
+支持 `full_itinerary`、`partial_itinerary`、`route_plan`、
+`candidate_comparison`、`local_adjustment`、`clarification`、
+`constraint_negotiation`、`safe_decline`。旧 schema 的 outcome/gold 字段继续保留，
+但不再把所有 `full_plan` 标签解释为“必须生成完整行程”。
+
+非行程任务使用任务完成、约束满足、grounding 与完整性检查，行程 Judge 为
+`not_applicable`；缺少 itinerary 不影响通过。预期完整行程但没有生成时，
+`artifact_type_match=false`、`failure_reason=missing_expected_artifact`，行程 Judge
+为 `not_run`。Partial itinerary 使用独立诊断 Rubric，不与 Full Rubric 分数混合平均。
+
+Judge 状态严格区分：`ok`（完成）、`not_applicable`（任务不需要）、`not_run`
+（缺少预期产物或系统失败）、`missing/error`（Judge 自身未完成或失败）。
+
 1. outcome 匹配（五分类：`full_plan` / `partial_plan_with_limitations` /
    `clarify` / `negotiate_constraints` / `safe_decline_action`）；
 2. gold 约束树无缺失（路径匹配 structured_state = final_profile + constraints artifact）；
@@ -40,8 +55,8 @@
 
 原 task_completion_rate / hard_constraint_rate 等 plan_eval 细项全部保留为**次要诊断指标**。
 
-独立 LLM-as-Judge 作为**次级质量审计**接入，默认模型固定为
-`google / gemini-3.6-flash`。它对 schedule、route、constraints、personalization、
+独立 LLM-as-Judge 作为**次级质量审计**接入；当前 Dev34 验收模型固定为
+`siliconflow / Qwen/Qwen3.5-397B-A17B`。它对 schedule、route、constraints、personalization、
 completeness、diversity、clarity 七个维度评分，总分 100，合理阈值为 70。
 Judge 输入不包含 Agent 内部 critic、初稿或 deterministic rule 结论；规则硬可行性
 只在 Judge 返回后作为 `reasonable` 的独立门控使用。`strict_task_success` 和 Judge
@@ -58,9 +73,27 @@ PYTHONPATH=src .venv/bin/python scripts/eval_plan_quality.py judge \
   --run-dir data/eval/product/runs/<run_id> --resume
 ```
 
+正式 Dev34 在 Judge 前先执行独立预检；预检只发送最小 ping，不包含 case 数据：
+
+```bash
+TRAVEL_AGENT_JUDGE_PROVIDER=siliconflow \
+TRAVEL_AGENT_JUDGE_MODEL=Qwen/Qwen3.5-397B-A17B \
+TRAVEL_AGENT_JUDGE_TEMPERATURE=0 \
+TRAVEL_AGENT_JUDGE_THINKING_ENABLED=false \
+PYTHONPATH=src .venv/bin/python scripts/eval_plan_quality.py preflight
+```
+
+完成两轮后由同一确定性合同验收，并核对两轮数据、代码、Prompt、评分器、工具、
+模型与 Judge 指纹完全一致：
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/check_dev34_acceptance.py \
+  --run-dir data/eval/product/runs/<round-1> \
+  --second-run-dir data/eval/product/runs/<round-2>
+```
+
 Judge 仍使用独立的 `TRAVEL_AGENT_JUDGE_*` 配置，不会复用被测 Agent 的凭据或模型。
-如需固定 Gemini，可设置 `TRAVEL_AGENT_JUDGE_PROVIDER=google` 并提供
-`TRAVEL_AGENT_JUDGE_API_KEY` 或 `GEMINI_API_KEY`。
+正式 Dev34 使用独立的 SiliconFlow 凭据；不得静默切换为其他 provider 或模型。
 
 逐条结果落在 `evaluation.independent_judge`；聚合指标为
 `judge_average_score`、`judge_reasonable_rate`、`judge_completion_rate` 和
@@ -100,10 +133,10 @@ Judge 仍使用独立的 `TRAVEL_AGENT_JUDGE_*` 配置，不会复用被测 Agen
 | 阶段二 | 30 条 × 1 最终版 | 30 |
 | 阶段三 | 60 条 × 2 遍追加 | 120 |
 | **正常环境总计** | 512 + 30 + 120 | **662** |
-| 最终架构自身 | 120 + 30 + 120 | **270** |
+| 最终架构自身 | 128 + 30 + 120 | **278** |
 
-共 **150 条独立冻结任务**（Core+Challenge 120 + Shadow 30），4 种架构累计完成
-630 次正常环境执行。**禁止表述为"4 个版本一共只跑 270 次"。**
+共 **158 条独立冻结任务**（Core+Challenge 128 + Shadow 30），4 种架构累计完成
+662 次正常环境执行。**禁止表述为"4 个版本一共只跑 278 次"。**
 
 ### 公平控制（五同，落盘 comparison.json 的 `fair_controls`）
 

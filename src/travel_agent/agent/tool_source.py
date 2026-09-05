@@ -17,6 +17,7 @@ from pydantic.fields import PydanticUndefined
 
 from travel_agent.agent.lc_tools import build_tools
 from travel_agent.agent.session import SessionContext, current_task_meta
+from travel_agent.agent.tool_contract import normalize_tool_result
 from travel_agent.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -184,6 +185,7 @@ def _normalize_envelope(
         raise ToolContractError(f"{tool_name}: unsupported MCP result {type(value).__name__}")
     if not isinstance(payload, dict) or "isError" not in payload or "summary" not in payload:
         raise ToolContractError(f"{tool_name}: result violates toolkit envelope")
+    payload = normalize_tool_result(payload, tool_name)
     record = payload.pop("_artifact_record", None)
     profile = payload.pop("_profile_snapshot", None)
     if isinstance(ctx, SessionContext) and ctx.request_control is not None:

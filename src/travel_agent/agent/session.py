@@ -21,10 +21,12 @@ import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from travel_agent.agent.serde import poi_to_dict
 from travel_agent.providers import TravelToolProvider, build_tool_provider
 from travel_agent.schemas import POI, TravelProfile
+from travel_agent.hybrid_planning.call_cache import HybridCallCache
 
 # 当前 Subagent 任务元数据：由 SubagentRunner 在执行前 set，工具写入
 # artifact 时未显式传元数据则自动补全，保证并发场景下每条 artifact 都能
@@ -72,8 +74,8 @@ DEFAULT_POI_PATH = Path(__file__).resolve().parents[3] / "data" / "seed" / "pois
 DEFAULT_ARTIFACT_DIR = Path(__file__).resolve().parents[3] / "data" / "artifacts"
 
 # per-session 工具串行锁：LangGraph ToolNode 会并行执行同一 AIMessage 里的
-# 多个 tool_call，而工具共享可变 ctx（store/profile/pois_by_id）。按 session
-# 串行执行，fail-closed 防止并发写 artifact/画像竞态。
+# 多个 tool_call。共享工具契约仅对显式声明为非 parallel_safe 的工具加锁；
+# 查询型工具依赖 ArtifactStore/profile 自身的短锁，可继续并发执行。
 _SESSION_LOCKS: dict[str, threading.Lock] = {}
 _SESSION_LOCKS_GUARD = threading.Lock()
 
@@ -97,8 +99,12 @@ def session_tool_lock(session_id: str) -> threading.Lock:
 
 
 def should_serialize_tool(tool_name: str) -> bool:
-    """判定工具是否需要 per-session 串行锁（dispatch 类工具永远不加锁）。"""
-    return tool_name not in UNLOCKED_TOOL_NAMES
+    """Return the fail-closed concurrency decision for one logical tool."""
+    if tool_name in UNLOCKED_TOOL_NAMES:
+        return False
+    from travel_agent.agent.tool_contract import tool_execution_policy
+
+    return not tool_execution_policy(tool_name).parallel_safe
 
 
 def holds_session_lock(session_id: str) -> bool:
@@ -143,6 +149,18 @@ class ArtifactStore:
     ) -> str:
         if self.request_control is not None:
             self.request_control.check_active()
+        meta = _TASK_META.get()
+        if kind == "itinerary" and not isinstance(payload.get("state_version"), dict):
+            task_version = (meta or {}).get("constraint_version")
+            if isinstance(task_version, dict):
+                payload = copy.deepcopy(payload)
+                payload["state_version"] = {
+                    "constraint_revision": task_version.get("revision"),
+                    "constraint_hash": task_version.get("constraint_hash"),
+                    "constraint_snapshot": copy.deepcopy(
+                        task_version.get("constraint_snapshot") or {}
+                    ),
+                }
         artifact_id = f"{kind}_{uuid.uuid4().hex[:8]}"
         record = {
             "artifact_id": artifact_id,
@@ -153,6 +171,25 @@ class ArtifactStore:
             # a mutable alias to state protected by the store lock.
             "payload": copy.deepcopy(payload),
         }
+        if kind == "itinerary":
+            record["artifact_status"] = str(payload.get("artifact_status") or "current")
+            version = payload.get("state_version") or {}
+            record["constraint_revision"] = version.get("constraint_revision")
+            record["constraint_hash"] = version.get("constraint_hash")
+            record["constraint_snapshot"] = copy.deepcopy(version.get("constraint_snapshot") or {})
+            record["parent_artifact_id"] = payload.get("parent_plan_artifact_id")
+            record["revision_lineage"] = list(payload.get("revision_lineage") or [])
+            validation = payload.get("validation_result") or {}
+            record["validation_constraint_revision"] = validation.get(
+                "validated_constraint_revision"
+            )
+            record["validation_constraint_hash"] = validation.get(
+                "validated_constraint_hash"
+            )
+        elif payload.get("artifact_status"):
+            # Read-only diagnostics participate in audit lookup but never in
+            # the current deliverable lifecycle.
+            record["artifact_status"] = str(payload["artifact_status"])
         if request_id is not None:
             record["request_id"] = request_id
         if task_id is not None:
@@ -162,12 +199,26 @@ class ArtifactStore:
         if data_source is not None:
             record["data_source"] = data_source
         # 未显式传入的元数据从当前 Subagent 任务上下文自动补全。
-        meta = _TASK_META.get()
         if meta:
             record.setdefault("request_id", meta.get("request_id"))
             record.setdefault("task_id", meta.get("task_id"))
             record.setdefault("agent", meta.get("agent"))
+            state = meta.get("constraint_state")
+            if isinstance(state, dict):
+                from travel_agent.artifact_policy import constraint_basis, constraint_fingerprint
+
+                record["constraint_basis"] = constraint_basis(kind, state, payload)
+                record["constraint_fingerprint"] = constraint_fingerprint(kind, state, payload)
         with self._lock:
+            if kind == "itinerary" and record["artifact_status"] == "current":
+                for previous in self._items.values():
+                    if (
+                        previous.get("kind") == "itinerary"
+                        and previous.get("artifact_status", "current") == "current"
+                    ):
+                        previous["artifact_status"] = "historical"
+                        previous["payload"]["artifact_status"] = "historical"
+                        self._persist(previous)
             self._items[artifact_id] = record
         self._persist(record)
         return artifact_id
@@ -257,9 +308,196 @@ class ArtifactStore:
         record = self._latest_record(kind)
         return record["artifact_id"] if record else None
 
-    def _latest_record(self, kind: str) -> dict | None:
+    def latest_current_id(self, kind: str) -> str | None:
+        record = self._latest_record(kind, statuses={"current"})
+        return record["artifact_id"] if record else None
+
+    def latest_current(self, kind: str) -> dict | None:
+        record = self._latest_record(kind, statuses={"current"})
+        return copy.deepcopy(record["payload"]) if record else None
+
+    def latest_revisable_id(self, kind: str) -> str | None:
+        """Return the newest artifact that may be used only as revision context.
+
+        A stale or historical itinerary is deliberately revisable but is never
+        deliverable.  Validation failures are excluded because they never
+        became a usable plan in the first place.
+        """
+        record = self._latest_record(kind, statuses={"current", "stale", "historical"})
+        return record["artifact_id"] if record else None
+
+    def latest_revisable(self, kind: str) -> dict | None:
+        record = self._latest_record(kind, statuses={"current", "stale", "historical"})
+        return copy.deepcopy(record["payload"]) if record else None
+
+    def promote_itinerary(
+        self,
+        artifact_id: str,
+        *,
+        limitations: list[str] | None = None,
+        review_advisories: list[str] | None = None,
+        resolved_review_issues: list[str] | None = None,
+        promotion_reason: str = "finalizer_acceptance",
+    ) -> bool:
+        """Atomically promote one validated candidate and supersede current.
+
+        No current artifact is demoted until the selected candidate has passed
+        the immutable revision/hash checks.  This keeps failed rework attempts
+        from creating an empty or partially advanced final state.
+        """
         with self._lock:
-            records = [r for r in self._items.values() if r["kind"] == kind]
+            record = self._items.get(artifact_id)
+            if not record or record.get("kind") != "itinerary":
+                return False
+            status = str(record.get("artifact_status") or "")
+            if status == "current":
+                return True
+            if status != "candidate":
+                return False
+            payload = record.get("payload") or {}
+            validation = payload.get("validation_result") or {}
+            state_version = payload.get("state_version") or {}
+            if (
+                validation.get("passed") is not True
+                or (payload.get("critic") or {}).get("passed") is not True
+                or state_version.get("constraint_revision")
+                != validation.get("validated_constraint_revision")
+                or state_version.get("constraint_hash")
+                != validation.get("validated_constraint_hash")
+            ):
+                return False
+            for previous in self._items.values():
+                if (
+                    previous.get("kind") == "itinerary"
+                    and previous.get("artifact_id") != artifact_id
+                    and previous.get("artifact_status", "current") == "current"
+                ):
+                    previous["artifact_status"] = "historical"
+                    previous["payload"]["artifact_status"] = "historical"
+                    previous["superseded_by"] = artifact_id
+                    self._persist(previous)
+            normalized_limitations = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in [
+                        *list(payload.get("limitations") or []),
+                        *list(limitations or []),
+                    ]
+                    if str(item).strip()
+                )
+            )
+            if normalized_limitations:
+                payload["limitations"] = normalized_limitations
+            normalized_advisories = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in [
+                        *list(payload.get("review_advisories") or []),
+                        *list(review_advisories or []),
+                    ]
+                    if str(item).strip()
+                )
+            )
+            if normalized_advisories:
+                payload["review_advisories"] = normalized_advisories
+            normalized_resolved = list(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in [
+                        *list(payload.get("resolved_review_issues") or []),
+                        *list(resolved_review_issues or []),
+                    ]
+                    if str(item).strip()
+                )
+            )
+            if normalized_resolved:
+                payload["resolved_review_issues"] = normalized_resolved
+                payload["repair_verification_pending"] = []
+            payload["artifact_status"] = "current"
+            payload["promotion_reason"] = promotion_reason
+            record["artifact_status"] = "current"
+            record["promotion_reason"] = promotion_reason
+            record["promoted_at"] = time.time()
+            self._persist(record)
+            return True
+
+    def reject_itinerary_candidate(
+        self,
+        artifact_id: str,
+        *,
+        reason: str,
+        status: str = "review_failed",
+    ) -> bool:
+        """Mark a non-current attempt rejected without touching current state."""
+        with self._lock:
+            record = self._items.get(artifact_id)
+            if (
+                not record
+                or record.get("kind") != "itinerary"
+                or record.get("artifact_status") == "current"
+            ):
+                return False
+            record["artifact_status"] = status
+            record["rejection_reason"] = reason
+            record["payload"]["artifact_status"] = status
+            record["payload"]["rejection_reason"] = reason
+            self._persist(record)
+            return True
+
+    def invalidate_itineraries(
+        self, *, constraint_revision: int, constraint_hash: str,
+        changed_fields: list[str], reason: str = "material_constraint_change",
+    ) -> list[str]:
+        """Mark current plans stale and revoke validation against active constraints."""
+        invalidated: list[str] = []
+        with self._lock:
+            for record in self._items.values():
+                if record.get("kind") != "itinerary":
+                    continue
+                if record.get("artifact_status", "current") != "current":
+                    continue
+                record["artifact_status"] = "stale"
+                record["stale_reason"] = reason
+                record["stale_at_constraint_revision"] = constraint_revision
+                record["stale_at_constraint_hash"] = constraint_hash
+                record["validation_status"] = "stale"
+                record["active_constraint_revision"] = constraint_revision
+                record["active_constraint_hash"] = constraint_hash
+                payload = record["payload"]
+                payload["artifact_status"] = "stale"
+                payload["stale_reason"] = reason
+                payload["stale_changed_fields"] = list(changed_fields)
+                prior_validation = copy.deepcopy(payload.get("validation_result") or {})
+                payload["historical_validation_result"] = prior_validation
+                payload["validation_result"] = {
+                    "passed": False,
+                    "status": "stale",
+                    "issues": [{
+                        "code": "stale_constraint_revision",
+                        "message": "该计划基于旧约束，必须按当前状态重建并重新校验。",
+                        "severity": "error",
+                    }],
+                    "validated_constraint_revision": (
+                        prior_validation.get("validated_constraint_revision")
+                        or (payload.get("state_version") or {}).get("constraint_revision")
+                    ),
+                    "active_constraint_revision": constraint_revision,
+                    "active_constraint_hash": constraint_hash,
+                }
+                invalidated.append(str(record["artifact_id"]))
+                self._persist(record)
+        return invalidated
+
+    def _latest_record(self, kind: str, statuses: set[str] | None = None) -> dict | None:
+        with self._lock:
+            records = [
+                r for r in self._items.values()
+                if r["kind"] == kind
+                and (
+                    statuses is None
+                    or str(r.get("artifact_status", "current")) in statuses
+                )
+            ]
         if not records:
             return None
         return max(records, key=lambda r: (r["created_at"], r["artifact_id"]))
@@ -293,7 +531,14 @@ class ArtifactStore:
             items = list(self._items.values())
 
         def _latest(kind: str) -> dict | None:
-            records = [r for r in items if r["kind"] == kind]
+            records = [
+                r for r in items
+                if r["kind"] == kind
+                and (
+                    kind != "itinerary"
+                    or r.get("artifact_status", "current") == "current"
+                )
+            ]
             if not records:
                 return None
             return max(records, key=lambda r: (r["created_at"], r["artifact_id"]))["payload"]
@@ -347,6 +592,14 @@ class SessionContext:
     evaluation_trace_enabled: bool = False
     evaluation_trace: list[dict] = field(default_factory=list)
     reference_datetime: str | None = None
+    runtime_settings: Any | None = field(default=None, repr=False, compare=False)
+    hybrid_llm_client: Any | None = field(default=None, repr=False, compare=False)
+    hybrid_call_cache: HybridCallCache = field(
+        default_factory=HybridCallCache, repr=False, compare=False
+    )
+    hybrid_request_scope: str | None = field(default=None, repr=False, compare=False)
+    active_task_type: str | None = field(default=None, repr=False, compare=False)
+    active_delivery_intent: str | None = field(default=None, repr=False, compare=False)
     request_control: RequestControl | None = field(default=None, repr=False)
     _state_lock: threading.RLock = field(
         default_factory=threading.RLock, init=False, repr=False, compare=False
@@ -381,6 +634,12 @@ class SessionContext:
             evaluation_trace_enabled=self.evaluation_trace_enabled,
             evaluation_trace=copy.deepcopy(self.evaluation_trace),
             reference_datetime=self.reference_datetime,
+            runtime_settings=self.runtime_settings,
+            hybrid_llm_client=self.hybrid_llm_client,
+            hybrid_call_cache=self.hybrid_call_cache,
+            hybrid_request_scope=self.hybrid_request_scope,
+            active_task_type=self.active_task_type,
+            active_delivery_intent=self.active_delivery_intent,
             request_control=active_control,
         )
 

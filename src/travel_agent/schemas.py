@@ -7,6 +7,19 @@ from typing import Any, Literal
 BudgetLevel = Literal["low", "mid", "high"]
 Pace = Literal["relaxed", "standard", "intensive"]
 TransportMode = Literal["walk", "public_transport", "taxi", "drive"]
+POIVerificationStatus = Literal[
+    "verified",
+    "closed",
+    "unsuitable",
+    "wrong_entity",
+    "evidence_insufficient",
+]
+RouteEvidenceStatus = Literal[
+    "provider_verified",
+    "deterministic_estimate",
+    "haversine_estimate",
+    "unavailable",
+]
 
 
 @dataclass(frozen=True)
@@ -28,6 +41,18 @@ class POI:
     average_cost: float | None = None  # 工具返回的人均消费
     parking_type: str | None = None  # 工具返回的停车信息
     source: str = "seed"  # 数据来源
+    # Entity identity and verification are intentionally distinct from the
+    # display name.  Downstream planners must consume these fields instead of
+    # inferring venue type or must-visit coverage from name substrings.
+    canonical_name: str | None = None
+    entity_type: str = "venue"
+    parent_poi_id: str | None = None
+    source_poi_id: str | None = None
+    verification_status: POIVerificationStatus = "verified"
+    verification_reason: str | None = None
+    aliases: list[str] = field(default_factory=list)
+    parent_canonical_name: str | None = None
+    coverage_relation: Literal["none", "child_covers_parent"] = "none"
 
 
 @dataclass
@@ -129,6 +154,7 @@ class RouteInfo:
     mode: TransportMode  # 交通方式
     source: str = "haversine_estimate"  # 来源
     walking_distance_km: float | None = None  # 公交方案内/步行路线的步行距离
+    evidence_status: RouteEvidenceStatus = "unavailable"
 
 
 @dataclass(frozen=True)

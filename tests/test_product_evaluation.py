@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -24,13 +25,17 @@ from travel_agent.harness.faults import FaultInjectingProvider
 from travel_agent.harness.live_tools import _redact_snapshot
 from travel_agent.harness.product import (
     DEFAULT_PRODUCT_CASES,
+    aggregate_product_rows,
     attribute_failures,
     decide_fine_tuning,
+    validate_absolute_return_deadline_evidence,
     validate_product_dataset,
     wilson_interval,
+    _configuration_fingerprint,
     _execution_case,
     _product_case_output,
     _product_row,
+    _tool_snapshot_fingerprint,
     write_product_run,
 )
 from travel_agent.harness.validators import validate_case_result
@@ -50,6 +55,116 @@ def test_production_v1_dataset_has_192_cases_with_frozen_split_discipline() -> N
     }
     assert len(validation.subset_counts) >= 15
     assert all(case.gold_outcome for case in cases)
+    assert validation.frozen_warnings == []
+
+
+def test_formal_run_fingerprints_config_without_hashing_secrets(offline_settings) -> None:
+    configured = replace(
+        offline_settings,
+        llm=replace(
+            offline_settings.llm,
+            provider="deepseek",
+            model="deepseek-chat",
+            api_key="first-secret",
+        ),
+        amap=replace(offline_settings.amap, web_key="first-amap-secret"),
+    )
+    rotated_secrets = replace(
+        configured,
+        llm=replace(configured.llm, api_key="second-secret"),
+        amap=replace(configured.amap, web_key="second-amap-secret"),
+    )
+    changed_temperature = replace(
+        configured,
+        llm=replace(configured.llm, temperature=0.7),
+    )
+
+    assert _configuration_fingerprint(configured, "configured") == (
+        _configuration_fingerprint(rotated_secrets, "configured")
+    )
+    assert _configuration_fingerprint(configured, "configured") != (
+        _configuration_fingerprint(changed_temperature, "configured")
+    )
+    assert _tool_snapshot_fingerprint(configured, "configured") == (
+        _tool_snapshot_fingerprint(rotated_secrets, "configured")
+    )
+    assert _tool_snapshot_fingerprint(configured, "configured") != (
+        _tool_snapshot_fingerprint(configured, "local")
+    )
+
+
+def test_absolute_return_deadline_accepts_explicit_relative_last_day_semantics() -> None:
+    case = HarnessCase(
+        case_id="ungrounded-deadline",
+        turns=["10月去杭州五天。", "最后一天17点前返程。"],
+        split="dev",
+        snapshot_date="2026-08-11T12:00:00+08:00",
+        gold_constraints_tree={
+            "date_start": "2026-10-01",
+            "duration_days": 5,
+            "return_deadline": "2026-10-05T17:00:00+08:00",
+        },
+    )
+
+    errors, frozen_warnings = validate_absolute_return_deadline_evidence([case])
+
+    assert errors == []
+    assert frozen_warnings == []
+
+
+def test_absolute_return_deadline_rejects_relative_time_that_disagrees_with_gold() -> None:
+    case = HarnessCase(
+        case_id="mismatched-relative-deadline",
+        turns=["10月去杭州五天。", "最后一天18点前返程。"],
+        split="dev",
+        gold_constraints_tree={
+            "duration_days": 5,
+            "return_deadline": "2026-10-05T17:00:00+08:00",
+        },
+    )
+
+    errors, _warnings = validate_absolute_return_deadline_evidence([case])
+
+    assert errors == [
+        "mismatched-relative-deadline: absolute return_deadline date 2026-10-05 "
+        "must be derivable from explicit user date_start/date_end and duration_days"
+    ]
+
+
+def test_absolute_return_deadline_accepts_user_grounded_start_and_duration() -> None:
+    case = HarnessCase(
+        case_id="grounded-deadline",
+        turns=["2026年10月1日起杭州五天。", "最后一天17点前返程。"],
+        split="dev",
+        gold_constraints_tree={
+            "date_start": "2026-10-01",
+            "duration_days": 5,
+            "return_deadline": "2026-10-05T17:00:00+08:00",
+        },
+    )
+
+    assert validate_absolute_return_deadline_evidence([case]) == ([], [])
+
+
+def test_frozen_ungrounded_absolute_return_deadline_is_report_only() -> None:
+    case = HarnessCase(
+        case_id="frozen-ungrounded-deadline",
+        turns=["10月1日起杭州五天。", "17点前返程。"],
+        split="core_frozen",
+        gold_constraints_tree={
+            "date_start": "2026-10-01",
+            "duration_days": 5,
+            "return_deadline": "2026-10-05T17:00:00+08:00",
+        },
+    )
+
+    errors, frozen_warnings = validate_absolute_return_deadline_evidence([case])
+
+    assert errors == []
+    assert frozen_warnings == [
+        "frozen-ungrounded-deadline: absolute return_deadline date 2026-10-05 "
+        "must be derivable from explicit user date_start/date_end and duration_days"
+    ]
 
 
 def test_production_dataset_loader_parses_external_schema() -> None:
@@ -142,6 +257,11 @@ def test_tool_argument_and_memory_assertions_are_scored() -> None:
     assert metrics["forbidden_tools_ok"] is True
     assert metrics["tool_arguments_ok"] is True
     assert metrics["memory_ok"] is True
+    assert metrics["llm_judge"] == {
+        "status": "not_run",
+        "rubric": None,
+        "reason": "missing_expected_artifact",
+    }
 
 
 def test_langchain_tool_trace_redacts_sensitive_arguments(offline_settings) -> None:
@@ -155,6 +275,61 @@ def test_langchain_tool_trace_redacts_sensitive_arguments(offline_settings) -> N
     assert record["name"] == "update_travel_profile"
     assert record["arguments"] == {"destination": "杭州", "days": 2}
     assert record["status"] == "ok"
+
+
+def test_langchain_tool_trace_records_structured_error_code(
+    offline_settings, monkeypatch
+) -> None:
+    from travel_agent.agent import toolkit
+
+    ctx = build_session(persist=False)
+    ctx.evaluation_trace_enabled = True
+    monkeypatch.setattr(
+        toolkit,
+        "search_poi",
+        lambda *_args, **_kwargs: {
+            "isError": True,
+            "error_code": "NOT_FOUND",
+            "summary": "没有匹配结果",
+        },
+    )
+    tool = next(item for item in build_tools(ctx, offline_settings) if item.name == "search_poi")
+
+    tool.invoke({"city": "测试城", "max_results": 10})
+
+    record = ctx.evaluation_trace[-1]
+    assert record["status"] == "error"
+    assert record["error_code"] == "NOT_FOUND"
+
+
+def test_restaurant_tool_normalizes_numeric_per_capita_budget(
+    offline_settings, monkeypatch
+) -> None:
+    from travel_agent.agent import toolkit
+
+    captured = {}
+
+    def fake_search(_ctx, city, cuisine, area, budget_level, max_results):
+        captured.update({
+            "city": city,
+            "area": area,
+            "budget_level": budget_level,
+            "max_results": max_results,
+        })
+        return {"isError": False, "restaurants": []}
+
+    monkeypatch.setattr(toolkit, "search_restaurant", fake_search)
+    ctx = build_session(persist=False)
+    tool = next(item for item in build_tools(ctx, offline_settings) if item.name == "search_restaurant")
+
+    tool.invoke({
+        "city": "测试城",
+        "area": "江畔商圈",
+        "budget_level": "人均100元左右",
+        "max_results": 10,
+    })
+
+    assert captured["budget_level"] == "mid"
 
 
 def test_plan_tool_ends_react_loop_after_structured_itinerary(offline_settings) -> None:
@@ -247,6 +422,88 @@ def test_wilson_interval_reports_counts_and_bounds() -> None:
     assert interval["total"] == 100
     assert interval["low"] == pytest.approx(0.4038, abs=0.001)
     assert interval["high"] == pytest.approx(0.5962, abs=0.001)
+
+
+def test_artifact_first_rates_have_applicable_confidence_intervals() -> None:
+    base = {
+        "repeat": 1,
+        "split": "dev",
+        "passed": True,
+        "tool_trace": [],
+        "strict_task_success": True,
+        "artifact_type_match": True,
+        "failure_reason": None,
+        "gating_passed": True,
+        "grounding_ok": True,
+        "authorization_ok": True,
+        "architecture_policy_ok": True,
+        "expected_outcome_match": True,
+        "task_completed": True,
+        "hard_constraints_ok": True,
+        "soft_preferences_ok": True,
+        "critic_passed": True,
+        "clarification_ok": True,
+        "tool_schema_valid": True,
+        "fault_recovery_ok": True,
+        "memory_ok": True,
+        "turn_state_ok": True,
+        "turn_state_accuracy": 1.0,
+        "tool_required_count": 0,
+        "tool_required_hit_count": 0,
+        "tool_selected_count": 0,
+        "tool_unexpected_count": 0,
+        "tool_argument_assertion_count": 0,
+        "tool_argument_pass_count": 0,
+        "duration_ms": 1.0,
+        "total_tokens": 1,
+        "estimated_cost_usd": 0.0,
+        "model_call_count": 1,
+        "tool_call_count": 0,
+        "dispatch_count": 0,
+        "failure_attributions": [],
+        "planner_required": 0,
+        "planner_admitted": 0,
+        "planner_budget_exhausted": 0,
+        "dispatch_total": 0,
+        "duplicate_dispatches": 0,
+        "artifact_reuse_total": 0,
+        "artifact_reused": 0,
+        "stale_artifact_reused": 0,
+        "execution_total": 1,
+        "system_error": 0,
+    }
+    rows = [
+        {
+            **base,
+            "case_id": "full",
+            "expected_artifact_type": "full_itinerary",
+            "planner_required": 1,
+            "planner_admitted": 1,
+            "dispatch_total": 3,
+            "artifact_reuse_total": 2,
+            "artifact_reused": 1,
+        },
+        {
+            **base,
+            "case_id": "route",
+            "expected_artifact_type": "route_plan",
+            "dispatch_total": 1,
+        },
+    ]
+
+    metrics = aggregate_product_rows(rows, remediation_complete=False)
+
+    intervals = metrics["confidence_intervals_95"]
+    assert intervals["overall_strict_success_rate"]["total"] == 2
+    assert intervals["artifact_type_match_rate"]["total"] == 2
+    assert intervals["full_itinerary_success_rate"]["total"] == 1
+    assert intervals["non_itinerary_success_rate"]["total"] == 1
+    assert intervals["expected_itinerary_missing_rate"]["successes"] == 0
+    assert metrics["planner_admission_rate"] == 1.0
+    assert metrics["planner_budget_exhaustion_rate"] == 0.0
+    assert metrics["duplicate_dispatch_rate"] == 0.0
+    assert metrics["artifact_reuse_rate"] == 0.5
+    assert metrics["system_error_rate"] == 0.0
 
 
 def test_chinatravel_preflight_and_provider_fail_fast(tmp_path) -> None:
@@ -374,7 +631,14 @@ def test_product_run_persists_inspectable_itinerary_per_case(tmp_path) -> None:
         final_profile={"destination": "杭州", "days": 2},
         final_artifacts={"itinerary": itinerary},
         passed=True,
-        metrics={"critic_passed": True},
+        metrics={
+            "critic_passed": True,
+            "llm_judge": {
+                "status": "not_run",
+                "rubric": "full_itinerary",
+                "reason": "judge_not_attached",
+            },
+        },
     )
     output = _product_case_output(case, result, 1)
     suite = HarnessSuiteResult(
@@ -397,6 +661,11 @@ def test_product_run_persists_inspectable_itinerary_per_case(tmp_path) -> None:
     assert saved_case["final_itinerary"]["critic"]["passed"] is True
     assert saved_case["final_itinerary"]["api_key"] == "[REDACTED]"
     assert saved_case["evaluation"]["independent_judge"] is None
+    assert saved_case["evaluation"]["rule_metrics"]["llm_judge"] == {
+        "status": "not_run",
+        "rubric": "full_itinerary",
+        "reason": "judge_not_attached",
+    }
     assert summary["artifacts"]["case_output_count"] == 1
     assert saved_summary["rows"][0]["case_output_file"] == str(case_path)
     assert "_case_outputs" not in saved_summary["artifacts"]

@@ -129,7 +129,7 @@ def test_candidate_selection_prefers_meal_near_hard_must_visit():
         estimated_duration_min=60,
         price_level="free",
     )
-    profile = TravelProfile(destination="杭州", days=1, must_visit=["西湖"])
+    profile = TravelProfile(destination="杭州", days=1, must_visit=["西湖"], interests=["food"])
     ranked = [
         ScoredPOI(must, 1.0, []),
         ScoredPOI(far_food, 0.99, []),
@@ -148,6 +148,7 @@ def test_candidate_selection_prefers_meal_near_hard_must_visit():
 
 def test_daily_opening_window_parses_explicit_hours_only():
     assert _daily_opening_window("周一至周日 09:00-16:30") == (540, 990)
+    assert _daily_opening_window("3–10月:06:45–17:30(17:00停止入园)") == (405, 1050)
     assert _daily_opening_window("00:00-24:00") is None
     assert _daily_opening_window("all_day") is None
 
@@ -267,6 +268,7 @@ def test_lunch_can_shift_to_1230_instead_of_being_pushed_to_dinner() -> None:
     profile = TravelProfile(
         destination="苏州",
         days=1,
+        interests=["food"],
         constraint_state={"activity_end_deadline": "17:30"},
     )
 

@@ -414,17 +414,30 @@ def test_repair_with_failed_hard_critic_is_incomplete() -> None:
                 return {"summary": "domain"}
             self.planner_calls += 1
             passed = self.planner_calls == 1
-            isolated.store.put(
-                "itinerary",
-                    {
-                        "itinerary": {"city": "杭州", "summary": "plan", "days": []},
-                        "source_artifact_ids": list(task.inputs.get("artifact_ids") or []),
-                    "critic": {
-                        "passed": passed,
-                        "issues": [] if passed else [{"severity": "critical", "message": "bad"}],
-                    },
+            from travel_agent.artifact_policy import constraint_version
+            from travel_agent.plan_invariants import validate_plan_artifact
+
+            version = constraint_version(isolated.profile)
+            payload = {
+                "artifact_status": "candidate",
+                "state_version": {
+                    "constraint_revision": version["revision"],
+                    "constraint_hash": version["constraint_hash"],
+                    "constraint_snapshot": version["constraint_snapshot"],
                 },
+                "itinerary": {"city": "杭州", "summary": "plan", "days": []},
+                "source_artifact_ids": list(task.inputs.get("artifact_ids") or []),
+                "critic": {
+                    "passed": passed,
+                    "issues": [] if passed else [
+                        {"severity": "critical", "message": "bad"}
+                    ],
+                },
+            }
+            payload["validation_result"] = validate_plan_artifact(
+                payload, isolated.profile
             )
+            isolated.store.put("itinerary", payload)
             return {"summary": "planner"}
 
     review = {
@@ -434,6 +447,7 @@ def test_repair_with_failed_hard_critic_is_incomplete() -> None:
                 "issue_type": "pace",
                 "severity": "recoverable",
                 "description": "too dense",
+                "evidence": ["itinerary.day2"],
                 "repair_target": "planner",
                 "repair_instruction": "relax",
             }
@@ -455,5 +469,5 @@ def test_repair_with_failed_hard_critic_is_incomplete() -> None:
         request_id="req-repair-gate",
     )
     assert outcome.rework_used == 1
-    assert outcome.status == STATUS_INCOMPLETE
-    assert outcome.status != STATUS_COMPLETED_WITH_WARNINGS
+    assert outcome.status == STATUS_COMPLETED_WITH_WARNINGS
+    assert outcome.plan_artifact_id == ctx.store.latest_current_id("itinerary")

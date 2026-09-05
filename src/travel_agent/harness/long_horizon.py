@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from travel_agent.harness.cases import HarnessCase, load_cases_json
@@ -9,6 +9,7 @@ from travel_agent.harness.product import (
     DEFAULT_PRODUCT_CASES,
     FROZEN_SPLITS,
     aggregate_product_results,
+    validate_absolute_return_deadline_evidence,
     _execution_case,
 )
 from travel_agent.harness.result import HarnessSuiteResult
@@ -29,6 +30,7 @@ class LongHorizonDatasetValidation:
     errors: list[str]
     turn_counts: dict[int, int]
     split_counts: dict[str, int]
+    frozen_warnings: list[str] = field(default_factory=list)
 
 
 def validate_long_horizon_dataset(
@@ -55,7 +57,15 @@ def validate_long_horizon_dataset(
             errors.append(f"{case.case_id}: every turn needs one ordered expectation")
         if case.metadata.get("turn_mode") != "multi_turn":
             errors.append(f"{case.case_id}: turn_mode must be multi_turn")
-    return LongHorizonDatasetValidation(not errors, errors, turn_counts, split_counts)
+    deadline_errors, frozen_warnings = validate_absolute_return_deadline_evidence(cases)
+    errors.extend(deadline_errors)
+    return LongHorizonDatasetValidation(
+        not errors,
+        errors,
+        turn_counts,
+        split_counts,
+        frozen_warnings,
+    )
 
 
 def run_long_horizon_suite(

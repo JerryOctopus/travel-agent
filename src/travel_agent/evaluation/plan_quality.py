@@ -110,8 +110,6 @@ def evaluate_plan_quality(
     pace = str(soft.get("pace") or final_profile.get("pace") or "standard")
     daily_load_valid = _daily_load_valid(days, pace, issues)
     route_thresholds_valid = _route_thresholds_valid(days, pace, issues)
-    if transfer_ok is not None:
-        transfer_ok = transfer_ok and route_thresholds_valid
 
     transport_expected = hard.get("transport_mode") or soft.get("transport_mode")
     transport_consistent = _transport_consistency(days, transport_expected, issues)
@@ -154,7 +152,7 @@ def evaluate_plan_quality(
         hard_checks.append(valid_opening == known_opening)
     hard_pass = all(hard_checks)
 
-    quality_checks = [hard_pass]
+    quality_checks = [hard_pass, route_thresholds_valid]
     for optional in (hotel_ok, food_ok, interest_ok, weather_ok):
         if optional is not None:
             quality_checks.append(optional)
@@ -380,12 +378,32 @@ def _must_visit_coverage(
 ) -> float | None:
     if not expected:
         return None
-    names = [_normalize(poi.get("name")) for poi in pois]
-    hits = sum(any(_normalize(item) in name for name in names) for item in expected)
+    hits = sum(any(_poi_covers_requirement(poi, item) for poi in pois) for item in expected)
     rate = hits / len(expected)
     if rate < 1:
         _issue(issues, "must_visit_missing", "error", f"coverage={rate:.2f}")
     return rate
+
+
+def _poi_covers_requirement(poi: dict[str, Any], required: Any) -> bool:
+    """Use the same canonical identity contract as planning and validation."""
+    try:
+        from travel_agent.agent.serde import poi_from_dict
+        from travel_agent.poi_evidence import poi_covers_requirement
+
+        return poi_covers_requirement(poi_from_dict(poi), str(required))
+    except (KeyError, TypeError, ValueError):
+        required_name = _normalize(required)
+        names = [
+            _normalize(value)
+            for value in (
+                poi.get("name"),
+                poi.get("canonical_name"),
+                *(poi.get("aliases") or []),
+            )
+            if value
+        ]
+        return bool(required_name and required_name in names)
 
 
 def _avoid_compliance(

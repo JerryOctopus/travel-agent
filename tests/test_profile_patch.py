@@ -151,7 +151,9 @@ def test_constraint_state_syncs_and_sanitizes_compact_profile() -> None:
 
     _sync_profile_constraints(ctx.profile)
 
-    assert ctx.profile.must_visit == ["鼓浪屿", "陕西历史博物馆"]
+    # A fixed-event location is scheduled literally but is not promoted into
+    # the independent must-visit set.
+    assert ctx.profile.must_visit == ["鼓浪屿"]
     assert ctx.profile.interests == ["nature"]
     assert ctx.profile.hotel_area == "钟楼附近"
     assert ctx.profile.constraint_state["must_visit"] == ["鼓浪屿"]

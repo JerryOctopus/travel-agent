@@ -8,7 +8,7 @@ from travel_agent.harness.result import HarnessCaseResult, HarnessTurnResult
 
 from scripts.eval_product_multi_model import (
     DEFAULT_RELAY_MODELS,
-    REQUIRED_AGENTS,
+    ALL_AGENT_ROLES,
     acquire_run_lock,
     build_state_template,
     build_parser,
@@ -17,6 +17,8 @@ from scripts.eval_product_multi_model import (
     load_pending_case_outputs,
     parse_models,
     pick_api_key,
+    provider_reported_models,
+    relay_mode_enabled,
     recorded_model_identity,
     save_pending_case_output,
     save_state,
@@ -93,6 +95,29 @@ def test_single_model_run_records_actual_identity() -> None:
     )
 
 
+def test_single_model_execution_is_not_reported_as_model_relay() -> None:
+    assert relay_mode_enabled([
+        {"provider": "deepseek", "model": "deepseek-chat"}
+    ]) is False
+    assert relay_mode_enabled([
+        {"provider": "deepseek", "model": "deepseek-chat"},
+        {"provider": "qwen", "model": "qwen-max"},
+    ]) is True
+
+
+def test_provider_reported_model_identity_is_recorded_separately() -> None:
+    result = _result(["attraction", "transport", "planner"])
+    result.turns[0].model_calls.extend([
+        {"model": "provider-resolved-a"},
+        {"model": "provider-resolved-a"},
+        {"model": "provider-resolved-b"},
+    ])
+
+    assert provider_reported_models(result) == [
+        "provider-resolved-a", "provider-resolved-b",
+    ]
+
+
 def test_local_model_token_cap_is_opt_in(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", ["eval_product_multi_model.py"])
 
@@ -144,7 +169,7 @@ def _result(successful_agents: list[str], *, real: bool = True) -> HarnessCaseRe
             "status": "completed" if agent in successful_agents else "failed",
             "detail": {"tool_trace": []},
         }
-        for agent in REQUIRED_AGENTS
+        for agent in ALL_AGENT_ROLES
     ]
     turn = HarnessTurnResult(
         user_message="杭州三天",
@@ -163,17 +188,24 @@ def _result(successful_agents: list[str], *, real: bool = True) -> HarnessCaseRe
             "itinerary": {"days": []},
             "agent_trace": {"items": agent_items},
         },
+        metrics={
+            "expected_artifact_type": "full_itinerary",
+            "artifact_type_match": True,
+        },
     )
 
 
-def test_multi_agent_strict_success_requires_all_five_real_agents() -> None:
-    complete = multi_agent_fields(_result(list(REQUIRED_AGENTS)))
+def test_multi_agent_strict_success_requires_artifact_scoped_real_agents() -> None:
+    # A plain full itinerary requires attraction, transport and planner; the
+    # optional hotel/restaurant roles are not fabricated requirements.
+    required = ["attraction", "transport", "planner"]
+    complete = multi_agent_fields(_result(required))
     assert complete["multi_agent_strict_success"] is True
     assert complete["multi_agent_missing_agents"] == []
 
-    partial = multi_agent_fields(_result(list(REQUIRED_AGENTS[:-1])))
+    partial = multi_agent_fields(_result(["attraction", "transport"]))
     assert partial["multi_agent_strict_success"] is False
     assert partial["multi_agent_missing_agents"] == ["planner"]
 
-    fallback = multi_agent_fields(_result(list(REQUIRED_AGENTS), real=False))
+    fallback = multi_agent_fields(_result(required, real=False))
     assert fallback["multi_agent_strict_success"] is False

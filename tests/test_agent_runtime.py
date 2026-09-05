@@ -9,6 +9,7 @@ from travel_agent.agent.session import build_session
 from travel_agent.harness.faults import FaultInjectingProvider
 from travel_agent.orchestration.multi_agent.engine import TurnOutcome
 from travel_agent.orchestration.multi_agent.schemas import (
+    STATUS_COMPLETED,
     STATUS_INCOMPLETE,
     ReviewIssue,
     ReviewResult,
@@ -105,6 +106,73 @@ def test_incomplete_outcome_discloses_gate_failure() -> None:
     assert "尚不可交付" in reply.text
     assert "必去场馆当天闭馆" in reply.text
     assert "约束检查已通过" not in reply.text
+
+
+def test_specialized_artifact_has_consistent_delivery_status() -> None:
+    ctx = build_session(persist=False)
+    artifact_id = ctx.store.put(
+        "route_plan",
+        {
+            "artifact_type": "route_plan",
+            "origin": "中央车站",
+            "destination": "湖畔酒店区",
+            "routes": [
+                {
+                    "origin_name": "中央车站",
+                    "destination_name": "湖畔酒店区",
+                    "duration_min": 35,
+                    "source": "fixture",
+                }
+            ],
+            "evidence": [{"artifact_id": "routes_fixture", "kind": "routes"}],
+            "limitations": [],
+        },
+        request_id="req",
+        task_id="artifact",
+        agent="engine",
+    )
+    outcome = TurnOutcome(
+        status=STATUS_COMPLETED,
+        reply="已生成从中央车站到湖畔酒店区的结构化路线方案。",
+        delivery_artifact_id=artifact_id,
+    )
+
+    reply = _reply_from_outcome(ctx, outcome)
+
+    assert reply.text == outcome.reply
+    assert reply.plan_artifact_id is None
+    assert reply.delivery_artifact_id == artifact_id
+    assert reply.delivery_status == "deliverable_specialized"
+
+
+def test_partial_specialized_reply_does_not_claim_itinerary_is_missing() -> None:
+    ctx = build_session(persist=False)
+    artifact_id = ctx.store.put(
+        "local_adjustment_advice",
+        {
+            "artifact_type": "local_adjustment_advice",
+            "subject": "第二天下午",
+            "recommendation": "条件不利，但尚无已核验备选",
+            "alternatives": [],
+            "evidence": [{"artifact_id": "weather_fixture", "kind": "weather"}],
+            "limitations": ["室内备选尚未核验"],
+            "apply_status": "advice_only_no_itinerary_modified",
+        },
+        request_id="req",
+        task_id="artifact",
+        agent="engine",
+    )
+    outcome = TurnOutcome(
+        status=STATUS_INCOMPLETE,
+        reply="Artifact：local_adjustment_advice\n- limitations：室内备选尚未核验",
+        delivery_artifact_id=artifact_id,
+    )
+
+    reply = _reply_from_outcome(ctx, outcome)
+
+    assert "local_adjustment_advice" in reply.text
+    assert "当前没有可交付的 current 行程" not in reply.text
+    assert reply.delivery_status == "partial_specialized_with_limitations"
 
 
 def test_incomplete_reply_omits_superseded_planner_failure() -> None:

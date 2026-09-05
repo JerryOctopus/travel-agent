@@ -73,10 +73,16 @@ def build_itinerary_cards(payload: dict[str, Any], weather: dict[str, Any] | Non
     return_plan = payload.get("return_plan")
     if isinstance(return_plan, dict) and return_plan.get("required"):
         cards.append({"type": "return_plan", **return_plan})
+    required_route_anchors = payload.get("required_route_anchors")
+    if isinstance(required_route_anchors, dict):
+        cards.append({"type": "required_route_anchors", **required_route_anchors})
 
     lodging_plan = payload.get("lodging_plan")
     if isinstance(lodging_plan, dict) and lodging_plan.get("required"):
         cards.append({"type": "lodging_plan", **lodging_plan})
+    lodging_route_anchors = payload.get("lodging_route_anchors")
+    if isinstance(lodging_route_anchors, dict):
+        cards.append({"type": "lodging_route_anchors", **lodging_route_anchors})
 
     budget_plan = payload.get("budget_plan")
     if isinstance(budget_plan, dict):
@@ -104,6 +110,10 @@ def build_itinerary_cards(payload: dict[str, Any], weather: dict[str, Any] | Non
                     "start_time": stop.get("start_time"),
                     "name": poi.get("name"),
                     "category": poi.get("category"),
+                    "poi_id": poi.get("poi_id"),
+                    "canonical_name": poi.get("canonical_name"),
+                    "entity_type": poi.get("entity_type"),
+                    "verification_status": poi.get("verification_status"),
                     "duration_min": stop.get("duration_min"),
                     "note": stop.get("note"),
                     "indoor": poi.get("indoor", False),
@@ -113,6 +123,10 @@ def build_itinerary_cards(payload: dict[str, Any], weather: dict[str, Any] | Non
                             "duration_min": route.get("duration_min"),
                             "distance_km": route.get("distance_km"),
                             "mode": route.get("mode"),
+                            "source": route.get("source"),
+                            "evidence_status": route.get("evidence_status"),
+                            "origin_poi_id": route.get("origin_poi_id"),
+                            "destination_poi_id": route.get("destination_poi_id"),
                         }
                         if route
                         else None

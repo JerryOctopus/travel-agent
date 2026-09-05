@@ -111,9 +111,13 @@ def _render_context_section(result: WorkflowResult) -> list[str]:
 def _render_route_prefix(route) -> str:
     if route is None:
         return ""
-    return (
-        f"上一站通勤约 {route.duration_min} 分钟 / {route.distance_km} 公里｜"
-    )
+    evidence = {
+        "provider_verified": "工具核验",
+        "deterministic_estimate": "结构化估算",
+        "haversine_estimate": "直线距离粗估，非实时公交耗时",
+        "unavailable": "路线未核实",
+    }.get(route.evidence_status, "路线未核实")
+    return f"上一站通勤约 {route.duration_min} 分钟 / {route.distance_km} 公里（{evidence}）｜"
 
 
 def _weather_label(condition: str) -> str:

@@ -2,7 +2,7 @@ from travel_agent.critic import critique_itinerary
 from travel_agent.data_loader import load_seed_pois
 from travel_agent.planning import build_simple_itinerary
 from travel_agent.recommendation import score_pois
-from travel_agent.reviser import revise_itinerary
+from travel_agent.reviser import _reconcile_revision_notes, revise_itinerary
 from travel_agent.schemas import (
     Itinerary,
     ItineraryDay,
@@ -21,7 +21,7 @@ def test_reviser_adds_missing_must_visit_when_candidate_exists() -> None:
         destination="北京",
         days=1,
         interests=["food"],
-        must_visit=["故宫"],
+        must_visit=["故宫博物院"],
         pace="relaxed",
     )
     pois = load_seed_pois(DEFAULT_POI_PATH)
@@ -52,7 +52,7 @@ def test_reviser_does_not_replace_one_must_visit_with_another() -> None:
         destination="北京",
         days=1,
         interests=[],
-        must_visit=["故宫", "天坛"],
+        must_visit=["故宫博物院", "天坛公园"],
         pace="relaxed",
     )
     pois = load_seed_pois(DEFAULT_POI_PATH)
@@ -507,3 +507,110 @@ def test_reviser_restores_missing_meal_after_other_repairs() -> None:
     assert any(stop.poi.category == "food" for stop in revised.days[0].stops)
     assert "daily_meal_missing" not in {issue.code for issue in result.issues}
     assert any("补全第1天用餐" in note for note in notes)
+
+
+def test_reviser_never_claims_an_addition_absent_from_final_itinerary() -> None:
+    existing = POI("existing", "已有景点", "测试城", "scenic", 30.0, 120.0, 4.5, 0.8, [], 90, "mid")
+    museum = POI("museum", "候选博物馆", "测试城", "museum", 31.0, 121.0, 4.5, 0.8, ["museum"], 90, "mid")
+    itinerary = Itinerary(
+        city="测试城",
+        summary="test",
+        days=[ItineraryDay(1, "test", [ItineraryStop(existing, "09:30", 90, "")])],
+    )
+    profile = TravelProfile(destination="测试城", days=1, interests=["museum"], pace="relaxed")
+
+    revised, _result, notes = revise_itinerary(
+        itinerary,
+        [ScoredPOI(museum, 1.0, [])],
+        profile,
+        critique_itinerary(itinerary, profile),
+    )
+    final_names = {stop.poi.name for day in revised.days for stop in day.stops}
+
+    assert all(
+        "补充" not in note or any(f"`{name}`" in note for name in final_names)
+        for note in notes
+    )
+
+
+def test_accumulated_revision_notes_drop_later_removed_candidate() -> None:
+    kept = POI("kept", "最终景点", "测试城", "scenic", 30.0, 120.0, 4.5, 0.8, [], 90, "mid")
+    itinerary = Itinerary(
+        city="测试城", summary="test",
+        days=[ItineraryDay(1, "test", [ItineraryStop(kept, "09:30", 90, "")])],
+    )
+
+    notes = _reconcile_revision_notes(
+        ["为覆盖 `museum` 偏好，补充 `已移除博物馆`。", "保留真实说明。"],
+        itinerary,
+        TravelProfile(destination="测试城", days=1),
+    )
+
+    assert notes == ["保留真实说明。"]
+
+
+def test_revision_notes_drop_stale_add_and_remove_claims() -> None:
+    kept = POI("kept", "最终景点", "测试城", "scenic", 30.0, 120.0, 4.5, 0.8, [], 90, "mid")
+    itinerary = Itinerary(
+        city="测试城", summary="test",
+        days=[ItineraryDay(1, "test", [ItineraryStop(kept, "09:30", 90, "")])],
+    )
+
+    notes = _reconcile_revision_notes(
+        [
+            "为补全第1天下午行程，增加 `已移除景点`。",
+            "为修复超长通勤，删减可选地点 `最终景点`。",
+            "保留真实说明。",
+        ],
+        itinerary,
+        TravelProfile(destination="测试城", days=1),
+    )
+
+    assert notes == ["保留真实说明。"]
+
+
+def test_reviser_does_not_reuse_a_global_activity_on_sparse_days() -> None:
+    only = POI("only", "唯一景点", "测试城", "scenic", 30.0, 120.0, 4.5, 0.8, [], 90, "mid")
+    itinerary = Itinerary(
+        city="测试城",
+        summary="test",
+        days=[
+            ItineraryDay(1, "test", [ItineraryStop(only, "09:30", 90, "")]),
+            ItineraryDay(2, "test", []),
+            ItineraryDay(3, "test", []),
+        ],
+    )
+    profile = TravelProfile(destination="测试城", days=3)
+
+    revised, _result, _notes = revise_itinerary(
+        itinerary,
+        [ScoredPOI(only, 1.0, [])],
+        profile,
+        critique_itinerary(itinerary, profile),
+    )
+
+    assert sum(
+        stop.poi.poi_id == "only"
+        for day in revised.days
+        for stop in day.stops
+    ) == 1
+
+
+def test_reviser_does_not_add_a_distant_meal_after_route_repair() -> None:
+    scenic = POI("scenic", "核心景点", "测试城", "scenic", 30.0, 120.0, 4.8, 0.9, [], 90, "mid")
+    distant = POI("meal", "远端餐厅", "测试城", "food", 31.0, 121.0, 4.5, 0.8, ["food"], 60, "mid")
+    itinerary = Itinerary(
+        city="测试城", summary="test",
+        days=[ItineraryDay(1, "test", [ItineraryStop(scenic, "09:30", 90, "")])],
+    )
+    profile = TravelProfile(destination="测试城", days=1, pace="standard")
+
+    revised, _result, notes = revise_itinerary(
+        itinerary,
+        [ScoredPOI(distant, 1.0, [])],
+        profile,
+        critique_itinerary(itinerary, profile),
+    )
+
+    assert all(stop.poi.category != "food" for stop in revised.days[0].stops)
+    assert all("远端餐厅" not in note for note in notes)

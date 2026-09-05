@@ -27,7 +27,7 @@ def test_response_renders_revision_notes() -> None:
         destination="北京",
         days=1,
         interests=["food"],
-        must_visit=["故宫"],
+        must_visit=["故宫博物院"],
         pace="relaxed",
     )
     result = run_mvp_workflow("", existing_profile=context)

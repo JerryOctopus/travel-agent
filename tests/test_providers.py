@@ -1,5 +1,27 @@
-from travel_agent.providers import AmapToolProvider, FallbackToolProvider, LocalToolProvider
+import pytest
+import json
+
+from travel_agent.providers import (
+    AmapToolProvider,
+    FallbackToolProvider,
+    LocalToolProvider,
+    ProviderRateLimitError,
+)
 from travel_agent.schemas import POI, WeatherInfo
+
+
+class _JSONResponse:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode()
 
 
 def _poi(name: str = "西湖") -> POI:
@@ -43,6 +65,20 @@ def test_fallback_tool_provider_uses_local_when_primary_fails() -> None:
     assert provider.estimate_route(_poi("西湖"), _poi("灵隐寺")).source == "haversine_estimate"
 
 
+def test_fallback_tool_provider_does_not_hide_primary_rate_limit() -> None:
+    class LimitedProvider:
+        def search_pois(self, *args, **kwargs):
+            raise ProviderRateLimitError("AMap rate limit: USER_DAILY_QUERY_OVER_LIMIT (10044)")
+
+    provider = FallbackToolProvider(
+        primary=LimitedProvider(),
+        fallback=LocalToolProvider([_poi()]),
+    )
+
+    with pytest.raises(ProviderRateLimitError, match="10044"):
+        provider.search_pois("杭州")
+
+
 def test_local_tool_provider_estimates_route() -> None:
     provider = LocalToolProvider([_poi()])
     route = provider.estimate_route(_poi("西湖"), _poi("灵隐寺"), mode="taxi")
@@ -59,8 +95,12 @@ def test_amap_provider_maps_poi_payload(monkeypatch) -> None:
     provider = AmapToolProvider(api_key="fake-key")
 
     def fake_get_json(path: str, params: dict[str, str]) -> dict:
-        assert path == "/v3/place/text"
-        assert params["city"] == "杭州"
+        assert path == "/v5/place/text"
+        assert params["region"] == "杭州"
+        assert params["city_limit"] == "true"
+        assert params["page_size"] == "20"
+        assert params["page_num"] == "1"
+        assert params["show_fields"] == "business"
         return {
             "status": "1",
             "pois": [
@@ -69,10 +109,12 @@ def test_amap_provider_maps_poi_payload(monkeypatch) -> None:
                     "name": "西湖风景名胜区",
                     "type": "风景名胜;风景名胜;国家级景点",
                     "location": "120.149,30.259",
-                    "biz_ext": {
+                    "adname": "西湖区",
+                    "address": "龙井路1号",
+                    "business": {
                         "rating": "4.8",
-                        "open_time": "09:00-17:00",
-                        "opentime2": "周一至周日 09:00-17:00",
+                        "opentime_today": "09:00-17:00",
+                        "opentime_week": "周一至周日 09:00-17:00",
                     },
                 }
             ],
@@ -87,14 +129,274 @@ def test_amap_provider_maps_poi_payload(monkeypatch) -> None:
     assert results[0].name == "西湖风景名胜区"
     assert results[0].category == "scenic"
     assert results[0].rating == 4.8
+    assert results[0].address == "西湖区龙井路1号"
+
+
+def test_amap_place_cache_is_shared_across_provider_instances(monkeypatch) -> None:
+    AmapToolProvider.clear_place_cache()
+    calls = 0
+
+    def fake_get_json(self, path: str, params: dict[str, str]) -> dict:
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "1",
+            "pois": [{
+                "id": "B001",
+                "name": "西湖风景名胜区",
+                "type": "风景名胜;风景名胜;国家级景点",
+                "location": "120.149,30.259",
+            }],
+        }
+
+    monkeypatch.setattr(AmapToolProvider, "_get_json", fake_get_json)
+    first = AmapToolProvider(api_key="same-key")
+    second = AmapToolProvider(api_key="same-key")
+
+    assert first.search_pois("杭州", category="景点")
+    assert second.search_pois("杭州", category="景点")
+    assert calls == 1
+
+
+def test_amap_place_cache_never_caches_rate_limit(monkeypatch) -> None:
+    AmapToolProvider.clear_place_cache()
+    calls = 0
+
+    def fake_get_json(self, path: str, params: dict[str, str]) -> dict:
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "0",
+            "info": "USER_DAILY_QUERY_OVER_LIMIT",
+            "infocode": "10044",
+        }
+
+    monkeypatch.setattr(AmapToolProvider, "_get_json", fake_get_json)
+    provider = AmapToolProvider(api_key="same-key")
+
+    for _ in range(2):
+        with pytest.raises(ProviderRateLimitError, match="10044"):
+            provider.search_pois("杭州", category="景点")
+    assert calls == 2
+
+
+def test_amap_provider_raises_rate_limit_instead_of_returning_empty(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+    monkeypatch.setattr(
+        provider,
+        "_get_json",
+        lambda *_args, **_kwargs: {
+            "status": "0",
+            "info": "USER_DAILY_QUERY_OVER_LIMIT",
+            "infocode": "10044",
+        },
+    )
+
+    with pytest.raises(ProviderRateLimitError, match="10044"):
+        provider.search_pois("杭州", category="景点")
+
+
+def test_amap_get_json_retries_transient_qps_limit(monkeypatch) -> None:
+    import travel_agent.providers as provider_module
+
+    payloads = iter([
+        {"status": "0", "info": "CUQPS_HAS_EXCEEDED_THE_LIMIT", "infocode": "10021"},
+        {"status": "1", "pois": []},
+    ])
+    calls = 0
+
+    def fake_urlopen(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _JSONResponse(next(payloads))
+
+    monkeypatch.setattr(provider_module, "urlopen", fake_urlopen)
+    monkeypatch.setattr(provider_module, "_AMAP_MIN_REQUEST_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(provider_module.time, "sleep", lambda _seconds: None)
+
+    payload = AmapToolProvider(api_key="fake-key")._get_json("/v5/place/text", {})
+
+    assert payload["status"] == "1"
+    assert calls == 2
+
+
+def test_amap_get_json_does_not_retry_daily_quota(monkeypatch) -> None:
+    import travel_agent.providers as provider_module
+
+    calls = 0
+
+    def fake_urlopen(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _JSONResponse({
+            "status": "0",
+            "info": "USER_DAILY_QUERY_OVER_LIMIT",
+            "infocode": "10044",
+        })
+
+    monkeypatch.setattr(provider_module, "urlopen", fake_urlopen)
+    monkeypatch.setattr(provider_module, "_AMAP_MIN_REQUEST_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(provider_module.time, "sleep", lambda _seconds: None)
+
+    payload = AmapToolProvider(api_key="fake-key")._get_json("/v5/place/text", {})
+
+    assert payload["infocode"] == "10044"
+    assert calls == 1
+
+
+def test_amap_food_search_uses_taxonomy_filter_and_rejects_non_food_payload(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+
+    def fake_get_json(path: str, params: dict[str, str]) -> dict:
+        assert path == "/v5/place/text"
+        assert params["types"] == "050000"
+        return {
+            "status": "1",
+            "pois": [
+                {
+                    "id": "office",
+                    "name": "商务大厦",
+                    "type": "商务住宅;楼宇;商务写字楼",
+                    "location": "120.1,30.2",
+                },
+                {
+                    "id": "meal",
+                    "name": "青禾餐厅",
+                    "type": "餐饮服务;中餐厅",
+                    "location": "120.11,30.21",
+                },
+            ],
+        }
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+
+    results = provider.search_pois("杭州", query_tags=["星光大道"], category="food")
+
+    assert [item.name for item in results] == ["青禾餐厅"]
+
+
+def test_amap_search_normalizes_chinese_category_before_taxonomy_filter(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+
+    def fake_get_json(path: str, params: dict[str, str]) -> dict:
+        assert params["types"] == "110000"
+        return {
+            "status": "1",
+            "pois": [
+                {
+                    "id": "scenic",
+                    "name": "海滨公园",
+                    "type": "风景名胜;公园广场;公园",
+                    "location": "118.1,24.4",
+                },
+                {
+                    "id": "salon",
+                    "name": "海滨造型",
+                    "type": "生活服务;美容美发店",
+                    "location": "118.11,24.41",
+                },
+            ],
+        }
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+
+    results = provider.search_pois("厦门", category="景点")
+
+    assert [item.name for item in results] == ["海滨公园"]
+    assert results[0].category == "scenic"
+
+
+def test_amap_search_does_not_exact_filter_unrecognized_named_category(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+
+    def fake_get_json(path: str, params: dict[str, str]) -> dict:
+        assert "types" not in params
+        assert "鼓浪屿" in params["keywords"]
+        return {
+            "status": "1",
+            "pois": [
+                {
+                    "id": "gulangyu",
+                    "name": "鼓浪屿",
+                    "type": "风景名胜;风景名胜;国家级景点",
+                    "location": "118.06,24.45",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+
+    results = provider.search_pois("厦门", category="鼓浪屿")
+
+    assert [item.name for item in results] == ["鼓浪屿"]
+
+
+def test_amap_v5_search_uses_pipe_separated_keywords_and_keeps_type_filter(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+
+    def fake_get_json(path: str, params: dict[str, str]) -> dict:
+        assert path == "/v5/place/text"
+        assert params["keywords"] == "鼓浪屿|海边|景点"
+        assert params["types"] == "110000"
+        assert params["city_limit"] == "false"
+        return {"status": "1", "pois": []}
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+
+    provider.search_pois(
+        "厦门", query_tags=["海边", "鼓浪屿"], category="景点"
+    )
+
+
+def test_amap_v5_search_treats_generic_chinese_interests_as_city_scoped(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+
+    def fake_get_json(path: str, params: dict[str, str]) -> dict:
+        assert params["keywords"] == "海边|自然风光|景点"
+        assert params["city_limit"] == "true"
+        return {"status": "1", "pois": []}
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+
+    provider.search_pois("厦门", query_tags=["海边", "nature"], category="景点")
+
+
+def test_amap_v5_search_drops_mobility_constraints_from_venue_keywords(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+
+    def fake_get_json(path: str, params: dict[str, str]) -> dict:
+        assert path == "/v5/place/text"
+        assert params["keywords"] == "西湖"
+        assert params["city_limit"] == "false"
+        return {"status": "1", "pois": []}
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+
+    provider.search_pois("杭州", query_tags=["西湖", "老年人", "少步行"])
+
+
+def test_amap_hotel_area_query_remains_city_scoped(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+
+    def fake_get_json(path: str, params: dict[str, str]) -> dict:
+        assert params["keywords"] == "人民广场附近"
+        assert params["types"] == "100000"
+        assert params["city_limit"] == "true"
+        return {"status": "1", "pois": []}
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+
+    provider.search_pois(
+        "上海", query_tags=["人民广场附近"], category="hotel"
+    )
 
 
 def test_amap_named_venue_query_allows_cross_city_and_keeps_actual_city(monkeypatch) -> None:
     provider = AmapToolProvider(api_key="fake-key")
 
     def fake_get_json(path: str, params: dict[str, str]) -> dict:
-        assert params["city"] == "成都"
-        assert params["citylimit"] == "false"
+        assert params["region"] == "成都"
+        assert params["city_limit"] == "false"
         return {
             "status": "1",
             "pois": [
@@ -104,7 +406,7 @@ def test_amap_named_venue_query_allows_cross_city_and_keeps_actual_city(monkeypa
                     "cityname": "广汉",
                     "type": "科教文化服务;博物馆",
                     "location": "104.2,31.0",
-                    "biz_ext": {"rating": "4.9"},
+                    "business": {"rating": "4.9"},
                 }
             ],
         }
@@ -231,3 +533,82 @@ def test_amap_provider_estimates_public_transport_route(monkeypatch) -> None:
     assert route.duration_min == 35
     assert route.walking_distance_km == 0.85
     assert route.source == "amap"
+
+
+def test_amap_route_cache_is_shared_across_provider_instances(monkeypatch) -> None:
+    AmapToolProvider.clear_route_cache()
+    calls = 0
+
+    def fake_get_json(self, path: str, params: dict[str, str]) -> dict:
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "1",
+            "route": {
+                "transits": [{
+                    "distance": "6800",
+                    "duration": "2100",
+                    "walking_distance": "850",
+                }]
+            },
+        }
+
+    monkeypatch.setattr(AmapToolProvider, "_get_json", fake_get_json)
+    first = AmapToolProvider(api_key="same-key")
+    second = AmapToolProvider(api_key="same-key")
+    origin, destination = _poi("西湖"), _poi("灵隐寺")
+
+    assert first.estimate_route(origin, destination).source == "amap"
+    assert second.estimate_route(origin, destination).source == "amap"
+    assert calls == 1
+
+
+def test_amap_route_cache_never_caches_rate_limit(monkeypatch) -> None:
+    AmapToolProvider.clear_route_cache()
+    calls = 0
+
+    def fake_get_json(self, path: str, params: dict[str, str]) -> dict:
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "0",
+            "info": "USER_DAILY_QUERY_OVER_LIMIT",
+            "infocode": "10044",
+        }
+
+    monkeypatch.setattr(AmapToolProvider, "_get_json", fake_get_json)
+    provider = AmapToolProvider(api_key="same-key")
+
+    for _ in range(2):
+        with pytest.raises(ProviderRateLimitError, match="10044"):
+            provider.estimate_route(_poi("西湖"), _poi("灵隐寺"))
+    assert calls == 2
+
+
+def test_amap_provider_retries_one_empty_route_response(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+    calls = 0
+
+    def fake_get_json(path: str, params: dict[str, str]) -> dict:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"status": "1", "route": {"transits": []}}
+        return {
+            "status": "1",
+            "route": {
+                "transits": [{
+                    "distance": "6800",
+                    "duration": "2100",
+                    "walking_distance": "850",
+                }]
+            },
+        }
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+
+    route = provider.estimate_route(_poi("西湖"), _poi("灵隐寺"))
+
+    assert calls == 2
+    assert route.source == "amap"
+    assert route.evidence_status == "provider_verified"

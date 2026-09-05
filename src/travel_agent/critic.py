@@ -5,7 +5,17 @@ from datetime import date
 import re
 from typing import Any
 
-from travel_agent.schemas import CriticIssue, CriticResult, Itinerary, TravelProfile
+from travel_agent.poi_evidence import (
+    is_verified_plannable_poi,
+    poi_avoid_match,
+    poi_covers_requirement,
+)
+from travel_agent.route_evidence import (
+    SHORT_WALK_DISTANCE_KM,
+    itinerary_route_violations,
+    route_can_prove_hard_feasibility,
+)
+from travel_agent.schemas import CriticIssue, CriticResult, Itinerary, POI, TravelProfile
 
 
 INTEREST_TO_CATEGORIES = {
@@ -61,9 +71,11 @@ def critique_itinerary(
 ) -> CriticResult:
     issues: list[CriticIssue] = []
     issues.extend(_check_required_fields(profile))
+    issues.extend(_check_temporal_invariants(itinerary, profile))
     issues.extend(_check_day_load(itinerary, profile))
     issues.extend(_check_schedule_completeness(itinerary, profile))
     issues.extend(_check_route_feasibility(itinerary, profile))
+    issues.extend(_check_poi_and_route_identity(itinerary, profile))
     issues.extend(_check_interest_coverage(itinerary, profile))
     issues.extend(_check_must_visit(itinerary, profile))
     issues.extend(_check_avoid_terms(itinerary, profile))
@@ -77,6 +89,35 @@ def critique_itinerary(
     # warning as a failed critic inverted the intended severity contract and
     # caused harmless pacing advice to block otherwise valid plans.
     return CriticResult(passed=not has_error, issues=issues)
+
+
+def _check_temporal_invariants(itinerary: Itinerary, profile: TravelProfile) -> list[CriticIssue]:
+    """The requested trip span is immutable; sparse evidence may yield empty days."""
+    state = profile.constraint_state or {}
+    expected = profile.days
+    start = profile.start_date or state.get("date_start")
+    end = state.get("date_end")
+    duration_value = state.get("duration_days") or profile.days
+    date_days = None
+    if start and end:
+        try:
+            date_days = (date.fromisoformat(str(end)) - date.fromisoformat(str(start))).days + 1
+            expected = date_days
+        except ValueError:
+            pass
+    try:
+        duration_days = int(duration_value) if duration_value is not None else None
+    except (TypeError, ValueError):
+        duration_days = None
+    issues: list[CriticIssue] = []
+    if date_days is not None and duration_days is not None and date_days != duration_days:
+        issues.append(CriticIssue("date_duration_mismatch", f"日期区间为{date_days}天，但 duration_days 为{duration_days}天。", "error"))
+    if expected is not None and len(itinerary.days) != expected:
+        issues.append(CriticIssue("trip_day_count_mismatch", f"行程应为{expected}天，实际为{len(itinerary.days)}天。", "error"))
+    indexes = [day.day_index for day in itinerary.days]
+    if indexes != list(range(1, len(itinerary.days) + 1)):
+        issues.append(CriticIssue("day_index_not_contiguous", "day_index 必须连续且无重复。", "error"))
+    return issues
 
 
 def _check_required_fields(profile: TravelProfile) -> list[CriticIssue]:
@@ -93,10 +134,7 @@ def _check_required_fields(profile: TravelProfile) -> list[CriticIssue]:
 
 
 def _check_day_load(itinerary: Itinerary, profile: TravelProfile) -> list[CriticIssue]:
-    max_stops = (
-        3 if profile.pace == "relaxed" and int(profile.days or 1) > 1
-        else {"relaxed": 2, "standard": 3, "intensive": 4}[profile.pace]
-    )
+    max_stops = {"relaxed": 2, "standard": 3, "intensive": 4}[profile.pace]
     issues = []
     for day in itinerary.days:
         if len(day.stops) > max_stops:
@@ -127,19 +165,27 @@ def _check_schedule_completeness(
     """Flag obviously partial day plans that previously passed the critic."""
     issues: list[CriticIssue] = []
     state = profile.constraint_state or {}
-    raw_dietary = state.get("dietary") or []
-    dietary = [str(raw_dietary)] if isinstance(raw_dietary, str) else [str(item) for item in raw_dietary]
-    meal_is_explicit = "food" in requested_interests(profile) or bool(dietary)
+    meal_is_explicit = "food" in requested_interests(profile)
     for day in itinerary.days:
+        fixed_event_day = any(
+            isinstance(event, dict) and (
+                str(event.get("day") or "") == str(day.day_index)
+                or (
+                    event.get("date") and profile.start_date
+                    and (date.fromisoformat(str(event["date"])) - date.fromisoformat(str(profile.start_date))).days + 1 == day.day_index
+                )
+            )
+            for event in (state.get("fixed_events") or [])
+        )
         if len(day.stops) < 2:
             issues.append(
                 CriticIssue(
                     code="day_too_sparse",
-                    message=f"第{day.day_index}天只有{len(day.stops)}个安排，行程明显不完整。",
+                    message=(f"第{day.day_index}天仅有固定活动/自由时段。" if fixed_event_day else f"第{day.day_index}天证据不足，保留自由活动时段。"),
                 )
             )
         activity_count = sum(stop.poi.category != "food" for stop in day.stops)
-        if profile.days > 1 and activity_count < 2:
+        if profile.days > 1 and activity_count < 2 and not fixed_event_day:
             issues.append(
                 CriticIssue(
                     code="daily_activity_sparse",
@@ -149,12 +195,12 @@ def _check_schedule_completeness(
                     ),
                 )
             )
-        if not any(stop.poi.category == "food" for stop in day.stops):
+        if not any(stop.poi.category == "food" for stop in day.stops) and meal_is_explicit:
             issues.append(
                 CriticIssue(
                     code="daily_meal_missing",
                     message=f"第{day.day_index}天没有有证据支持的用餐安排。",
-                    severity="error" if meal_is_explicit else "warning",
+                    severity="error",
                 )
             )
     return issues
@@ -192,7 +238,8 @@ def _check_route_feasibility(
                         ),
                         severity=(
                             "error"
-                            if route.duration_min > max_single_route_min * 2
+                            if route.mode == "walk"
+                            and route.duration_min > max_single_route_min * 2
                             else "warning"
                         ),
                     )
@@ -208,7 +255,8 @@ def _check_route_feasibility(
                     ),
                     severity=(
                         "error"
-                        if total_route_min > max_daily_route_min * 2
+                        if any(route.mode == "walk" for route in routes)
+                        and total_route_min > max_daily_route_min * 2
                         else "warning"
                     ),
                 )
@@ -263,36 +311,107 @@ def _check_must_visit(
 
 
 def poi_matches_must_visit(poi: Any, term: str) -> bool:
-    """Venue-area mentions in restaurant/hotel names must not satisfy POI constraints."""
-    name = str(getattr(poi, "name", "") or "").strip()
-    target = str(term or "").strip()
-    if not name or not target:
-        return False
-    if name == target:
-        return True
-    if str(getattr(poi, "category", "")) in {"food", "hotel", "transport", "shopping"}:
-        return False
-    commercial_markers = (
-        "纪念品", "商店", "超市", "商业", "旅游广场", "停车场", "售票处",
-        "枢纽", "换乘中心", "游客中心",
-    )
-    if any(marker in name for marker in commercial_markers):
-        return False
-    return target in name or name in target
+    """Use canonical identity, provider aliases, or explicit parent coverage only."""
+    return isinstance(poi, POI) and poi_covers_requirement(poi, term)
+
+
+def _check_poi_and_route_identity(
+    itinerary: Itinerary, profile: TravelProfile
+) -> list[CriticIssue]:
+    issues: list[CriticIssue] = []
+    for day in itinerary.days:
+        for stop in day.stops:
+            if stop.poi.category != "food" and not is_verified_plannable_poi(stop.poi):
+                reason = f"（{stop.poi.verification_reason}）" if stop.poi.verification_reason else ""
+                issues.append(CriticIssue(
+                    code="poi_not_verified",
+                    message=(
+                        f"第{day.day_index}天地点 {stop.poi.name} 未通过实体核验："
+                        f"{stop.poi.verification_status}{reason}"
+                    ),
+                    severity="error",
+                ))
+    for code, message in itinerary_route_violations(itinerary):
+        if code == "route_evidence_missing":
+            continue
+        issues.append(CriticIssue(
+            code=code,
+            message=message,
+            severity="error",
+        ))
+
+    state = profile.constraint_state or {}
+    if state.get("accessibility_priority") or state.get("wheelchair_user"):
+        if any(
+            not route_can_prove_hard_feasibility(stop.route_from_previous, "accessibility")
+            for day in itinerary.days
+            for stop in day.stops[1:]
+        ):
+            issues.append(CriticIssue(
+                code="hard_route_evidence_insufficient",
+                message="无障碍硬约束依赖的路线只有低可信估算或无证据，无法证明可达。",
+                severity="error",
+            ))
+
+    events = [event for event in (state.get("fixed_events") or []) if isinstance(event, dict)]
+    for event in events:
+        location = str(event.get("location") or "").strip()
+        if not location or location in {"自由活动", "休息", "自由时间"}:
+            continue
+        try:
+            event_day = int(event.get("day") or 0)
+        except (TypeError, ValueError):
+            event_day = 0
+        day = next((item for item in itinerary.days if not event_day or item.day_index == event_day), None)
+        if day is None:
+            continue
+        index = next(
+            (
+                i for i, stop in enumerate(day.stops)
+                if poi_covers_requirement(stop.poi, location)
+                or location == stop.poi.name
+                or location in str(stop.poi.address or "")
+            ),
+            None,
+        )
+        if index is not None and index > 0 and not route_can_prove_hard_feasibility(
+            day.stops[index].route_from_previous, "fixed_appointment"
+        ):
+            issues.append(CriticIssue(
+                code="hard_route_evidence_insufficient",
+                message=f"固定预约 {location} 的前往路线只有低可信估算，无法证明准时到达。",
+                severity="error",
+            ))
+
+    for day in itinerary.days:
+        for stop in day.stops[1:]:
+            route = stop.route_from_previous
+            if (
+                route is not None
+                and route.distance_km <= SHORT_WALK_DISTANCE_KM
+                and route.mode != "walk"
+                and route.evidence_status != "provider_verified"
+            ):
+                issues.append(CriticIssue(
+                    code="short_route_mode_warning",
+                    message=f"第{day.day_index}天 {route.distance_km:g} 公里短距离路段未标为步行，建议复核交通方式。",
+                    severity="warning",
+                ))
+    return issues
 
 
 def _check_avoid_terms(
     itinerary: Itinerary,
     profile: TravelProfile,
 ) -> list[CriticIssue]:
-    if not profile.avoid:
-        return []
-    poi_names = _itinerary_poi_names(itinerary)
-    matched = [
-        term
-        for term in profile.avoid
-        if any(term in poi_name for poi_name in poi_names)
-    ]
+    matched = list(
+        dict.fromkeys(
+            match.term
+            for day in itinerary.days
+            for stop in day.stops
+            if (match := poi_avoid_match(stop.poi, profile)) is not None
+        )
+    )
     if not matched:
         return []
     return [
@@ -322,8 +441,18 @@ def poi_complies_with_dietary(poi: Any, profile: TravelProfile) -> bool:
     if any("不吃海鲜" in rule for rule in rules):
         if any(marker in searchable for marker in ("海鲜", "水产", "seafood", "蟹", "虾", "生蚝")):
             return False
+        if not any(
+            marker in searchable
+            for marker in ("无海鲜", "不含海鲜", "素食", "纯素", "vegetarian", "vegan")
+        ):
+            return False
     if any("不吃辣" in rule or "不太辣" in rule for rule in rules):
         if "辣" in searchable or "spicy" in searchable:
+            return False
+        if not any(
+            marker in searchable
+            for marker in ("不辣", "少辣", "微辣", "清淡", "mild", "non-spicy")
+        ):
             return False
     return True
 
@@ -388,6 +517,39 @@ def _check_structured_constraints(
                     severity="error",
                 )
             )
+
+    conditional_avoid = state.get("conditional_avoid_window") or {}
+    if (
+        isinstance(conditional_avoid, dict)
+        and conditional_avoid.get("avoid") == "long_outdoor_activity"
+    ):
+        try:
+            avoid_start = _clock_minutes(str(conditional_avoid.get("start")))
+            avoid_end = _clock_minutes(str(conditional_avoid.get("end")))
+        except (TypeError, ValueError):
+            avoid_start = avoid_end = 0
+        if avoid_end > avoid_start:
+            conflicts = [
+                f"第{day.day_index}天 {stop.poi.name}"
+                for day in itinerary.days
+                for stop in day.stops
+                if not stop.poi.indoor
+                and stop.duration_min >= 90
+                and _clock_minutes(stop.start_time) < avoid_end
+                and _clock_minutes(stop.start_time) + stop.duration_min > avoid_start
+            ]
+            if conflicts:
+                issues.append(
+                    CriticIssue(
+                        code="conditional_avoid_window_conflict",
+                        message=(
+                            f"条件性避让时段 {conditional_avoid.get('start')}-"
+                            f"{conditional_avoid.get('end')} 内包含长时间户外活动："
+                            f"{', '.join(conflicts)}。"
+                        ),
+                        severity="error",
+                    )
+                )
 
     walking_limit = state.get("max_walking_km_per_day")
     try:
@@ -473,7 +635,13 @@ def _check_structured_constraints(
         except (TypeError, ValueError):
             continue
         location = str(event.get("location") or "").strip()
-        if location in {"自由活动", "休息", "自由时间"}:
+        unspecified_locations = {
+            str(item).strip()
+            for item in state.get("user_owned_unspecified_fixed_event_locations") or []
+            if str(item).strip()
+        }
+        user_owned_unspecified_meal = location in unspecified_locations
+        if location in {"自由活动", "休息", "自由时间"} or user_owned_unspecified_meal:
             # User-authored reserved blocks are represented by fixed_event_plan,
             # not fabricated POIs in the map itinerary.
             continue
@@ -510,8 +678,9 @@ def _check_structured_constraints(
 
 
 def _clock_minutes(value: str) -> int:
-    hour, minute = value.split(":", 1)
-    return int(hour) * 60 + int(minute)
+    from travel_agent.constraint_events import clock_minutes
+
+    return clock_minutes(value)
 
 
 def _check_diversity(itinerary: Itinerary) -> list[CriticIssue]:

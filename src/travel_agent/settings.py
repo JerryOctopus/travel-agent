@@ -133,6 +133,15 @@ class SkillsSettings:
 
 
 @dataclass(frozen=True)
+class HybridPlanningSettings:
+    """Experimental hybrid helpers; every capability is opt-in."""
+
+    enable_llm_intent_normalizer: bool = False
+    enable_llm_preference_resolver: bool = False
+    enable_structured_duration_estimator: bool = False
+
+
+@dataclass(frozen=True)
 class JudgeSettings:
     provider: str = "google"
     api_key: str | None = None
@@ -164,7 +173,20 @@ class Settings:
     orchestration: OrchestrationSettings = field(default_factory=OrchestrationSettings)
     mcp: McpSettings = field(default_factory=McpSettings)
     skills: SkillsSettings = field(default_factory=SkillsSettings)
+    hybrid_planning: HybridPlanningSettings = field(default_factory=HybridPlanningSettings)
     evaluation: EvaluationSettings = field(default_factory=EvaluationSettings)
+
+    @property
+    def enable_llm_intent_normalizer(self) -> bool:
+        return self.hybrid_planning.enable_llm_intent_normalizer
+
+    @property
+    def enable_llm_preference_resolver(self) -> bool:
+        return self.hybrid_planning.enable_llm_preference_resolver
+
+    @property
+    def enable_structured_duration_estimator(self) -> bool:
+        return self.hybrid_planning.enable_structured_duration_estimator
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -199,6 +221,19 @@ def _as_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    return default
 
 
 def _empty_to_none(value: Any) -> str | None:
@@ -326,6 +361,11 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
     orch_toml = data.get("orchestration", {}) if isinstance(data.get("orchestration"), dict) else {}
     mcp_toml = data.get("mcp", {}) if isinstance(data.get("mcp"), dict) else {}
     skills_toml = data.get("skills", {}) if isinstance(data.get("skills"), dict) else {}
+    hybrid_toml = (
+        data.get("hybrid_planning", {})
+        if isinstance(data.get("hybrid_planning"), dict)
+        else {}
+    )
     evaluation_toml = (
         data.get("evaluation", {}) if isinstance(data.get("evaluation"), dict) else {}
     )
@@ -607,6 +647,30 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
         not in {"0", "false", "no", "off"},
     )
 
+    hybrid_planning = HybridPlanningSettings(
+        enable_llm_intent_normalizer=_as_bool(
+            _pick(
+                "ENABLE_LLM_INTENT_NORMALIZER",
+                hybrid_toml.get("enable_llm_intent_normalizer"),
+                False,
+            )
+        ),
+        enable_llm_preference_resolver=_as_bool(
+            _pick(
+                "ENABLE_LLM_PREFERENCE_RESOLVER",
+                hybrid_toml.get("enable_llm_preference_resolver"),
+                False,
+            )
+        ),
+        enable_structured_duration_estimator=_as_bool(
+            _pick(
+                "ENABLE_STRUCTURED_DURATION_ESTIMATOR",
+                hybrid_toml.get("enable_structured_duration_estimator"),
+                False,
+            )
+        ),
+    )
+
     judge_provider_env = _empty_to_none(os.getenv("TRAVEL_AGENT_JUDGE_PROVIDER"))
     judge_provider = str(judge_provider_env or judge_toml.get("provider") or "google").lower()
     judge_provider_overridden = bool(
@@ -672,6 +736,7 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
         orchestration=orchestration,
         mcp=mcp,
         skills=skills,
+        hybrid_planning=hybrid_planning,
         evaluation=EvaluationSettings(judge=judge),
     )
 

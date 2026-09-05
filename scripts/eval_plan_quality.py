@@ -18,6 +18,7 @@ from travel_agent.evaluation.plan_quality_pipeline import (  # noqa: E402
     apply_quality_rules,
     export_human_review_sample,
 )
+from travel_agent.evaluation.plan_quality_judge import preflight_judge  # noqa: E402
 from travel_agent.settings import get_settings  # noqa: E402
 
 
@@ -34,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
             subparser.add_argument("--output", type=Path)
         elif command == "calibrate":
             subparser.add_argument("--reviews", type=Path, required=True)
+    subparsers.add_parser("preflight")
     return parser
 
 
@@ -55,8 +57,13 @@ def main() -> None:
             size=args.size,
             output=args.output,
         )
-    else:
+    elif args.command == "calibrate":
         result = apply_human_calibration(args.run_dir, args.reviews)
+    else:
+        result = preflight_judge(get_settings().evaluation.judge)
+        if not result.get("ok"):
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            raise SystemExit(1)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

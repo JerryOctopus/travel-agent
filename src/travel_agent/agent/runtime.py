@@ -28,6 +28,7 @@ from travel_agent.agent.turn_analysis import (
     TurnAnalysis,
     analyze_travel_turn,
     is_plan_revision_followup,
+    required_slot_satisfied,
 )
 from travel_agent.profile_patch import patches_to_payload
 from travel_agent.agent.preferences import (
@@ -93,12 +94,14 @@ class AgentReply:
     profile: dict[str, Any] = field(default_factory=dict)
     status: str | None = None
     plan_artifact_id: str | None = None
+    delivery_artifact_id: str | None = None
     agent_trace: list[dict[str, Any]] = field(default_factory=list)
     request_id: str | None = None
     turn_metrics: dict[str, Any] = field(default_factory=dict)
     raw_failure: str | None = None
     fallback_triggered: bool = False
     final_outcome: str | None = None
+    delivery_status: str | None = None
 
 
 def run_production_turn(
@@ -280,9 +283,37 @@ def _reply_from_outcome(ctx: SessionContext, outcome: Any) -> AgentReply:
     else:
         planner_status = PLANNER_STATUS["PLAN_FAILURE"]
         failure_reason = "planner_failed"
+    from travel_agent.delivery_contract import resolve_delivery_snapshot
+
+    delivery = resolve_delivery_snapshot(
+        ctx,
+        attempted_artifact_id=outcome.plan_artifact_id,
+        specialized_artifact_id=outcome.delivery_artifact_id,
+        clarification=clarification,
+    )
+    outcome.delivery_status = delivery.status
     text = outcome.reply
-    if outcome.plan_artifact_id and ctx.store.latest("itinerary") is not None:
-        text = build_plan_reply_text(ctx)
+    deterministic_preplanner_reason = text if not outcome.plan_artifact_id else ""
+    if delivery.artifact_id and outcome.delivery_artifact_id:
+        # A valid specialized artifact is the requested deliverable.  Preserve
+        # its type-specific renderer even when it is explicitly partial.
+        outcome.cards = []
+        outcome.map_payload = None
+    elif delivery.artifact_id and outcome.plan_artifact_id:
+        outcome.plan_artifact_id = delivery.artifact_id
+        text = build_plan_reply_text(ctx, delivery.artifact_id)
+    elif outcome.status not in (STATUS_COMPLETED, STATUS_COMPLETED_WITH_WARNINGS):
+        outcome.cards = []
+        outcome.map_payload = None
+        text = (
+            "当前候选未通过最终校验，ArtifactStore 中没有可交付的 current 行程。"
+            if delivery.status == "candidate_rejected"
+            else "当前行程正在等待按最新约束重建，尚无可交付的 current 行程。"
+            if delivery.status == "rebuild_pending"
+            else "当前没有可交付的 current 行程。"
+        )
+        if deterministic_preplanner_reason.strip():
+            text += "\n\n" + deterministic_preplanner_reason.strip()
     if not clarification and outcome.status not in (
         STATUS_COMPLETED,
         STATUS_COMPLETED_WITH_WARNINGS,
@@ -302,11 +333,13 @@ def _reply_from_outcome(ctx: SessionContext, outcome: Any) -> AgentReply:
         profile=toolkit._profile_brief(ctx.profile),
         status=outcome.status,
         plan_artifact_id=outcome.plan_artifact_id,
+        delivery_artifact_id=delivery.artifact_id,
         agent_trace=list(
             ((ctx.store.get(outcome.trace_artifact_id) or {}).get("items") or [])
             if outcome.trace_artifact_id
             else []
         ),
+        delivery_status=delivery.status,
     )
 
 
@@ -463,7 +496,11 @@ def _missing_required_slots(
     task_type: TaskType,
 ) -> list[str]:
     """按任务类型动态计算缺失的必填槽位；路线问答/行程修改不强制追问。"""
-    return [slot for slot in REQUIRED_SLOTS.get(task_type, ()) if not getattr(profile, slot, None)]
+    return [
+        slot
+        for slot in REQUIRED_SLOTS.get(task_type, ())
+        if not required_slot_satisfied(profile, task_type, slot)
+    ]
 
 
 def _contains_date_hint(text: str) -> bool:
@@ -549,8 +586,8 @@ def _persist_user_memory_turn(
     service = get_user_memory_service(settings.memory)
     observations: list[PreferenceObservation] = []
     for item in ctx.pending_preference_observations:
-        value = item.get("value", "").strip()
-        category = item.get("category", "").strip()
+        value = str(item.get("value") or "").strip()
+        category = str(item.get("category") or "").strip()
         if category == "interests":
             from travel_agent.workflow_rules import normalize_interest
 
@@ -801,7 +838,7 @@ def _run_react(
         and "plan_and_critique" not in tool_trace
     )
     recovered_tools: list[str] = []
-    if not clarification and ctx.store.latest("itinerary") is None:
+    if not clarification and ctx.store.latest_current("itinerary") is None:
         recovered_tools = _complete_required_plan(ctx, user_message)
         tool_trace.extend(recovered_tools)
     final_text = ""
@@ -811,7 +848,7 @@ def _run_react(
             break
 
     final_text = _finalize_reply_text(ctx, tool_trace, final_text)
-    plan_itinerary = ctx.store.latest("itinerary")
+    plan_itinerary = ctx.store.latest_current("itinerary")
     critic_passed = bool(
         plan_itinerary
         and isinstance(plan_itinerary, dict)
@@ -874,6 +911,8 @@ def _call_toolkit(ctx: SessionContext, name: str, fn, **kwargs: Any) -> dict[str
     try:
         result = fn(ctx, **kwargs)
         record["status"] = "error" if result.get("isError") else "ok"
+        if result.get("error_code") is not None:
+            record["error_code"] = result.get("error_code")
         return result
     except Exception as exc:  # noqa: BLE001
         record["status"] = "error"
@@ -1000,7 +1039,7 @@ def _run_fallback(
 
 def _finalize_reply_text(ctx: SessionContext, tool_trace: list[str], llm_text: str) -> str:
     """规划成功时用 artifact 摘要替代模型长文；拦截手写行程幻觉。"""
-    has_itinerary = ctx.store.latest("itinerary") is not None
+    has_itinerary = ctx.store.latest_current("itinerary") is not None
     if "plan_and_critique" in tool_trace and has_itinerary:
         return build_plan_reply_text(ctx)
     if looks_like_hallucinated_itinerary(llm_text):
@@ -1021,7 +1060,7 @@ def _reply_from_store(
     critical_slots_matched: list[str] | None = None,
     failure_reason: str | None = None,
 ) -> AgentReply:
-    payload = ctx.store.latest("itinerary")
+    payload = ctx.store.latest_current("itinerary")
     recovery = ctx.store.latest("recovery")
     if recovery:
         reason = recovery.get("reason") or "外部查询异常"
@@ -1074,25 +1113,14 @@ def _derive_fallback_failure_reason(plan_result: dict[str, Any]) -> str:
 
 
 def _wants_restaurants(user_message: str, ctx: SessionContext) -> bool:
-    text = user_message.lower()
-    return bool(
-        ctx.profile.food_preference
-        or "food" in ctx.profile.interests
-        or any(
-            keyword in text
-            for keyword in (
-                "吃",
-                "餐厅",
-                "菜系",
-                "美食",
-                "本帮菜",
-                "火锅",
-                "小吃",
-                "咖啡",
-                "coffee",
-                "cafe",
-            )
-        )
+    from travel_agent.orchestration.multi_agent.dispatch_rules import (
+        specific_restaurant_recommendation_requested,
+    )
+
+    return specific_restaurant_recommendation_requested(
+        user_message,
+        toolkit._profile_brief(ctx.profile),
+        ctx.profile.constraint_state,
     )
 
 

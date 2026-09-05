@@ -22,7 +22,12 @@ _ARTIFACT_KINDS = (
     "hotels",
     "budget",
     "ranked",
+    "route_plan",
+    "candidate_comparison",
+    "itinerary_patch",
+    "local_adjustment_advice",
     "itinerary",
+    "duration_diagnostic",
     "agent_trace",
     "variant_metrics",
 )
@@ -52,6 +57,7 @@ class AgentHarness:
                 poi_path=self.environment.poi_path,
                 persist=self.environment.persist,
             )
+            _apply_tool_provider_mode(ctx, self.environment)
             _prepare_context(ctx, case)
             return _finalize_case(case, [], ctx, [], variant=_architecture_variant(self.environment))
 
@@ -63,6 +69,7 @@ class AgentHarness:
                     poi_path=self.environment.poi_path,
                     persist=self.environment.persist,
                 )
+                _apply_tool_provider_mode(ctx, self.environment)
                 _prepare_context(ctx, case)
                 contexts[session_id] = ctx
                 histories[session_id] = []
@@ -151,12 +158,20 @@ class AgentHarness:
                 memory_snapshot=_memory_snapshot(self.settings, user_id),
                 status=getattr(reply, "status", None),
                 plan_artifact_id=getattr(reply, "plan_artifact_id", None),
+                delivery_artifact_id=getattr(reply, "delivery_artifact_id", None),
                 agent_trace=list(getattr(reply, "agent_trace", None) or []),
                 request_id=getattr(reply, "request_id", None),
                 turn_metrics=dict(getattr(reply, "turn_metrics", None) or {}),
+                planner_status=getattr(reply, "planner_status", None),
+                recovery_state=getattr(reply, "recovery_state", None),
+                critical_slots_matched=list(
+                    getattr(reply, "critical_slots_matched", None) or []
+                ),
+                failure_reason=getattr(reply, "failure_reason", None),
                 raw_failure=getattr(reply, "raw_failure", None),
                 fallback_triggered=bool(getattr(reply, "fallback_triggered", False)),
                 final_outcome=getattr(reply, "final_outcome", None),
+                delivery_status=getattr(reply, "delivery_status", None),
             )
         except Exception as exc:  # noqa: BLE001
             duration_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -185,7 +200,11 @@ def _artifact_snapshot(ctx: SessionContext) -> dict[str, Any]:
     return {
         kind: payload
         for kind in _ARTIFACT_KINDS
-        if (payload := ctx.store.latest(kind)) is not None
+        if (payload := (
+            ctx.store.latest_current(kind)
+            if kind == "itinerary"
+            else ctx.store.latest(kind)
+        )) is not None
     }
 
 
@@ -233,6 +252,18 @@ def _prepare_context(ctx: SessionContext, case: HarnessCase) -> None:
     ctx.reference_datetime = case.snapshot_date
     if case.failure_injection:
         ctx.provider = FaultInjectingProvider(ctx.provider, case.failure_injection)
+
+
+def _apply_tool_provider_mode(
+    ctx: SessionContext,
+    environment: HarnessEnvironment,
+) -> None:
+    if environment.tool_provider != "local":
+        return
+    from travel_agent.data_loader import load_seed_pois
+    from travel_agent.providers import LocalToolProvider
+
+    ctx.provider = LocalToolProvider(load_seed_pois(environment.poi_path))
 
 
 def _session_ids(case: HarnessCase) -> list[str]:

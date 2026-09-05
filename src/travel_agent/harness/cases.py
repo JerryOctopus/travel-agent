@@ -42,6 +42,9 @@ class HarnessCase:
     high_risk: bool = False
     snapshot_date: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Optional artifact-first schema field. Legacy cases omit it and are
+    # classified from immutable gold/task text by the evaluator.
+    expected_artifact_type: str | None = None
     # production_v1 外部 schema 字段
     gold_outcome: str | None = None
     gold_constraints_tree: dict[str, Any] = field(default_factory=dict)
@@ -94,6 +97,7 @@ class HarnessCase:
             turn_expectations=list(data.get("turn_expectations") or []),
             snapshot_date=str(data.get("reference_datetime") or "") or None,
             metadata={key: value for key, value in metadata.items() if value is not None},
+            expected_artifact_type=str(data.get("expected_artifact_type") or "") or None,
             gold_outcome=str(gold.get("expected_outcome") or "") or None,
             gold_constraints_tree=constraints_tree,
             must_clarify_before_plan=list(gold.get("must_clarify_before_plan") or []),
@@ -150,6 +154,7 @@ class HarnessCase:
             "high_risk",
             "snapshot_date",
             "metadata",
+            "expected_artifact_type",
         }
         return cls(
             case_id=str(data.get("case_id") or data.get("id")),
@@ -184,6 +189,7 @@ class HarnessCase:
                 **dict(data.get("metadata") or {}),
                 **{k: v for k, v in data.items() if k not in known_keys},
             },
+            expected_artifact_type=str(data.get("expected_artifact_type") or "") or None,
         )
 
 

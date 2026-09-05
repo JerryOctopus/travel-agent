@@ -203,14 +203,17 @@ def test_v1_real_toolkit_planner_consumes_all_bound_domains_not_latest():
     plan = ctx.store.get(outcome.plan_artifact_id)
     assert executor.foreign_artifact_id not in plan["source_artifact_ids"]
     domain_inputs = plan["domain_inputs"]
-    for key in ("attractions", "hotels", "restaurants", "transport", "weather", "budgets"):
+    for key in ("attractions", "transport", "weather"):
         assert domain_inputs[key], key
+    assert domain_inputs["hotels"] == []
+    assert domain_inputs["restaurants"] == []
+    assert domain_inputs["budgets"] == []
     planned_categories = {
         stop["poi"]["category"]
         for day in plan["itinerary"]["days"]
         for stop in day["stops"]
     }
-    assert "food" in planned_categories
+    assert "food" not in planned_categories
     transport_task = next(task for task in executor.tasks if task.agent == "transport")
     compact_inputs = transport_task.inputs["artifact_inputs"]
     assert any(item["kind"] == "candidates" and item["payload"]["pois"] for item in compact_inputs)
@@ -239,12 +242,20 @@ def test_dynamic_full_plan_without_planner_is_incomplete(monkeypatch):
 
 def test_renderer_incomplete_overrides_top_level_completed(monkeypatch):
     ctx = build_session(session_id="sess_gate_override", persist=False)
+    from travel_agent.artifact_policy import constraint_version
+
+    version = constraint_version(ctx.profile)
     task_id = "planner-gate"
     plan_id = ctx.store.put(
         "itinerary",
         {
             "itinerary": {"city": "杭州", "summary": "不完整计划", "days": []},
             "critic": {"passed": False, "issues": [{"severity": "critical"}]},
+            "state_version": {
+                "constraint_revision": version["revision"],
+                "constraint_hash": version["constraint_hash"],
+                "constraint_snapshot": version["constraint_snapshot"],
+            },
         },
         request_id="req_gate_override",
         task_id=task_id,
@@ -305,14 +316,16 @@ def test_reviewer_invalid_schema_fails_closed():
 
 
 def test_v1_poi_transport_depends_on_upstream_poi_tasks():
-    tasks = build_fixed_tasks("req_poi", TaskType.POI_ADVICE, task_brief="住哪方便")
+    tasks = build_fixed_tasks(
+        "req_poi", TaskType.POI_ADVICE, task_brief="比较住宿区域到中央车站的交通可达性，住哪方便"
+    )
     assert isinstance(tasks, list)
-    attraction, hotel, transport = tasks
-    assert [task.agent for task in tasks] == ["attraction", "hotel", "transport"]
-    assert transport.depends_on == [attraction.task_id, hotel.task_id]
+    hotel, transport = tasks
+    assert [task.agent for task in tasks] == ["hotel", "transport"]
+    assert transport.depends_on == [hotel.task_id]
 
 
-def test_v1_revision_binds_existing_itinerary_artifact():
+def test_v1_local_adjustment_binds_existing_itinerary_without_planner():
     ctx = build_session(session_id="sess_revision", persist=False)
     old_plan_id = ctx.store.put("itinerary", dict(PLAN_PAYLOAD), agent="planner")
     seen: list[SubagentTask] = []
@@ -333,8 +346,8 @@ def test_v1_revision_binds_existing_itinerary_artifact():
     )
 
     assert outcome.status == STATUS_COMPLETED
-    assert seen[0].agent == "planner"
-    assert seen[0].inputs["artifact_ids"] == [old_plan_id]
+    assert [task.agent for task in seen] == ["attraction"]
+    assert all(old_plan_id in task.inputs["artifact_ids"] for task in seen)
 
 
 def test_v1_revision_without_existing_itinerary_asks_for_one():

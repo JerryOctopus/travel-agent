@@ -14,6 +14,7 @@ from travel_agent.orchestration.multi_agent.engine import (
     FULL_CONFIG,
     V2_CONFIG,
     MultiAgentEngine,
+    _missing_evidence_dispatches,
 )
 from travel_agent.orchestration.multi_agent.orchestrator_agent import (
     ROUTER_MAX_OUTPUT_TOKENS,
@@ -46,7 +47,8 @@ def test_preplanner_timeout_preserves_planner_reserve_and_guard() -> None:
     assert deadline.effective_preplanner_timeout(20, now=185.0) == 0
     assert deadline.admits_planner(now=185.0)
     assert not deadline.admits_recovery_wave(now=180.0)
-    assert deadline.reviewer_timeout(now=330.0) == 5
+    # Deterministic gate + renderer + guard are protected after Reviewer.
+    assert deadline.reviewer_timeout(now=330.0) == 0
 
 
 def test_turn_deadline_includes_outer_preflight_time() -> None:
@@ -64,28 +66,28 @@ def test_v3_candidate_budget_preserves_planner_reviewer_and_finalization() -> No
         config=DeadlineConfig(),
     )
 
-    # Base closes at 210s because the 300s turn cap preserves the 85s
-    # Reviewer reserve plus the independent 5s finalization guard.
-    assert deadline.base_deadline == 210
+    # Base closes at 200s because the turn cap now protects Reviewer,
+    # deterministic gate, rendering, and the independent guard.
+    assert deadline.base_deadline == 200
     assert deadline.admits_router(now=40)
     assert deadline.router_timeout_preserving_worker(now=40) == 80
-    assert deadline.admits_planner(now=180)
-    assert deadline.planner_timeout(60, now=145) == 60
-    assert deadline.reviewer_timeout(now=210) == 85
+    assert deadline.admits_planner(now=170)
+    assert deadline.planner_timeout(60, now=145) == 50
+    assert deadline.reviewer_timeout(now=200) == 85
     assert deadline.reviewer_timeout(now=295) == 0
 
 
 def test_recovery_wave_uses_minimum_useful_windows_not_full_transport_caps() -> None:
     deadline = TurnDeadline(started_at=0.0, config=DeadlineConfig())
 
-    # At t=120, usable pre-Planner time is 60s: enough for the calibrated
+    # At t=110, usable pre-Planner time is 60s: enough for the calibrated
     # Router-useful 35s + recovery-worker-useful 25s admission threshold.
-    assert deadline.usable_preplanner_time(now=120) == 60
-    assert deadline.admits_recovery_wave(now=120)
-    assert deadline.admits_router(now=120)
-    assert deadline.router_timeout_preserving_worker(now=120) == 35
-    assert not deadline.admits_recovery_wave(now=121)
-    assert not deadline.admits_router(now=121)
+    assert deadline.usable_preplanner_time(now=110) == 60
+    assert deadline.admits_recovery_wave(now=110)
+    assert deadline.admits_router(now=110)
+    assert deadline.router_timeout_preserving_worker(now=110) == 35
+    assert not deadline.admits_recovery_wave(now=111)
+    assert not deadline.admits_router(now=111)
 
 
 def test_router_effective_timeout_cannot_consume_recovery_worker_window() -> None:
@@ -93,8 +95,8 @@ def test_router_effective_timeout_cannot_consume_recovery_worker_window() -> Non
 
     # The calibrated Router transport cap is 80s, but at this admission point
     # only 65s are usable. Keep 25s for the worker, so Router receives 40s.
-    assert deadline.usable_preplanner_time(now=115) == 65
-    assert deadline.router_timeout_preserving_worker(now=115) == 40
+    assert deadline.usable_preplanner_time(now=105) == 65
+    assert deadline.router_timeout_preserving_worker(now=105) == 40
 
 
 class _JsonRouterModel(BaseChatModel):
@@ -248,7 +250,10 @@ class _WaveExecutor:
                     "hotel": "hotels",
                     "restaurant": "restaurants",
                 }[task.agent]
-                ctx.store.put(kind, {"city": "杭州", "items": []})
+                payload = {"city": "测试城", "items": []}
+                if task.agent == "attraction":
+                    payload["pois"] = [{"poi_id": "sight-1", "name": "景点甲"}]
+                ctx.store.put(kind, payload)
                 if task.agent == "attraction":
                     ctx.store.put(
                         "restaurants",
@@ -330,10 +335,24 @@ def test_wave2_only_runs_for_missing_hard_evidence(monkeypatch) -> None:
     )
 
     assert outcome.status == STATUS_COMPLETED
-    assert calls == [1, 2]
+    assert calls == [1]
+    assert any(task.agent == "transport" for task in _executor.tasks)
 
 
-def test_missing_hard_evidence_does_not_force_planner(monkeypatch) -> None:
+def test_missing_evidence_postcondition_maps_only_allowed_domain_agents() -> None:
+    dispatches = _missing_evidence_dispatches(
+        ["景点候选", "预算证据", "具体餐厅证据", "住宿证据"],
+        allowed_agents={"attraction", "transport", "restaurant"},
+        excluded_agents={"attraction"},
+    )
+
+    assert dispatches == [
+        ("transport", ["预算证据"]),
+        ("restaurant", ["具体餐厅证据"]),
+    ]
+
+
+def test_router_ready_cannot_bypass_missing_hard_evidence_dispatch(monkeypatch) -> None:
     monkeypatch.setattr(
         "travel_agent.orchestration.multi_agent.orchestrator_agent.route_wave",
         lambda *args, **kwargs: RoutingDecision(ready=True),
@@ -347,9 +366,9 @@ def test_missing_hard_evidence_does_not_force_planner(monkeypatch) -> None:
         request_id="req-no-plan",
     )
 
-    assert outcome.status == STATUS_INCOMPLETE
-    assert not any(task.agent == "planner" for task in executor.tasks)
-    assert ctx.store.latest_id("itinerary") is None
+    assert outcome.status == STATUS_COMPLETED
+    assert {task.agent for task in executor.tasks} >= {"attraction", "transport", "planner"}
+    assert ctx.store.latest_id("itinerary") is not None
 
 
 def test_v2_v3_execute_independent_bases_with_same_policy(monkeypatch) -> None:

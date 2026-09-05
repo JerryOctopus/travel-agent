@@ -22,7 +22,7 @@ from travel_agent.planning import (
     apply_structured_schedule_constraints,
     build_simple_itinerary,
 )
-from travel_agent.reviser import revise_itinerary
+from travel_agent.reviser import _reconcile_revision_notes, revise_itinerary
 from travel_agent.schemas import (
     CriticResult,
     Itinerary,
@@ -198,6 +198,8 @@ def plan_and_critique(
         original_itinerary=original,
         critic_result=final["critic_result"],
         original_issue_count=len(original_issues),
-        revision_notes=list(final.get("revision_notes", [])),
+        revision_notes=_reconcile_revision_notes(
+            list(final.get("revision_notes", [])), final["itinerary"], profile
+        ),
         iterations=final.get("iteration", 0),
     )

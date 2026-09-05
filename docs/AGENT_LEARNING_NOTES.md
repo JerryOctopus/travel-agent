@@ -1345,3 +1345,362 @@ HumanMessage
   - 非明确旅行问题快速回收
   - 避免无效主链路调用
   - 在异常/失败下保持确定性离线行为（不会卡死）
+
+## 动态 Router、执行 Wave 与证据闭环
+
+### Router 是什么
+
+动态派工模式下，Router 是“本波派工决策模块”：它根据用户请求、任务类型、之前各波的
+结果和仍缺少的硬证据，建议这一波应该派发哪些领域 Subagent。Router 不搜索业务数据、
+不生成行程，也不直接执行 Subagent；完整生命周期仍由 `MultiAgentEngine` 控制。
+
+```text
+MultiAgentEngine
+    -> 计算 missing_hard、时间和派工额度
+    -> route_wave() 调用 Router LLM，取得派工建议
+    -> 校验 Agent、依赖、重复目标和 DispatchLedger
+    -> SubagentRunner 执行领域 Subagent
+    -> 汇总 Result / Evidence / Artifact
+    -> 再次计算 missing_hard
+    -> 证据齐全后执行 Planner 工具链和 Reviewer
+```
+
+职责边界如下：
+
+| 组件 | 职责 |
+|---|---|
+| Router | 理解语义，建议“派谁、做什么、依赖谁” |
+| `MultiAgentEngine` | 控制 wave、校验建议、决定是否真的派工 |
+| `DispatchLedger` | 限制总派工次数和各 Agent 次数 |
+| `SubagentRunner` | 隔离并实际执行 Subagent，归因其 Artifact |
+| 领域 Subagent | 调用景点、酒店、餐厅、交通等领域工具取得证据 |
+| Planner 工具链 | 按明确 Artifact ID 读取完整数据并生成行程 |
+| Reviewer | 独立检查完整计划的语义质量 |
+
+固定派工模式不调用 Router LLM，而是按任务类型使用预设映射；以下内容描述动态派工模式。
+
+### `route_wave()` 做什么
+
+```python
+def route_wave(
+    ctx,
+    settings,
+    user_message,
+    request_id,
+    *,
+    wave,
+    model=None,
+    history=None,
+    task_type=None,
+    turn_inputs=None,
+    compact_results=None,
+    attempted_objectives=None,
+    missing_evidence=None,
+    timeout_seconds,
+    max_tasks,
+) -> RoutingDecision:
+```
+
+这个函数对当前 wave 进行**恰好一次、有超时上限的 Router 模型调用**。它不会把可变的
+`ctx.store` 句柄交给模型，也不会进入 ReAct 工具循环。传给模型的是只读 snapshot：
+
+```json
+{
+  "wave": 2,
+  "task_type": "full_trip_plan",
+  "request": "厦门四天，住思明区，不吃海鲜",
+  "turn_inputs": {"artifact_ids": []},
+  "history": [],
+  "compact_results": [],
+  "attempted_objectives": [],
+  "engine_missing_hard_evidence": ["景点候选", "路线可行性", "住宿证据", "餐饮证据"],
+  "max_tasks": 2
+}
+```
+
+其中：
+
+- `history` 最多取最近 4 条消息；
+- `compact_results` 是前面各波结果的紧凑摘要，不是 Artifact 完整 payload；
+- `attempted_objectives` 防止模型重复提出相同目标；
+- `engine_missing_hard_evidence` 是 Engine 的确定性判断；
+- `max_tasks` 限制本波最多返回多少个任务。
+
+Router 的 `SystemMessage` 规定：只能派 `attraction / hotel / restaurant / transport`，不能派
+`planner / reviewer / repair`；第一波返回可并行任务，后续波只返回补齐硬证据的 delta
+任务；信息不足时应请求澄清；输出必须是 JSON。`HumanMessage` 则承载上述 snapshot。
+
+模型调用被约束为：
+
+```python
+active_model.bind(
+    max_tokens=768,
+    response_format={"type": "json_object"},
+)
+```
+
+Router 模型负责语义判断，但没有最终派工权。模型输出先经 `_parse_decision()` 校验，之后
+Engine 还会检查允许的 Agent、是否重复、`depends_on` 是否存在且成功、Ledger 额度和剩余
+时间，全部通过后才创建真正的 `SubagentTask`。
+
+### `_parse_decision()` 返回什么
+
+```python
+return _parse_decision(raw, max_tasks=max_tasks)
+```
+
+返回的是不可变的 `RoutingDecision` 数据对象，不是普通字典：
+
+```python
+RoutingDecision(
+    tasks=(
+        RoutingTask(
+            agent="hotel",
+            instruction="查询思明区符合预算的酒店",
+            objective="补齐思明区住宿证据",
+            depends_on=(),
+        ),
+    ),
+    ready=False,
+    clarification=False,
+    missing_evidence=("住宿证据",),
+    reason="仍缺住宿候选",
+    reply="",
+    error=None,
+)
+```
+
+字段含义：
+
+| 字段 | 含义 |
+|---|---|
+| `tasks` | Router 建议的本波领域任务 |
+| `ready` | Router 主观认为是否可以停止派发；不取代 Engine 的证据判断 |
+| `clarification` | 是否应该向用户追问 |
+| `missing_evidence` | Router 自己报告的缺失项，主要用于解释和 Trace |
+| `reason` | 路由理由 |
+| `reply` | 请求澄清时的候选回复 |
+| `error` | 超时、无 JSON、模型不可用等错误 |
+
+`_parse_decision()` 只接受四种领域 Agent，丢弃缺少 `instruction/objective` 的任务，按
+`objective_key` 去重，并截断到 `max_tasks`。Engine 的 `missing_hard` 才是证据准入的权威
+结果，不能仅凭 `decision.ready=True` 认定证据齐全。
+
+### Wave 和停止条件
+
+动态执行最多分为三类 wave：
+
+| Wave | 目的 |
+|---|---|
+| 1 | 首次正常派工，最多 `routing_wave1_max_tasks` 个独立任务 |
+| 2 | 只补第一波后仍缺少的硬证据，最多 2 个任务 |
+| 3 | 对第二波的可重试失败或新 Artifact 解锁机会做最后补救，最多 2 个任务 |
+
+每一波开始前按顺序检查：
+
+```python
+if wave > 1 and not missing_hard:
+    stop_reason = "hard_evidence_ready"
+elif router_calls >= max_calls or ledger.attempts >= max_dispatches:
+    stop_reason = "routing_budget_exhausted"
+elif wave > 1 and not deadline.admits_recovery_wave():
+    stop_reason = "recovery_admission_denied"
+elif wave == 3 and not _wave3_recovery_allowed(last_wave_results, missing_hard):
+    stop_reason = "wave3_conditions_not_met"
+```
+
+随后还会检查 Router 时间准入。`deadline.router_timeout_preserving_worker()` 动态计算 Router
+本次最多可用时间，同时为 Worker、Planner、Reviewer 保留预算；不能让 Router 用光本轮
+时间。剩余总派工数为：
+
+```python
+remaining_dispatch = max_dispatches - ledger.attempts
+max_tasks = min(wave1_max if wave == 1 else 2, remaining_dispatch)
+```
+
+第三波只有在仍缺硬证据、第二波确实有结果，并满足以下任一条件时才允许：
+
+```text
+第二波存在 failed / budget_exhausted
+                         或
+第二波成功产生了带 artifact_id 的新证据
+```
+
+当前 `_wave3_recovery_allowed()` 比较宽松：它没有区分永久失败和临时失败，也只判断是否
+产生 Artifact ID，没有验证该 Artifact 的 kind 是否真正能解锁当前 `missing_hard`。
+
+### 硬证据、`ctx`、Result 和 Artifact 的关系
+
+`_required_evidence(ctx, task_type, results, base_inputs)` 同时读取四类信息，但职责不同：
+
+```text
+task_type + ctx.profile.constraint_state
+    -> 决定“必须具备什么证据”
+
+累计 results[].evidence
+    -> 本轮各波 Subagent 新取得了什么证据
+
+base_inputs.artifact_ids -> ctx.store.get_record(id)
+    -> 本轮明确复用的既有证据
+
+要求集合 - 已有证据 kinds
+    -> missing_hard / missing_soft
+```
+
+例如 `ctx.profile.constraint_state["lodging_area"] = "思明区"` 只表示用户要求住思明区，
+它不是酒店事实证据；只有成功的 Subagent Result 或明确绑定的 Artifact 声明
+`kind="hotels"`，住宿证据才算具备。`results` 是各波累计结果，`last_wave_results` 才仅代表
+上一波。
+
+Artifact 是工具/Subagent 保存到 `ctx.store` 的结构化结果本体，例如：
+
+```python
+{
+    "artifact_id": "hotels_a1b2c3d4",
+    "kind": "hotels",
+    "session_id": "sess_xxx",
+    "payload": {"city": "厦门", "hotels": [...]},
+    "request_id": "req_xxx",
+    "task_id": "hotel-12345678",
+    "agent": "hotel",
+    "data_source": "amap",
+}
+```
+
+Artifact 是数据本体，Evidence 是 Result 对其证明用途的声明：
+
+```python
+{"kind": "hotels", "artifact_id": "hotels_a1b2c3d4"}
+```
+
+完整数据留在 Store 中，传递 ID能降低 Token 消耗并保持请求、任务、Agent 和来源可追踪。
+`_required_evidence()` 不扫描 Store 中全部历史 Artifact，只承认本轮明确绑定的 ID，避免误用
+过期或无关结果。
+
+### 当前 Planner 是否把所有酒店交给大模型
+
+当前实现中，`definition.name == "planner"` 时会直接进入确定性 Planner 工具链，不会执行
+`create_agent(...).invoke(...)`，因此不存在“把全部酒店候选交给 Planner LLM”这一步：
+
+```text
+明确绑定的 artifact_ids
+    -> build_constraints()
+    -> recommend_candidates()
+    -> plan_and_critique()
+```
+
+`plan_and_critique()` 按 ID从 Store 读取酒店 Artifact 的完整 payload；酒店候选的 ID、名称、
+地址、区域、价格、评分、经纬度和来源都可被确定性代码使用。`_build_lodging_plan()` 会排除
+mock、按用户区域过滤，再按“价格最低、评分较高”选出一个酒店，并计算晚数、房间数和住宿
+小计。完整候选仍保存在最终 itinerary Artifact 的 `domain_inputs.hotels` 中，最终
+`lodging_plan` 通常只展示被选中的一个。
+
+需要区分另一条路径：非 Planner 的下游 Subagent 若依赖酒店 Artifact，只接收最多前 8 个
+酒店的 ID 和名称；Hotel Subagent 自己调用 `search_hotel()` 后，模型工具消息通常能看到该次
+返回的全部候选（默认最多 10 个）。真正从原始 POI 丢失的信息主要发生在
+`_hotels_from_pois()` 构建酒店 Artifact 时，而不是 Planner 按 ID读取 Artifact 时。
+
+## 工具执行契约：LLM 结束 Worker，Engine 结束任务
+
+Worker 中的 LLM 仍通过 `create_agent()` 决定调用哪个白名单工具，以及何时不再发出
+`tool_call`。不再发工具调用只代表当前 Worker 的 ReAct 循环结束，不代表旅行任务完成。
+Engine 随后使用后置条件、Artifact 归属和 `_required_evidence()` 判断是否需要确定性补救、
+下一 Wave 或 Planner：
+
+```text
+LLM 不再调用工具
+  -> Worker 返回
+  -> 校验目标 Artifact 和任务归属
+  -> Engine 检查 missing_hard
+  -> 补救 / 下一 Wave / Planner / 结束
+```
+
+所有 toolkit 工具现在共用调用前契约，因此 Local LangChain、MCP 和确定性补救路径具有相同
+行为。成功信封仍为 `{isError: false, summary: ...}`；失败信封增加稳定字段：
+
+```python
+{
+    "isError": True,
+    "summary": "找不到对应 POI",
+    "error_code": "NOT_FOUND",
+    "retryable": True,
+    "details": {"missing_poi_ids": ["poi-x"]},
+}
+```
+
+固定错误码包括 `INVALID_INPUT`、`NOT_FOUND`、`UPSTREAM_UNAVAILABLE`、
+`RATE_LIMITED`、`PERMISSION_DENIED`、`CONTRACT_VIOLATION` 和 `INTERNAL_ERROR`。
+只有 `retryable=true` 才允许修正参数后重试一次；不可重试错误后的重复调用会被预算守卫
+直接拒绝。请求取消、超时和工具预算耗尽属于控制流，不会伪装成普通工具错误。
+
+调用前语义校验覆盖城市、数量范围、预算与人数、交通方式、路线端点、当前会话 POI ID，
+以及 Planner 明确绑定的 Artifact ID。工具声称成功却没有生成预期 kind 的 Artifact，或
+Artifact 的 `request_id/task_id/agent` 不属于当前任务，会转换为
+`CONTRACT_VIOLATION`，不能充当完成证据。
+
+工具并发采用显式 `ToolExecutionPolicy`：查询、天气、路线和预算工具可并发，依赖
+`ArtifactStore` 自身的短锁保证记录安全；画像修改、约束构建、候选排序、规划和渲染按
+session 串行。未注册工具默认串行（fail-closed），不同 session 使用不同锁，不会互相阻塞。
+Planner 的 `build_constraints -> recommend_candidates -> plan_and_critique` 仍由确定性代码
+严格串行执行。
+
+## `avoid`：评分前的结构化硬过滤
+
+`avoid` 不再只是候选评分中的少量扣分。`recommend_candidates()` 在实体去重之后、调用
+`score_pois()` 之前，使用共享的 `poi_avoid_match()` 删除具有确定性避开证据的候选。因此高
+热度、高评分地点只要命中有效硬约束，也不会进入 `ranked.pois` 或后续 Planner。
+
+匹配器按以下来源收集规则，当前行程约束优先于长期画像：
+
+```text
+constraint_state.removed / avoid / exclude
+    -> 当前行程硬约束
+
+profile.avoid
+    -> 长期偏好回退
+```
+
+`removed` 只匹配具体实体：当前 Provider POI ID、规范名称、Provider 别名或统一的 canonical
+identity。它不会把“博物馆”解释成删除所有博物馆。`avoid/exclude` 除具体实体外，还可使用
+受控兴趣类别和 Provider 标签；`咖啡店`、`海边`、`园林` 使用各自的窄别名集合，例如避开
+“咖啡店”不会删除所有 `food`，避开“海边”也不会删除所有自然景点。
+
+“早起、排队久、连续爬坡、长楼梯”等条件缺少可靠 POI 属性时，不在候选阶段硬删，继续交给
+排程和 Critic 判断。匹配完全由结构化字段与确定性规则完成，不增加 LLM 判断。
+
+约束冲突遵循以下优先级：
+
+```text
+当前 constraint_state.avoid / exclude / removed
+    > 本轮 must_visit
+    > 仅来自长期 profile.avoid 的旧偏好
+```
+
+也就是说，本轮明确说“必须去西湖”可以覆盖长期记忆中的“避开西湖”；但本轮又明确
+`removed/avoid/exclude=西湖` 时仍必须删除。
+
+Ranked Artifact 保持原有 `pois` 和 `source_artifact_ids`，并新增可选审计字段：
+
+```python
+{
+    "pois": [...],
+    "source_artifact_ids": [...],
+    "excluded_by_avoid": [
+        {
+            "poi_id": "...",
+            "name": "西湖景区",
+            "term": "西湖",
+            "source": "avoid",
+            "method": "canonical_identity",
+            "matched_value": "西湖",
+        }
+    ],
+}
+```
+
+全部候选都被过滤时，工具返回稳定的 `NOT_FOUND`，并附带同一份
+`excluded_by_avoid`，便于 Engine 决定补充检索或向用户说明。Critic、Reviser、超长路线修复和
+稀疏日补充都调用同一个匹配器，因此不会在后续修复中重新放回已经排除的地点。
+
+`score_pois()` 中仍保留 `constraint_boost=0` 的防御路径，兼容绕过 Planner 直接评分的旧调用；
+正常 Planner 链路中，避开项在评分前已经被移除。

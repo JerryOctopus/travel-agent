@@ -198,18 +198,13 @@ def test_preference_followup_continues_travel_context(offline_settings) -> None:
     assert second.map_payload is not None
 
 
-def test_preference_change_followup_replans_with_new_interest(offline_settings) -> None:
+def test_preference_change_followup_accumulates_until_explicit_rebuild(offline_settings) -> None:
     ctx = build_session(persist=False)
     first = run_production_turn("帮我规划杭州三天，喜欢美食", ctx=ctx, settings=offline_settings)
     second = run_production_turn("自然风景呢，结合吃饭", ctx=ctx, settings=offline_settings)
 
     assert "plan_and_critique" in first.tool_trace
-    assert "plan_and_critique" in second.tool_trace
+    assert "plan_and_critique" not in second.tool_trace
+    assert second.planner_status == "deferred_state_update"
     assert {"food", "nature"}.issubset(set(ctx.profile.interests))
-    assert second.map_payload is not None
-    categories = {
-        marker["category"]
-        for marker in second.map_payload["markers"]
-    }
-    assert "scenic" in categories
-    assert "food" in categories
+    assert ctx.profile.constraint_state["_plan_status"] == "rebuild_pending"

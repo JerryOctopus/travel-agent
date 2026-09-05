@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import re
 import time
 from functools import wraps
 from typing import Any
@@ -19,8 +20,6 @@ from travel_agent.agent import toolkit
 from travel_agent.agent.session import (
     SessionContext,
     current_task_meta,
-    session_tool_lock,
-    should_serialize_tool,
 )
 from travel_agent.settings import Settings
 from travel_agent.skills.loader import build_skill_tools, load_skills
@@ -42,6 +41,33 @@ TOOL_CONTEXT_DEFAULTS: dict[str, dict[str, str]] = {
     "search_hotel": {"city": "destination", "budget_level": "budget_level"},
     "estimate_budget": {"city": "destination", "days": "days", "budget_level": "budget_level"},
 }
+
+
+def _normalize_restaurant_budget_level(value: str | None) -> str | None:
+    """Map a per-capita amount mistakenly placed in the tier slot to a tier."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    lowered = text.casefold()
+    aliases = {
+        "low": "low",
+        "mid": "mid",
+        "high": "high",
+        "经济": "low",
+        "舒适": "mid",
+        "豪华": "high",
+    }
+    if lowered in aliases:
+        return aliases[lowered]
+    amount = re.search(r"\d+(?:\.\d+)?", text)
+    if amount is None:
+        return text
+    per_capita = float(amount.group(0))
+    if per_capita <= 80:
+        return "low"
+    if per_capita <= 200:
+        return "mid"
+    return "high"
 
 
 def _dump(result: dict[str, Any]) -> str:
@@ -149,9 +175,16 @@ def build_tools(
         budget_level: str | None = None,
         max_results: int = 10,
     ) -> str:
-        """检索餐厅候选，支持城市、菜系、区域和预算档位。"""
+        """检索餐厅候选；budget_level 填 low/mid/high，人均金额也会自动换算。"""
         return _dump(
-            toolkit.search_restaurant(ctx, city, cuisine, area, budget_level, max_results)
+            toolkit.search_restaurant(
+                ctx,
+                city,
+                cuisine,
+                area,
+                _normalize_restaurant_budget_level(budget_level),
+                max_results,
+            )
         )
 
     def search_hotel(
@@ -254,6 +287,8 @@ def build_tools(
                 result = fn(*args, **kwargs)
                 payload = _parse_tool_payload(result)
                 record["status"] = "error" if payload.get("isError") else "ok"
+                if payload.get("error_code") is not None:
+                    record["error_code"] = payload.get("error_code")
                 record["data_source"] = _find_data_source(payload) or type(ctx.provider).__name__
                 record["fallback_reason"] = payload.get("fallback_reason")
                 if ctx.request_control is not None:
@@ -276,7 +311,7 @@ def build_tools(
         return wrapper
 
     def serialized(fn):
-        """Compatibility hook: toolkit/store own short state locks; I/O stays unlocked."""
+        """Compatibility hook: ``contracted_tool`` owns concurrency policy."""
         return fn
 
     tools = [

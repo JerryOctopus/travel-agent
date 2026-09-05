@@ -30,6 +30,13 @@ from travel_agent.harness.product import (
     _git_revision,
     _prompt_fingerprint,
     _sha256,
+    _artifact_contract_fingerprint,
+    _code_fingerprint,
+    _configuration_fingerprint,
+    _evaluator_fingerprint,
+    _evaluator_version,
+    _tooling_fingerprint,
+    _tool_snapshot_fingerprint,
     aggregate_product_rows,
     validate_product_dataset,
     write_product_run,
@@ -37,7 +44,7 @@ from travel_agent.harness.product import (
 from travel_agent.harness.result import HarnessSuiteResult
 from travel_agent.settings import load_settings
 
-REQUIRED_AGENTS = ["attraction", "hotel", "restaurant", "transport", "planner"]
+ALL_AGENT_ROLES = ["attraction", "hotel", "restaurant", "transport", "planner"]
 
 
 def acquire_run_lock(run_dir: Path):
@@ -129,6 +136,11 @@ def parse_models(entries: list[str], default_provider: str) -> list[tuple[str, s
     return models
 
 
+def relay_mode_enabled(models: list[Any]) -> bool:
+    """A one-model execution uses the relay runner but is not model relay."""
+    return len(models) > 1
+
+
 def pick_api_key(
     provider: str,
     override: str | None,
@@ -211,6 +223,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--api-key", default=None, help="API key override for all relay models.")
     parser.add_argument(
+        "--tool-provider",
+        choices=["configured", "local"],
+        default="configured",
+        help="Use configured live tools or the frozen local seed provider.",
+    )
+    parser.add_argument(
         "--max-model-tokens",
         type=int,
         default=0,
@@ -274,7 +292,7 @@ def build_state_template(
 
 
 def multi_agent_fields(result) -> dict[str, Any]:
-    """Strict proof that all five real LLM Subagents completed for this execution."""
+    """Artifact-scoped proof that every semantically required role completed."""
     items = [item for turn in result.turns for item in (turn.agent_trace or [])]
     if not items:
         payload = result.final_artifacts.get("agent_trace") or {}
@@ -285,20 +303,38 @@ def multi_agent_fields(result) -> dict[str, Any]:
         if item.get("kind") == "subagent"
         and item.get("status") in ("completed", "completed_with_warnings")
     }
-    missing_agents = [agent for agent in REQUIRED_AGENTS if agent not in successful_agents]
     last = result.last_turn
+    from travel_agent.evaluation.artifact_contract import required_agents_for_delivery
+
+    expected = str((result.metrics or {}).get("expected_artifact_type") or "full_itinerary")
+    required_agents = required_agents_for_delivery(
+        expected,
+        task_brief=str(last.user_message if last else ""),
+        profile=(last.profile if last else result.final_profile),
+    )
+    missing_agents = [agent for agent in required_agents if agent not in successful_agents]
     real_delivery = bool(last and last.used_real_agent)
-    itinerary_produced = result.final_artifacts.get("itinerary") is not None
+    artifact_delivered = bool((result.metrics or {}).get("artifact_type_match"))
     return {
         "multi_agent_mode": True,
-        "multi_agent_required_agents": list(REQUIRED_AGENTS),
+        "multi_agent_required_agents": required_agents,
         "multi_agent_successful_agents": sorted(successful_agents),
         "multi_agent_missing_agents": missing_agents,
         "multi_agent_all_agents_completed": not missing_agents,
         "multi_agent_strict_success": bool(
-            real_delivery and itinerary_produced and not missing_agents
+            real_delivery and artifact_delivered and not missing_agents
         ),
     }
+
+
+def provider_reported_models(result) -> list[str]:
+    """Collect upstream response model identities without replacing requested identity."""
+    return sorted({
+        str(call.get("model") or "").strip()
+        for turn in result.turns
+        for call in (turn.model_calls or [])
+        if str(call.get("model") or "").strip()
+    })
 
 
 def load_state(state_path: Path) -> dict[str, Any]:
@@ -343,6 +379,17 @@ def load_pending_case_outputs(pending_dir: Path) -> list[dict[str, Any]]:
 
 
 def build_failed_row(case, reason: str) -> dict[str, Any]:
+    from travel_agent.evaluation.artifact_contract import (
+        expected_artifact_type,
+        required_agents_for_delivery,
+    )
+
+    expected = expected_artifact_type(case)
+    required_agents = required_agents_for_delivery(
+        expected,
+        task_brief=str(case.turns[-1] if case.turns else ""),
+        profile={"constraint_state": dict(case.hard_constraints or {})},
+    )
     return {
         "case_id": case.case_id,
         "split": case.split,
@@ -385,9 +432,9 @@ def build_failed_row(case, reason: str) -> dict[str, Any]:
         "failure_attributions": ["external_api"],
         "errors": [reason],
         "multi_agent_mode": True,
-        "multi_agent_required_agents": list(REQUIRED_AGENTS),
+        "multi_agent_required_agents": required_agents,
         "multi_agent_successful_agents": [],
-        "multi_agent_missing_agents": list(REQUIRED_AGENTS),
+        "multi_agent_missing_agents": required_agents,
         "multi_agent_all_agents_completed": False,
         "multi_agent_strict_success": False,
     }
@@ -446,8 +493,15 @@ def main() -> None:
         state["case_count"] = len(selected_cases)
         state["split"] = args.product_split
         state["limit"] = args.limit
+        state["tool_provider_mode"] = args.tool_provider
     else:
         if args.resume:
+            recorded_tool_provider = str(state.get("tool_provider_mode") or "configured")
+            if recorded_tool_provider != args.tool_provider:
+                raise RuntimeError(
+                    "resume tool-provider mismatch: "
+                    f"recorded={recorded_tool_provider} requested={args.tool_provider}"
+                )
             state["run_id"] = run_id
             state["case_count"] = len(selected_cases)
             state["split"] = args.product_split
@@ -579,6 +633,7 @@ def main() -> None:
         mode="real_agent",
         persist=False,
         user_id="product_eval",
+        tool_provider=args.tool_provider,
     )
 
     harnesses: dict[tuple[str, str], AgentHarness] = {}
@@ -728,6 +783,8 @@ def main() -> None:
             output["execution"]["runtime_model_base_url"] = str(harness.settings.llm.base_url)
             output["execution"]["runtime_model_switches"] = local_switches
             output["execution"]["runtime_model_index"] = current_model_index
+            output["execution"]["requested_model"] = model
+            output["execution"]["provider_reported_models"] = provider_reported_models(result)
             append_case_output(output)
             row["runtime_model"] = model
             rows.append(row)
@@ -795,7 +852,8 @@ def main() -> None:
             break
 
     summary = aggregate_product_rows(rows, remediation_complete=args.remediation_complete)
-    summary["relay_mode"] = True
+    relay_enabled = relay_mode_enabled(state["models"])
+    summary["relay_mode"] = relay_enabled
     summary["real_multi_agent"] = True
     strict_values = [row.get("multi_agent_strict_success") for row in rows]
     strict_values = [value for value in strict_values if isinstance(value, bool)]
@@ -826,10 +884,42 @@ def main() -> None:
             "model_temperature": settings.llm.temperature,
             "model_thinking_enabled": settings.llm.thinking_enabled,
             "model_requests_per_second": settings.llm.requests_per_second,
+            "hybrid_flags": {
+                "enable_llm_intent_normalizer": settings.hybrid_planning.enable_llm_intent_normalizer,
+                "enable_llm_preference_resolver": settings.hybrid_planning.enable_llm_preference_resolver,
+                "enable_structured_duration_estimator": settings.hybrid_planning.enable_structured_duration_estimator,
+            },
             "prompt_fingerprint": _prompt_fingerprint(),
+            "code_fingerprint": _code_fingerprint(),
+            "evaluator_fingerprint": _evaluator_fingerprint(),
+            "tooling_fingerprint": _tooling_fingerprint(),
+            "configuration_fingerprint": _configuration_fingerprint(
+                settings, args.tool_provider
+            ),
+            "tool_snapshot_fingerprint": _tool_snapshot_fingerprint(
+                settings, args.tool_provider
+            ),
+            "evaluator_version": _evaluator_version(),
+            "artifact_contract_fingerprint": _artifact_contract_fingerprint(selected_cases),
             "relay_models": state["models"],
+            "model_execution_mode": (
+                "model_relay" if relay_enabled else "fixed_single_model"
+            ),
+            "requested_models": sorted({item["model"] for item in state["models"]}),
+            "provider_reported_models": sorted({
+                reported
+                for output in case_outputs
+                for reported in (
+                    (output.get("execution") or {}).get("provider_reported_models") or []
+                )
+            }),
             "real_multi_agent": True,
-            "required_agents": list(REQUIRED_AGENTS),
+            "tool_provider_mode": args.tool_provider,
+            "required_agents": sorted({
+                agent
+                for row in rows
+                for agent in (row.get("multi_agent_required_agents") or [])
+            }),
             "relay_model_usage": model_usage,
             "relay_summary": {
                 "attempts_total": attempts_total,

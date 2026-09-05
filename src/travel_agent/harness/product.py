@@ -6,8 +6,8 @@ import math
 import re
 import statistics
 import subprocess
-from dataclasses import asdict, dataclass, is_dataclass, replace
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,172 @@ class ProductDatasetValidation:
     errors: list[str]
     split_counts: dict[str, int]
     subset_counts: dict[str, int]
+    frozen_warnings: list[str] = field(default_factory=list)
+
+
+_ABSOLUTE_RETURN_DEADLINE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})(?:$|[T\s])"
+)
+_ISO_USER_DATE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
+_CHINESE_USER_DATE = re.compile(
+    r"(?<!\d)(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?"
+)
+_DURATION_TOKEN = re.compile(
+    r"(?P<number>\d{1,3}|[零〇一二两三四五六七八九十百]+)\s*(?P<unit>天|日游)"
+)
+_RELATIVE_FINAL_DEADLINE = re.compile(
+    r"(?P<day>最后一天|第(?P<number>\d{1,3}|[零〇一二两三四五六七八九十百]+)天)"
+    r"[^。；]{0,30}?(?P<hour>\d{1,2})(?::|点)(?P<minute>\d{2})?"
+)
+
+
+def validate_absolute_return_deadline_evidence(
+    cases: list[HarnessCase],
+) -> tuple[list[str], list[str]]:
+    """Reject absolute return dates unsupported by either date or relative-day semantics.
+
+    An ISO ``return_deadline`` date must equal either an explicitly stated
+    ``date_end`` or ``date_start + duration_days - 1``.  Only full dates and
+    durations present in user turns count as evidence. A matching explicit
+    “最后一天/第 N 天 HH:MM” is also sufficient when N equals the explicit trip
+    duration; the absolute date carried by legacy Gold is then treated only as
+    an annotation and is never inferred from ``reference_datetime``.
+    """
+    errors: list[str] = []
+    frozen_warnings: list[str] = []
+    for case in cases:
+        issue = _absolute_return_deadline_evidence_issue(case)
+        if issue is None:
+            continue
+        if case.split in FROZEN_SPLITS:
+            frozen_warnings.append(issue)
+        else:
+            errors.append(issue)
+    return errors, frozen_warnings
+
+
+def _absolute_return_deadline_evidence_issue(case: HarnessCase) -> str | None:
+    constraints = case.gold_constraints_tree
+    return_deadline = constraints.get("return_deadline")
+    match = _ABSOLUTE_RETURN_DEADLINE.match(str(return_deadline or ""))
+    if match is None:
+        return None
+
+    deadline_date = date.fromisoformat(match.group("date"))
+    stated_dates = _explicit_user_dates(case.turns)
+    supported_dates: set[date] = set()
+
+    date_end = _constraint_date(constraints.get("date_end"))
+    if date_end is not None and date_end in stated_dates:
+        supported_dates.add(date_end)
+
+    date_start = _constraint_date(constraints.get("date_start"))
+    duration_days = constraints.get("duration_days")
+    if (
+        date_start is not None
+        and date_start in stated_dates
+        and isinstance(duration_days, int)
+        and not isinstance(duration_days, bool)
+        and duration_days > 0
+        and _duration_is_explicit(case.turns, duration_days)
+    ):
+        supported_dates.add(date_start + timedelta(days=duration_days - 1))
+
+    if deadline_date in supported_dates:
+        return None
+    if _relative_final_day_deadline_supported(
+        case.turns,
+        duration_days,
+        str(return_deadline),
+    ):
+        return None
+    return (
+        f"{case.case_id}: absolute return_deadline date {deadline_date.isoformat()} "
+        "must be derivable from explicit user date_start/date_end and duration_days"
+    )
+
+
+def _relative_final_day_deadline_supported(
+    turns: list[str],
+    duration_days: Any,
+    return_deadline: str,
+) -> bool:
+    if (
+        not isinstance(duration_days, int)
+        or isinstance(duration_days, bool)
+        or duration_days <= 0
+        or not _duration_is_explicit(turns, duration_days)
+    ):
+        return False
+    expected_time = re.search(r"(?:T|\s)(\d{1,2}):(\d{2})", return_deadline)
+    if expected_time is None:
+        return False
+    expected_hour = int(expected_time.group(1))
+    expected_minute = int(expected_time.group(2))
+    for turn in turns:
+        for match in _RELATIVE_FINAL_DEADLINE.finditer(turn):
+            if match.group("day") == "最后一天":
+                day_number = duration_days
+            else:
+                day_number = _parse_duration_number(str(match.group("number") or ""))
+            minute = int(match.group("minute") or 0)
+            if (
+                day_number == duration_days
+                and int(match.group("hour")) == expected_hour
+                and minute == expected_minute
+            ):
+                return True
+    return False
+
+
+def _constraint_date(value: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _explicit_user_dates(turns: list[str]) -> set[date]:
+    dates: set[date] = set()
+    for turn in turns:
+        for pattern in (_ISO_USER_DATE, _CHINESE_USER_DATE):
+            for match in pattern.finditer(turn):
+                try:
+                    dates.add(date(*(int(part) for part in match.groups())))
+                except ValueError:
+                    continue
+    return dates
+
+
+def _duration_is_explicit(turns: list[str], expected_days: int) -> bool:
+    for turn in turns:
+        for match in _DURATION_TOKEN.finditer(turn):
+            prefix = turn[: match.start()]
+            if match.group("unit") == "天" and prefix.endswith(("第", "最后", "倒数", "每")):
+                continue
+            if _parse_duration_number(match.group("number")) == expected_days:
+                return True
+    return False
+
+
+def _parse_duration_number(value: str) -> int | None:
+    if value.isdigit():
+        return int(value)
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if value == "十":
+        return 10
+    if "百" in value:
+        left, _, right = value.partition("百")
+        hundreds = digits.get(left or "一")
+        remainder = _parse_duration_number(right) if right else 0
+        return None if hundreds is None or remainder is None else hundreds * 100 + remainder
+    if "十" in value:
+        left, _, right = value.partition("十")
+        tens = digits.get(left or "一")
+        ones = digits.get(right, 0)
+        return None if tens is None or ones is None else tens * 10 + ones
+    return digits.get(value)
 
 
 def validate_product_dataset(cases: list[HarnessCase]) -> ProductDatasetValidation:
@@ -90,7 +256,15 @@ def validate_product_dataset(cases: list[HarnessCase]) -> ProductDatasetValidati
         errors.append(f"expected {total} cases, found {len(cases)}")
     if split_counts != PRODUCTION_SPLIT_COUNTS:
         errors.append(f"split counts mismatch: {split_counts}")
-    return ProductDatasetValidation(not errors, errors, split_counts, subset_counts)
+    deadline_errors, frozen_warnings = validate_absolute_return_deadline_evidence(cases)
+    errors.extend(deadline_errors)
+    return ProductDatasetValidation(
+        not errors,
+        errors,
+        split_counts,
+        subset_counts,
+        frozen_warnings,
+    )
 
 
 def run_product_suite(
@@ -150,7 +324,23 @@ def run_product_suite(
             "model_temperature": harness.settings.llm.temperature,
             "model_thinking_enabled": harness.settings.llm.thinking_enabled,
             "model_requests_per_second": harness.settings.llm.requests_per_second,
+            "hybrid_flags": {
+                "enable_llm_intent_normalizer": harness.settings.hybrid_planning.enable_llm_intent_normalizer,
+                "enable_llm_preference_resolver": harness.settings.hybrid_planning.enable_llm_preference_resolver,
+                "enable_structured_duration_estimator": harness.settings.hybrid_planning.enable_structured_duration_estimator,
+            },
             "prompt_fingerprint": _prompt_fingerprint(),
+            "code_fingerprint": _code_fingerprint(),
+            "evaluator_fingerprint": _evaluator_fingerprint(),
+            "tooling_fingerprint": _tooling_fingerprint(),
+            "configuration_fingerprint": _configuration_fingerprint(
+                harness.settings, harness.environment.tool_provider
+            ),
+            "tool_snapshot_fingerprint": _tool_snapshot_fingerprint(
+                harness.settings, harness.environment.tool_provider
+            ),
+            "evaluator_version": _evaluator_version(),
+            "artifact_contract_fingerprint": _artifact_contract_fingerprint(cases),
             "fine_tuning": summary["fine_tuning"],
             "independent_case_count": len(cases),
             "execution_count": len(executions),
@@ -222,6 +412,13 @@ def _product_case_output(
     result: HarnessCaseResult,
     repeat: int,
 ) -> dict[str, Any]:
+    from travel_agent.evaluation.artifact_contract import (
+        ARTIFACT_CONTRACT_VERSION,
+        expected_artifact_type,
+    )
+
+    state = dict((result.final_profile or {}).get("constraint_state") or {})
+    expected = result.metrics.get("expected_artifact_type") or expected_artifact_type(case)
     return _json_safe(
         {
             "schema_version": "product-case-output-v1",
@@ -230,6 +427,8 @@ def _product_case_output(
                 "repeat": repeat,
                 "passed": result.passed,
                 "errors": [_sanitize_error(error) for error in result.errors],
+                "active_constraint_revision": state.get("_constraint_revision"),
+                "active_constraint_hash": state.get("_constraint_hash"),
             },
             "turns": [asdict(turn) for turn in result.turns],
             "final_profile": result.final_profile,
@@ -239,6 +438,11 @@ def _product_case_output(
                 "rule_metrics": result.metrics,
                 "independent_judge": None,
                 "human_review": None,
+                "evaluator_version": _evaluator_version(),
+                "artifact_contract_version": ARTIFACT_CONTRACT_VERSION,
+                "artifact_contract_fingerprint": _artifact_contract_fingerprint([case]),
+                "expected_artifact_type": expected,
+                "actual_artifact_type": result.metrics.get("actual_artifact_type"),
             },
         }
     )
@@ -289,9 +493,22 @@ def aggregate_product_rows(
     remediation_complete: bool,
 ) -> dict[str, Any]:
     primary = [row for row in rows if row["repeat"] == 1]
+    full_itinerary = [row for row in primary if row.get("expected_artifact_type") == "full_itinerary"]
+    non_itinerary = [
+        row for row in primary
+        if row.get("expected_artifact_type") not in {None, "full_itinerary", "partial_itinerary"}
+    ]
     proportions = {
         # 主指标：外部 production_v1 评分口径（七项合取 + 一票否决）
         "strict_success_rate": _bool_rate(primary, "strict_task_success"),
+        "overall_strict_success_rate": _bool_rate(primary, "strict_task_success"),
+        "artifact_type_match_rate": _bool_rate(primary, "artifact_type_match"),
+        "full_itinerary_success_rate": _bool_rate(full_itinerary, "strict_task_success"),
+        "non_itinerary_success_rate": _bool_rate(non_itinerary, "strict_task_success"),
+        "expected_itinerary_missing_rate": (
+            sum(row.get("failure_reason") == "missing_expected_artifact" for row in full_itinerary)
+            / len(full_itinerary) if full_itinerary else None
+        ),
         "gating_pass_rate": _bool_rate(primary, "gating_passed"),
         "grounding_pass_rate": _bool_rate(primary, "grounding_ok"),
         "authorization_pass_rate": _bool_rate(primary, "authorization_ok"),
@@ -351,6 +568,40 @@ def aggregate_product_rows(
         name: wilson_interval(*_bool_counts(primary, _metric_row_key(name)))
         for name, value in proportions.items()
         if value is not None
+        and name not in {
+            "full_itinerary_success_rate",
+            "non_itinerary_success_rate",
+            "expected_itinerary_missing_rate",
+        }
+    }
+    if full_itinerary:
+        confidence_intervals["full_itinerary_success_rate"] = wilson_interval(
+            *_bool_counts(full_itinerary, "strict_task_success")
+        )
+        confidence_intervals["expected_itinerary_missing_rate"] = wilson_interval(
+            sum(row.get("failure_reason") == "missing_expected_artifact" for row in full_itinerary),
+            len(full_itinerary),
+        )
+    if non_itinerary:
+        confidence_intervals["non_itinerary_success_rate"] = wilson_interval(
+            *_bool_counts(non_itinerary, "strict_task_success")
+        )
+    from travel_agent.harness.state_metrics import internal_state_metrics
+
+    internal_state = internal_state_metrics(primary)
+    internal_metrics = {
+        key: internal_state[key]
+        for key in (
+            "planner_admission_rate",
+            "planner_budget_exhaustion_rate",
+            "duplicate_dispatch_rate",
+            "artifact_reuse_rate",
+            "stale_artifact_reuse_rate",
+            "stale_parent_rebuild_reuse_rate",
+            "final_current_artifact_missing_rate",
+            "system_error_rate",
+            "stage_timeout_attribution",
+        )
     }
     fine_tuning = decide_fine_tuning(primary, remediation_complete=remediation_complete)
     return {
@@ -378,6 +629,7 @@ def aggregate_product_rows(
         "avg_llm_calls": statistics.mean(llm_call_values) if llm_call_values else None,
         "avg_tool_calls": statistics.mean(tool_call_values) if tool_call_values else None,
         "avg_dispatches": statistics.mean(dispatch_values) if dispatch_values else None,
+        **internal_metrics,
         "stability_rate": _stability_rate(rows),
         "confidence_intervals_95": confidence_intervals,
         "failure_attribution_counts": _attribution_counts(primary),
@@ -493,7 +745,10 @@ def _product_row(
     metered_cost_usd = sum(float(item.get("cost_usd") or 0.0) for item in meter_totals)
     metrics = result.metrics
     itinerary = result.final_artifacts.get("itinerary")
-    expected_task = case.expect_itinerary is not False and not case.expect_clarification
+    from travel_agent.evaluation.artifact_contract import ITINERARY_TYPES, expected_artifact_type
+
+    expected_artifact = metrics.get("expected_artifact_type") or expected_artifact_type(case)
+    expected_task = expected_artifact in ITINERARY_TYPES
     fallback_used = bool(
         model_call_errors
         and last
@@ -504,6 +759,9 @@ def _product_row(
     completed_via_fallback = bool(itinerary and fallback_used)
     delivered_by_react = bool(itinerary and last and last.used_real_agent and not fallback_used)
     strict_task_success = bool(metrics.get("strict_task_success"))
+    from travel_agent.harness.state_metrics import extract_internal_counters
+
+    internal_counters = extract_internal_counters(result)
     return {
         "case_id": case.case_id,
         "split": case.split,
@@ -517,6 +775,12 @@ def _product_row(
         "passed": strict_task_success,
         "strict_task_success": strict_task_success,
         "actual_outcome": metrics.get("actual_outcome"),
+        "expected_artifact_type": expected_artifact,
+        "actual_artifact_type": metrics.get("actual_artifact_type"),
+        "artifact_type_match": metrics.get("artifact_type_match"),
+        "failure_reason": metrics.get("failure_reason"),
+        "task_completion_judge": metrics.get("task_completion_judge"),
+        "llm_judge": metrics.get("llm_judge"),
         "expected_outcome_match": metrics.get("expected_outcome_match"),
         "gating_passed": metrics.get("gating_passed"),
         "gating_triggered": metrics.get("gating_triggered") or [],
@@ -569,6 +833,7 @@ def _product_row(
         "dispatch_count": metered_dispatches,
         "failure_attributions": attributions,
         "errors": [_sanitize_error(error) for error in result.errors],
+        **internal_counters,
     }
 
 
@@ -699,6 +964,8 @@ def _bool_rate(rows: list[dict[str, Any]], key: str) -> float | None:
 def _metric_row_key(name: str) -> str:
     return {
         "strict_success_rate": "strict_task_success",
+        "overall_strict_success_rate": "strict_task_success",
+        "artifact_type_match_rate": "artifact_type_match",
         "gating_pass_rate": "gating_passed",
         "grounding_pass_rate": "grounding_ok",
         "authorization_pass_rate": "authorization_ok",
@@ -752,6 +1019,113 @@ def _stability_rate(rows: list[dict[str, Any]]) -> float | None:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _files_fingerprint(paths: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted({item.resolve() for item in paths if item.is_file()}):
+        try:
+            relative = path.relative_to(ROOT.resolve())
+        except ValueError:
+            relative = path
+        digest.update(str(relative).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _code_fingerprint() -> str:
+    return _files_fingerprint(list((ROOT / "src" / "travel_agent").rglob("*.py")))
+
+
+def _evaluator_fingerprint() -> str:
+    return _files_fingerprint([
+        *(ROOT / "src" / "travel_agent" / "evaluation").rglob("*.py"),
+        *(ROOT / "src" / "travel_agent" / "harness").rglob("*.py"),
+    ])
+
+
+def _tooling_fingerprint() -> str:
+    return _files_fingerprint([
+        ROOT / "src" / "travel_agent" / "agent" / "tool_contract.py",
+        ROOT / "src" / "travel_agent" / "agent" / "toolkit.py",
+        ROOT / "src" / "travel_agent" / "providers.py",
+        ROOT / "src" / "travel_agent" / "route_evidence.py",
+        ROOT / "src" / "travel_agent" / "poi_evidence.py",
+    ])
+
+
+def _configuration_fingerprint(settings: Any, tool_provider_mode: str) -> str:
+    """Hash behavior-affecting runtime settings without persisting credentials."""
+    payload = {
+        "llm": _public_settings(settings.llm, excluded={"api_key"}),
+        "amap": {
+            "base_url": settings.amap.base_url,
+            "timeout_seconds": settings.amap.timeout_seconds,
+            "rest_enabled": settings.amap.rest_enabled,
+        },
+        "agent": _public_settings(settings.agent),
+        "memory": _public_settings(
+            settings.memory,
+            excluded={"database_url", "profile_dir"},
+        ),
+        "orchestration": _public_settings(settings.orchestration),
+        "mcp": _public_settings(settings.mcp),
+        "skills": {
+            "enabled": settings.skills.enabled,
+            "skills_dir": str(settings.skills.skills_dir),
+        },
+        "hybrid_planning": _public_settings(settings.hybrid_planning),
+        "judge": _public_settings(settings.evaluation.judge, excluded={"api_key"}),
+        "tool_provider_mode": tool_provider_mode,
+    }
+    return _json_fingerprint(payload)
+
+
+def _tool_snapshot_fingerprint(settings: Any, tool_provider_mode: str) -> str:
+    """Identify the provider/config/code snapshot used by a Product run."""
+    payload = {
+        "tool_provider_mode": tool_provider_mode,
+        "tooling_fingerprint": _tooling_fingerprint(),
+        "amap": {
+            "base_url": settings.amap.base_url,
+            "timeout_seconds": settings.amap.timeout_seconds,
+            "rest_enabled": settings.amap.rest_enabled,
+        },
+        "mcp": _public_settings(settings.mcp),
+    }
+    return _json_fingerprint(payload)
+
+
+def _public_settings(value: Any, *, excluded: set[str] | None = None) -> dict[str, Any]:
+    payload = asdict(value) if is_dataclass(value) else dict(value or {})
+    for field_name in excluded or set():
+        payload.pop(field_name, None)
+    return payload
+
+
+def _json_fingerprint(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _evaluator_version() -> str:
+    from travel_agent.evaluation.artifact_contract import ARTIFACT_CONTRACT_VERSION
+
+    return f"product-v1.1+{ARTIFACT_CONTRACT_VERSION}"
+
+
+def _artifact_contract_fingerprint(cases: list[HarnessCase]) -> str:
+    from travel_agent.evaluation.artifact_contract import artifact_contract_fingerprint
+
+    return artifact_contract_fingerprint(cases)
 
 
 def _prompt_fingerprint() -> str:

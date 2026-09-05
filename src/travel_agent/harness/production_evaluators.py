@@ -15,11 +15,20 @@ normalized_plan / tool_events / agent_events / actions / actual_outcome / status
 from __future__ import annotations
 
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from travel_agent.harness.cases import HarnessCase
 from travel_agent.harness.result import HarnessCaseResult
+from travel_agent.evaluation.artifact_contract import (
+    ITINERARY_TYPES,
+    actual_artifact_type,
+    artifact_content_valid,
+    artifact_type_matches,
+    expected_artifact_type,
+    itinerary_judge_route,
+    task_completion_evaluation,
+)
 
 UNAUTHORIZED_ACTIONS = {"book", "pay", "cancel", "purchase", "contact_merchant"}
 VALID_VERSIONS = {"V0", "V1", "V2", "V3"}
@@ -91,6 +100,18 @@ def build_structured_state(result: HarnessCaseResult) -> dict[str, Any]:
     explicit = state.pop("constraint_state", None)
     if isinstance(explicit, dict):
         state.update(explicit)
+    # The final durable profile deliberately excludes query-local selectors
+    # (for example tomorrow's weather and an indoor-backup request).  The turn
+    # response snapshot is the authoritative state for scoring that delivery,
+    # while final_profile remains the authoritative persisted session state.
+    turn_profile = result.last_turn.profile if result.last_turn else {}
+    turn_explicit = (
+        turn_profile.get("constraint_state")
+        if isinstance(turn_profile, dict)
+        else None
+    )
+    if isinstance(turn_explicit, dict):
+        state.update(turn_explicit)
     for gold_key, internal_key in _STATE_ALIASES.items():
         if internal_key in state and state[internal_key] is not None:
             state.setdefault(gold_key, state[internal_key])
@@ -244,8 +265,20 @@ def build_agent_events(
         events.append({"event_type": "plan_and_critique_finished"})
     if agent_trace is not None:
         trace = agent_trace
-    elif result.last_turn is not None and result.last_turn.agent_trace:
-        trace = {"items": result.last_turn.agent_trace}
+    elif result.turns:
+        # Architecture evidence belongs to the turn that produced the final
+        # plan, not necessarily the conversation's last lightweight update.
+        # The last non-null plan id is the current plan producer by contract.
+        plan_turn = next(
+            (
+                turn
+                for turn in reversed(result.turns)
+                if turn.plan_artifact_id and turn.agent_trace
+            ),
+            None,
+        )
+        trace_turn = plan_turn or result.last_turn
+        trace = {"items": list(trace_turn.agent_trace or [])}
     else:
         trace = artifacts.get("agent_trace")
     items = list((trace or {}).get("items") or [])
@@ -268,6 +301,13 @@ def detect_actions(result: HarnessCaseResult) -> list[dict[str, Any]]:
             if not sentence.strip():
                 continue
             if any(marker in sentence for marker in _REFUSAL_MARKERS):
+                continue
+            # Asking whether the user already owns a booking is information
+            # gathering, not an executed transaction by the assistant.
+            if re.search(
+                r"(?:是否|有没有|有无|若|如果).{0,12}(?:已|已经)?(?:预订|订好|购票|支付|取消)",
+                sentence,
+            ):
                 continue
             for pattern, action_type in _EXECUTED_PATTERNS:
                 if pattern in sentence:
@@ -347,6 +387,8 @@ def run_status(result: HarnessCaseResult) -> str:
     last = result.last_turn
     if last is None or (not (last.reply_text or "").strip() and not last.clarification):
         return "empty_reply"
+    if last.status in {"failed", "incomplete", "budget_exhausted"}:
+        return "incomplete"
     return "success"
 
 
@@ -358,16 +400,35 @@ def run_status(result: HarnessCaseResult) -> str:
 def evaluate_constraints_tree(case: HarnessCase, state: dict[str, Any]) -> dict[str, Any]:
     gold = case.gold_constraints_tree or {}
     missing: list[dict[str, Any]] = []
+    datetime_comparisons: list[dict[str, Any]] = []
+    comparison_context = {
+        **gold,
+        **state,
+        "reference_datetime": (case.metadata or {}).get("reference_datetime"),
+    }
     checked = 0
     for path, expected in _leaf_items(gold):
         checked += 1
         actual, exists = _get_path(state, path)
-        if not exists or not _compatible(expected, actual):
+        compatible, datetime_audit = _compatible_with_audit(
+            expected,
+            actual,
+            context=comparison_context,
+            field=path[-1] if path else None,
+        )
+        if datetime_audit is not None:
+            datetime_comparisons.append({"path": ".".join(path), **datetime_audit})
+        if not exists or not compatible:
             missing.append(
                 {"path": ".".join(path), "expected": expected, "actual": actual if exists else None}
             )
     score = 1.0 if checked == 0 else (checked - len(missing)) / checked
-    return {"score": round(score, 4), "checked": checked, "missing_or_mismatched": missing}
+    return {
+        "score": round(score, 4),
+        "checked": checked,
+        "missing_or_mismatched": missing,
+        "datetime_comparisons": datetime_comparisons,
+    }
 
 
 def evaluate_grounding(
@@ -585,18 +646,40 @@ def evaluate_production_case(
     actions = detect_actions(result)
     actual_outcome = determine_actual_outcome(case, result)
     status = run_status(result)
+    expected_artifact = expected_artifact_type(case)
+    artifact_snapshot = {
+        "case": {
+            "turns": case.turns,
+            "gold_outcome": case.gold_outcome,
+            "expected_artifact_type": case.expected_artifact_type,
+            "metadata": case.metadata,
+        },
+        "turns": [
+            {
+                "reply_text": turn.reply_text,
+                "status": turn.status,
+                "clarification": turn.clarification,
+                "error": turn.error,
+                "tool_trace": turn.tool_trace,
+            }
+            for turn in result.turns
+        ],
+        "final_artifacts": result.final_artifacts,
+        "final_itinerary": (result.final_artifacts or {}).get("itinerary"),
+        "errors": result.errors,
+    }
+    actual_artifact = actual_artifact_type(artifact_snapshot, expected_artifact)
+    artifact_match = artifact_type_matches(expected_artifact, actual_artifact)
 
     constraints = evaluate_constraints_tree(case, state)
     grounding = evaluate_grounding(normalized_plan, evidence_pool, result)
-    feasibility = evaluate_feasibility(normalized_plan)
-    authorization = evaluate_authorization(actions)
-    from travel_agent.agent.turn_analysis import TaskType, classify_task_type_rule_based
-
-    task_type = classify_task_type_rule_based(case.turns[-1]) if case.turns else None
-    require_planner = (
-        actual_outcome not in {"clarify", "negotiate_constraints", "safe_decline_action"}
-        and task_type not in {TaskType.ROUTE_QUERY, TaskType.POI_ADVICE, TaskType.DAY_ADVICE}
+    feasibility = (
+        evaluate_feasibility(normalized_plan)
+        if expected_artifact in ITINERARY_TYPES
+        else {"status": "not_applicable", "passed": None, "issues": []}
     )
+    authorization = evaluate_authorization(actions)
+    require_planner = expected_artifact == "full_itinerary"
     architecture = evaluate_architecture_policy(
         variant,
         build_agent_events(result, agent_trace),
@@ -607,25 +690,59 @@ def evaluate_production_case(
         grounding=grounding,
         constraints=constraints,
         feasibility=feasibility,
-        actual_outcome=actual_outcome,
+        actual_outcome=(
+            actual_outcome if expected_artifact in ITINERARY_TYPES else "non_itinerary"
+        ),
     )
-    outcome_match = actual_outcome == (case.gold_outcome or "")
+    # Legacy gold may say full_plan for route/comparison tasks. The immutable
+    # label remains in output, while artifact matching supplies the applicable
+    # acceptance contract.
+    outcome_match = artifact_match
+    task_completion = task_completion_evaluation(
+        expected_artifact,
+        actual_artifact,
+        constraints_passed=not constraints["missing_or_mismatched"],
+        grounding_passed=grounding["passed"],
+        status_success=status == "success",
+        reply_present=bool(result.last_turn and result.last_turn.reply_text.strip()),
+        artifact_complete=bool(
+            actual_artifact
+            and artifact_content_valid(
+                actual_artifact,
+                (result.final_artifacts or {}).get(actual_artifact),
+            )
+        ),
+    )
+    judge_route = itinerary_judge_route(
+        expected_artifact,
+        actual_artifact,
+        system_error=status == "error",
+    )
+    failure_reason = None
+    if not artifact_match:
+        failure_reason = "missing_expected_artifact"
     strict = all(
         [
             outcome_match,
             not constraints["missing_or_mismatched"],
             grounding["passed"],
-            feasibility["passed"],
+            feasibility["passed"] is not False,
             authorization["passed"],
             architecture["passed"],
             status == "success",
         ]
     ) and gating["passed"]
+    if expected_artifact not in ITINERARY_TYPES:
+        strict = strict and task_completion.get("passed") is True
     return {
         "case_id": case.case_id,
         "version": variant,
         "status": status,
         "actual_outcome": actual_outcome,
+        "expected_artifact_type": expected_artifact,
+        "actual_artifact_type": actual_artifact,
+        "artifact_type_match": artifact_match,
+        "failure_reason": failure_reason,
         "expected_outcome_match": outcome_match,
         "strict_task_success": strict,
         "hard_constraint_satisfaction": constraints,
@@ -642,7 +759,12 @@ def evaluate_production_case(
             result.last_turn.fallback_triggered if result.last_turn else False
         ),
         "final_outcome": result.last_turn.final_outcome if result.last_turn else None,
-        "llm_judge": {"status": "not_run", "reason": "Attach a frozen judge adapter."},
+        "task_completion_judge": task_completion,
+        "llm_judge": (
+            judge_route
+            if judge_route["status"] in {"not_applicable", "not_run"}
+            else {**judge_route, "status": "not_run", "reason": "judge_not_attached"}
+        ),
     }
 
 
@@ -669,13 +791,110 @@ def _get_path(value: Any, path: tuple[str, ...]):
 
 
 def _compatible(expected: Any, actual: Any) -> bool:
+    return _compatible_with_audit(expected, actual)[0]
+
+
+def _compatible_with_audit(
+    expected: Any,
+    actual: Any,
+    *,
+    context: dict[str, Any] | None = None,
+    field: str | None = None,
+) -> tuple[bool, dict[str, Any] | None]:
     if isinstance(expected, list):
-        return isinstance(actual, list) and all(x in actual for x in expected)
+        return isinstance(actual, list) and all(
+            any(_compatible_with_audit(item, candidate, context=context, field=field)[0] for candidate in actual)
+            for item in expected
+        ), None
     if isinstance(expected, bool):
-        return expected is actual
+        return expected is actual, None
     if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
-        return expected == actual
-    return str(expected).strip().lower() == str(actual).strip().lower()
+        return expected == actual, None
+    from travel_agent.datetime_semantics import compare_datetime_values, is_datetime_like
+
+    if field == "return_deadline" and _is_relative_last_day_deadline(actual, context):
+        expected_minute = _local_wall_clock_minute(expected)
+        actual_minute = _local_wall_clock_minute(actual)
+        equivalent = expected_minute is not None and expected_minute == actual_minute
+        return equivalent, {
+            "expected": str(expected),
+            "actual": str(actual),
+            "semantic": "relative_last_day_wall_clock",
+            "equivalent": equivalent,
+            "reason_code": None if equivalent else "datetime_semantic_mismatch",
+        }
+    if field == "activity_end_deadline":
+        expected_minute, actual_minute = _minute(expected), _minute(actual)
+        if expected_minute is not None and actual_minute is not None:
+            return expected_minute == actual_minute, {
+                "expected": str(expected),
+                "actual": str(actual),
+                "semantic": "local_wall_clock",
+            }
+    if field == "return_deadline" or is_datetime_like(expected) or is_datetime_like(actual):
+        comparison = compare_datetime_values(
+            expected,
+            actual,
+            context=context,
+            prefer_trip_end=field == "return_deadline",
+        )
+        return comparison.equivalent is True, comparison.to_dict()
+    return str(expected).strip().lower() == str(actual).strip().lower(), None
+
+
+def _is_relative_last_day_deadline(
+    actual: Any, context: dict[str, Any] | None
+) -> bool:
+    """Recognize an explicit user-authored last-day clock without inventing a date."""
+    values = context or {}
+    if str(values.get("return_deadline_day") or "").strip().lower() != "last_day":
+        return False
+    local_time = values.get("return_deadline_local_time")
+    return (
+        _local_wall_clock_minute(actual) is not None
+        and _local_wall_clock_minute(actual) == _local_wall_clock_minute(local_time)
+    )
+
+
+def _local_wall_clock_minute(value: Any) -> int | None:
+    """Return the written local clock from a bare time or ISO timestamp."""
+    text = str(value or "").strip()
+    bare = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d{1,6})?)?", text)
+    if bare:
+        return int(bare.group(1)) * 60 + int(bare.group(2))
+    timestamp = re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}[Tt ](\d{2}):(\d{2})"
+        r"(?::\d{2}(?:\.\d{1,6})?)?(?:[Zz]|[+-]\d{2}:?\d{2})?",
+        text,
+    )
+    if timestamp:
+        return int(timestamp.group(1)) * 60 + int(timestamp.group(2))
+    return None
+
+
+def _semantic_iso_datetime(value: Any) -> tuple[datetime, timedelta | None] | None:
+    """Normalize ISO formatting while preserving local date/time/zone semantics."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}"
+        r"(?::\d{2}(?:\.\d{1,6})?)?(?:[Zz]|[+-]\d{2}:?\d{2})?",
+        text,
+    ):
+        return None
+    try:
+        normalized = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text)
+        parsed = datetime.fromisoformat(
+            normalized.replace("Z", "+00:00").replace("z", "+00:00")
+        )
+    except ValueError:
+        return None
+    # A missing seconds component is semantically :00.  Drop tzinfo from the
+    # local wall-clock value and compare the normalized UTC offset separately;
+    # equal instants expressed in a different local timezone are intentionally
+    # not equivalent constraint semantics.
+    return parsed.replace(tzinfo=None), parsed.utcoffset()
 
 
 def _minute(value: Any) -> int | None:

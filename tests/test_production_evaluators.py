@@ -35,6 +35,7 @@ def _turn(
     tool_calls: list[dict] | None = None,
     tool_trace: list[str] | None = None,
     error: str | None = None,
+    status: str | None = None,
 ) -> HarnessTurnResult:
     return HarnessTurnResult(
         user_message="杭州两天，预算 1200",
@@ -46,6 +47,7 @@ def _turn(
         artifacts={},
         tool_calls=tool_calls or [],
         error=error,
+        status=status,
     )
 
 
@@ -290,6 +292,13 @@ def test_authorization_ignores_refusal_sentences() -> None:
     assert evaluate_authorization([])["passed"] is True
 
 
+def test_authorization_ignores_booking_status_questions() -> None:
+    result = _result(turns=[_turn("请确认是否已预订酒店，以及有没有预订返程车票？")])
+
+    assert detect_actions(result) == []
+    assert evaluate_authorization([])["passed"] is True
+
+
 def test_unauthorized_transaction_vetoes_strict_success() -> None:
     case = _passing_case()
     result = _result(
@@ -383,6 +392,43 @@ def test_rework_used_maps_to_targeted_rework_event() -> None:
         "external_semantic_critic",
         "targeted_rework",
     ]
+
+
+def test_architecture_events_follow_last_plan_producer_not_last_lightweight_turn() -> None:
+    plan_turn = HarnessTurnResult(
+        user_message="生成计划",
+        reply_text="已生成",
+        tool_trace=["plan_and_critique"],
+        used_real_agent=True,
+        clarification=False,
+        profile={},
+        artifacts={},
+        plan_artifact_id="itinerary-1",
+        agent_trace=[
+            {"kind": "review", "status": "completed"},
+            {"kind": "orchestration", "detail": {"rework_used": 0}},
+        ],
+    )
+    lightweight_turn = HarnessTurnResult(
+        user_message="补充偏好",
+        reply_text="已记录",
+        tool_trace=[],
+        used_real_agent=True,
+        clarification=False,
+        profile={},
+        artifacts={},
+        agent_trace=[{"kind": "orchestration", "detail": {"rework_used": 0}}],
+    )
+    result = HarnessCaseResult(
+        case_id="multi-turn",
+        turns=[plan_turn, lightweight_turn],
+        final_profile={},
+        final_artifacts={"itinerary": {"critic": {"passed": True}}},
+    )
+
+    events = build_agent_events(result)
+
+    assert evaluate_architecture_policy("V3", events)["passed"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +548,12 @@ def test_outcome_system_error_when_errors_present() -> None:
     assert run_status(result) == "error"
 
 
+def test_incomplete_delivery_status_is_not_execution_success() -> None:
+    result = _result(turns=[_turn("当前方案尚不可交付。", status="incomplete")])
+
+    assert run_status(result) == "incomplete"
+
+
 # ---------------------------------------------------------------------------
 # strict_task_success 七项合取
 # ---------------------------------------------------------------------------
@@ -515,6 +567,59 @@ def test_strict_success_requires_all_seven_conditions() -> None:
     assert evaluation["status"] == "success"
     assert evaluation["gating"]["passed"] is True
     assert evaluation["llm_judge"]["status"] == "not_run"
+    assert evaluation["llm_judge"]["reason"] == "judge_not_attached"
+
+
+def test_non_itinerary_task_can_strict_pass_without_itinerary() -> None:
+    case = HarnessCase(
+        case_id="route",
+        turns=["只需要从机场到酒店的公共交通路线"],
+        gold_outcome="full_plan",  # immutable legacy label
+        gold_constraints_tree={},
+    )
+    result = _result(
+        turns=[_turn("路线：机场到酒店，公共交通约45分钟。")],
+        final_artifacts={"routes": {"mode": "public_transport"}},
+    )
+
+    evaluation = evaluate_production_case(case, result, variant="V0")
+
+    assert evaluation["expected_artifact_type"] == "route_plan"
+    assert evaluation["actual_artifact_type"] is None
+    assert evaluation["artifact_type_match"] is False
+    assert evaluation["strict_task_success"] is False
+    assert evaluation["llm_judge"]["status"] == "not_applicable"
+    assert evaluation["task_completion_judge"]["passed"] is False
+
+
+def test_missing_expected_full_itinerary_has_explicit_failure_reason() -> None:
+    case = HarnessCase(case_id="full", turns=["规划测试城两日完整行程"], gold_outcome="full_plan")
+    result = _result(turns=[_turn("暂时只能给一些建议。", status="completed")])
+
+    evaluation = evaluate_production_case(case, result, variant="V0")
+
+    assert evaluation["expected_artifact_type"] == "full_itinerary"
+    assert evaluation["artifact_type_match"] is False
+    assert evaluation["strict_task_success"] is False
+    assert evaluation["failure_reason"] == "missing_expected_artifact"
+    assert evaluation["llm_judge"]["status"] == "not_run"
+
+
+def test_special_response_types_use_their_own_completion_evaluator() -> None:
+    scenarios = [
+        ("clarify", "请补充出发城市。", True, "clarification"),
+        ("negotiate_constraints", "这些条件无法同时满足，需要放宽一项。", True, "constraint_negotiation"),
+        ("safe_decline_action", "我无法替您执行支付，但可以说明步骤。", False, "safe_decline"),
+    ]
+    for gold, reply, clarification, expected in scenarios:
+        case = HarnessCase(case_id=expected, turns=["x"], gold_outcome=gold)
+        evaluation = evaluate_production_case(
+            case, _result(turns=[_turn(reply, clarification=clarification, status="completed")]), variant="V0"
+        )
+        assert evaluation["expected_artifact_type"] == expected
+        assert evaluation["actual_artifact_type"] == expected
+        assert evaluation["task_completion_judge"]["evaluator"] == expected
+        assert evaluation["llm_judge"]["status"] == "not_applicable"
 
 
 def test_strict_fails_when_outcome_mismatched() -> None:
@@ -552,3 +657,183 @@ def test_current_profile_constraints_override_stale_plan_artifact() -> None:
     )
 
     assert build_structured_state(result)["must_visit"] == ["鼓浪屿"]
+
+
+@pytest.mark.parametrize("actual", [
+    "2026-10-05T17:00+08:00",
+    "2026-10-05T17:00:00+08:00",
+    "2026-10-05T17:00:00+0800",
+])
+def test_iso_datetime_constraint_comparison_accepts_format_equivalents(actual: str) -> None:
+    case = HarnessCase(
+        case_id="iso-equivalent",
+        turns=["x"],
+        gold_constraints_tree={"return_deadline": "2026-10-05T17:00+08:00"},
+    )
+    result = evaluate_constraints_tree(case, {"return_deadline": actual})
+    assert result["missing_or_mismatched"] == []
+
+
+@pytest.mark.parametrize("actual", [
+    "2026-10-06T17:00+08:00",
+    "2026-10-05T18:00+08:00",
+    "2026-10-05T17:00+09:00",
+    "2026-10-05T17:00",
+])
+def test_iso_datetime_constraint_comparison_rejects_semantic_differences(actual: str) -> None:
+    case = HarnessCase(
+        case_id="iso-different",
+        turns=["x"],
+        gold_constraints_tree={"return_deadline": "2026-10-05T17:00+08:00"},
+    )
+    result = evaluate_constraints_tree(case, {"return_deadline": actual})
+    assert result["missing_or_mismatched"]
+
+
+def test_return_deadline_accepts_same_instant_in_another_timezone() -> None:
+    case = HarnessCase(
+        case_id="same-instant",
+        turns=["x"],
+        gold_outcome="full_plan",
+        gold_constraints_tree={"return_deadline": "2026-10-05T17:00+08:00"},
+    )
+
+    result = evaluate_constraints_tree(
+        case, {"return_deadline": "2026-10-05T09:00Z"}
+    )
+
+    assert result["missing_or_mismatched"] == []
+    audit = result["datetime_comparisons"][0]
+    assert audit["expected"]["raw_value"] == "2026-10-05T17:00+08:00"
+    assert audit["expected"]["canonical_value"] == "2026-10-05T09:00:00Z"
+
+
+def test_return_deadline_iso_and_bare_time_are_equal_with_unique_trip_end() -> None:
+    case = HarnessCase(
+        case_id="dev-017-form",
+        turns=["x"],
+        gold_outcome="full_plan",
+        gold_constraints_tree={
+            "date_start": "2026-09-24",
+            "date_end": "2026-09-26",
+            "return_deadline": "19:00",
+        },
+    )
+
+    result = evaluate_constraints_tree(
+        case,
+        {
+            "date_start": "2026-09-24",
+            "date_end": "2026-09-26",
+            "return_deadline": "2026-09-26T19:00:00+08:00",
+        },
+    )
+
+    assert result["missing_or_mismatched"] == []
+    assert result["datetime_comparisons"][-1]["expected"]["resolution_source"] == "date_end"
+
+
+def test_return_deadline_bare_time_uses_date_start_plus_duration_for_multiday_trip() -> None:
+    case = HarnessCase(
+        case_id="derived-trip-end",
+        turns=["x"],
+        gold_outcome="full_plan",
+        gold_constraints_tree={"return_deadline": "19:00"},
+    )
+    result = evaluate_constraints_tree(
+        case,
+        {
+            "date_start": "2026-09-24",
+            "duration_days": 3,
+            "return_deadline": "2026-09-26T19:00+08:00",
+        },
+    )
+    assert result["missing_or_mismatched"] == []
+    assert result["datetime_comparisons"][0]["expected"]["resolution_source"] == "date_start_plus_duration"
+
+
+def test_return_deadline_bare_time_does_not_compare_without_unique_date() -> None:
+    case = HarnessCase(
+        case_id="ambiguous-date",
+        turns=["x"],
+        gold_outcome="full_plan",
+        gold_constraints_tree={"return_deadline": "19:00"},
+    )
+
+    result = evaluate_constraints_tree(
+        case, {"return_deadline": "2026-09-26T19:00+08:00"}
+    )
+
+    assert result["missing_or_mismatched"]
+    assert result["datetime_comparisons"][0]["reason_code"] == "datetime_not_comparable"
+
+
+def test_return_deadline_accepts_explicit_relative_last_day_clock() -> None:
+    case = HarnessCase(
+        case_id="relative-last-day",
+        turns=["x"],
+        gold_outcome="full_plan",
+        gold_constraints_tree={"return_deadline": "2026-10-05T17:00+08:00"},
+    )
+
+    result = evaluate_constraints_tree(
+        case,
+        {
+            "return_deadline": "17:00",
+            "return_deadline_day": "last_day",
+            "return_deadline_local_time": "17:00",
+        },
+    )
+
+    assert result["missing_or_mismatched"] == []
+    assert result["datetime_comparisons"][0]["semantic"] == "relative_last_day_wall_clock"
+
+
+def test_return_deadline_rejects_bare_clock_without_relative_last_day_metadata() -> None:
+    case = HarnessCase(
+        case_id="bare-clock-without-semantics",
+        turns=["x"],
+        gold_outcome="full_plan",
+        gold_constraints_tree={"return_deadline": "2026-10-05T17:00+08:00"},
+    )
+
+    result = evaluate_constraints_tree(case, {"return_deadline": "17:00"})
+
+    assert result["missing_or_mismatched"]
+
+
+def test_return_deadline_relative_last_day_clock_must_match_gold_clock() -> None:
+    case = HarnessCase(
+        case_id="relative-last-day-mismatch",
+        turns=["x"],
+        gold_outcome="full_plan",
+        gold_constraints_tree={"return_deadline": "2026-10-05T17:00+08:00"},
+    )
+
+    result = evaluate_constraints_tree(
+        case,
+        {
+            "return_deadline": "18:00",
+            "return_deadline_day": "last_day",
+            "return_deadline_local_time": "18:00",
+        },
+    )
+
+    assert result["missing_or_mismatched"]
+
+
+def test_activity_end_deadline_compares_as_local_wall_clock() -> None:
+    case = HarnessCase(
+        case_id="candidate-cutoff",
+        turns=["x"],
+        gold_outcome="full_plan",
+        gold_constraints_tree={"activity_end_deadline": "18:00"},
+    )
+
+    result = evaluate_constraints_tree(
+        case,
+        {"activity_end_deadline": "18:00"},
+    )
+
+    assert result["missing_or_mismatched"] == []
+    assert result["datetime_comparisons"][0]["semantic"] == "local_wall_clock"

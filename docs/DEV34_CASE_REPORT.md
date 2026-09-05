@@ -1,50 +1,67 @@
 # Dev34 用户、行程与评分
 
-> 冻结版本的 34 个 Dev cases。每个 case 仅保留用户问题、Agent 的具体行程和评测结论。
+> 本报告主体由第二次正式通过 run `dev34_acceptance_r14_20260905da` 生成。每个 case 仅保留用户问题、Agent 的具体行程和评测结论。
+
+## 最终验收状态（2026-09-05）
+
+- Dev34 闭环已经完成：R13 与 R14 连续两次完整验收均由正式检查器判定 `passed=true`，连续通过 **2/2**。
+- 两轮均为 34/34 case 恰好执行一次，Strict **28/34**、完整行程 **17/22**、非行程 **11/12**、硬约束 **34/34**、长程 **3/4**；Grounding、Authorization、Tool schema、Architecture 均 **34/34**，系统/模型/工具错误均为 0。
+- R13 Judge：eligible/completed **17/17**，平均分 **84.94**，reasonable **76.47%**，critical issue **17.65%**。
+- R14 Judge：eligible/completed **17/17**，平均分 **82.88**，reasonable **76.47%**，critical issue **17.65%**。
+- 两轮之间未修改代码、Prompt、评分器、配置、数据或工具快照；dataset、code、Prompt、evaluator、tooling、configuration、tool snapshot、Artifact contract 与 Judge 身份指纹全部一致。
+- 完整验收与基线对比见 [DEV34_ACCEPTANCE_REPORT.md](DEV34_ACCEPTANCE_REPORT.md)。
 
 ## 总览
 
-- Harness strict：20/34 通过
-- LLM-as-Judge：19 个 case 获得评分，平均 65.1 分，6 个通过
-- 15 个 case 未形成可供行程 Judge 评分的完整计划
-- `dev_018` 经人工复核标记为 Judge 误判
+- 当前正式 R14 strict：28/34
+- 当前正式 R14 原始 strict：28/34
+- 计划启动时 Artifact 合同审计：14/34
+- evaluator correction case 数：0（仅表示口径重解释，不计产品提升，也不表示产品重新运行后退步）
+- Artifact type match：82.4%
+- Full-itinerary success：77.3%
+- Non-itinerary success：91.7%
+- Expected itinerary missing rate：18.2%
+- Itinerary Judge：applicable 22，completed 18，full-rubric average 82.9
+- Task-completion Judge：applicable 12，pass rate 0.9166666666666666
+- Judge 状态分布：{'not_applicable': 12, 'not_run': 4, 'ok': 18}
+- Judge 原因分布：{'missing_expected_artifact': 4, 'task_does_not_require_itinerary': 12}
 
-| Case | 城市 | Harness strict | Judge 分数 | Judge 结论 |
-| --- | --- | --- | ---: | --- |
-| `dev_001` | 杭州 | 通过 | 82 | 通过 |
-| `dev_002` | 北京 | 通过 | 90 | 通过 |
-| `dev_003` | 厦门 | 通过 | 55 | 未通过 |
-| `dev_004` | 西安 | 通过 | 83 | 未通过 |
-| `dev_005` | 苏州 | 失败 | 45 | 未通过 |
-| `dev_006` | 珠江新城酒店区 | 失败 | — | 未评分 |
-| `dev_007` | 南京 | 通过 | — | 未评分 |
-| `dev_008` | 成都 | 通过 | — | 未评分 |
-| `dev_009` | 上海 | 通过 | — | 未评分 |
-| `dev_010` | 青岛 | 通过 | — | 未评分 |
-| `dev_011` | 杭州 | 通过 | — | 未评分 |
-| `dev_012` | 深圳 | 通过 | — | 未评分 |
-| `dev_013` | 武汉 | 通过 | 88 | 通过 |
-| `dev_014` | 天津 | 失败 | 40 | 未通过 |
-| `dev_015` | 杭州 | 通过 | — | 未评分 |
-| `dev_016` | 成都 | 失败 | 64 | 未通过 |
-| `dev_017` | 南京 | 失败 | 49 | 未通过 |
-| `dev_018` | 重庆 | 通过 | 75 | Judge 误判 |
-| `dev_019` | 长沙 | 失败 | — | 未评分 |
-| `dev_020` | 广州 | 通过 | 78 | 通过 |
-| `dev_021` | 杭州 | 失败 | — | 未评分 |
-| `dev_022` | 苏州 | 通过 | 85 | 通过 |
-| `dev_023` | 西安 | 通过 | 54 | 未通过 |
-| `dev_024` | 青岛 | 失败 | — | 未评分 |
-| `dev_025` | 厦门 | 失败 | 63 | 未通过 |
-| `dev_026` | — | 失败 | — | 未评分 |
-| `dev_027` | 上海 | 通过 | — | 未评分 |
-| `dev_028` | 北京 | 通过 | — | 未评分 |
-| `dev_029` | 成都 | 通过 | — | 未评分 |
-| `dev_030` | 上海 | 通过 | 91 | 通过 |
-| `lh_12_001` | 杭州 | 失败 | 29 | 未通过 |
-| `lh_12_002` | 上海 | 失败 | 39 | 未通过 |
-| `lh_5_001` | 杭州 | 失败 | 70 | 未通过 |
-| `lh_8_001` | 厦门 | 失败 | 57 | 未通过 |
+| Case | 城市 | Expected artifact | Actual artifact | Match | Harness strict | Judge 分数 | Judge 结论 |
+| --- | --- | --- | --- | --- | --- | ---: | --- |
+| `dev_001` | 杭州 | full_itinerary | missing | 失败 | 失败 | — | 未运行 |
+| `dev_002` | 北京 | full_itinerary | full_itinerary | 通过 | 通过 | 88 | 通过 |
+| `dev_003` | 厦门 | full_itinerary | full_itinerary | 通过 | 通过 | 73 | 未通过 |
+| `dev_004` | 西安 | full_itinerary | missing | 失败 | 失败 | — | 未运行 |
+| `dev_005` | 苏州 | full_itinerary | missing | 失败 | 失败 | — | 未运行 |
+| `dev_006` | 广州 | route_plan | route_plan | 通过 | 通过 | — | N/A |
+| `dev_007` | 南京 | candidate_comparison | missing | 失败 | 失败 | — | N/A |
+| `dev_008` | 成都 | candidate_comparison | candidate_comparison | 通过 | 通过 | — | N/A |
+| `dev_009` | 上海 | candidate_comparison | candidate_comparison | 通过 | 通过 | — | N/A |
+| `dev_010` | 青岛 | local_adjustment_advice | local_adjustment_advice | 通过 | 通过 | — | N/A |
+| `dev_011` | 杭州 | route_plan | route_plan | 通过 | 通过 | — | N/A |
+| `dev_012` | 深圳 | candidate_comparison | candidate_comparison | 通过 | 通过 | — | N/A |
+| `dev_013` | 武汉 | full_itinerary | full_itinerary | 通过 | 通过 | 93 | 通过 |
+| `dev_014` | 天津 | full_itinerary | full_itinerary | 通过 | 通过 | 73 | 通过 |
+| `dev_015` | 杭州 | candidate_comparison | candidate_comparison | 通过 | 通过 | — | N/A |
+| `dev_016` | 成都 | full_itinerary | full_itinerary | 通过 | 通过 | 96 | 未通过 |
+| `dev_017` | 南京 | full_itinerary | full_itinerary | 通过 | 通过 | 83 | 未通过 |
+| `dev_018` | 重庆 | full_itinerary | full_itinerary | 通过 | 通过 | 83 | 通过 |
+| `dev_019` | 长沙 | full_itinerary | full_itinerary | 通过 | 通过 | 90 | 通过 |
+| `dev_020` | 广州 | full_itinerary | full_itinerary | 通过 | 通过 | 83 | 通过 |
+| `dev_021` | 杭州 | full_itinerary | full_itinerary | 通过 | 通过 | 73 | 通过 |
+| `dev_022` | 苏州 | full_itinerary | full_itinerary | 通过 | 通过 | 88 | 通过 |
+| `dev_023` | 西安 | full_itinerary | partial_itinerary | 失败 | 失败 | 74 | 通过 |
+| `dev_024` | 青岛 | full_itinerary | full_itinerary | 通过 | 通过 | 86 | 通过 |
+| `dev_025` | 厦门 | full_itinerary | full_itinerary | 通过 | 通过 | 68 | 未通过 |
+| `dev_026` | — | candidate_comparison | candidate_comparison | 通过 | 通过 | — | N/A |
+| `dev_027` | 上海 | route_plan | route_plan | 通过 | 通过 | — | N/A |
+| `dev_028` | 北京 | candidate_comparison | candidate_comparison | 通过 | 通过 | — | N/A |
+| `dev_029` | 成都 | candidate_comparison | candidate_comparison | 通过 | 通过 | — | N/A |
+| `dev_030` | 上海 | full_itinerary | full_itinerary | 通过 | 通过 | 90 | 通过 |
+| `lh_12_001` | 杭州 | full_itinerary | missing | 失败 | 失败 | — | 未运行 |
+| `lh_12_002` | 上海 | full_itinerary | full_itinerary | 通过 | 通过 | 79 | 通过 |
+| `lh_5_001` | 杭州 | full_itinerary | full_itinerary | 通过 | 通过 | 80 | 通过 |
+| `lh_8_001` | 厦门 | full_itinerary | full_itinerary | 通过 | 通过 | 83 | 通过 |
 
 ## 逐 Case 记录
 
@@ -56,31 +73,23 @@
 
 ### 回答
 
-**第 1 天｜自然风光与本地美食**
-- 09:30–12:00　杭州西湖风景名胜区（景点）
-- 13:00–14:00　鱼笑面食(嘉绿名苑东区店)（餐饮）
-  - 交通：从上一站乘公共交通，约 6.3 公里，约 21 分钟
-- 14:45–16:15　湖滨步行街（街区/购物）
-  - 交通：从上一站乘公共交通，约 5.35 公里，约 18 分钟
-
-
-**预算**：预计 ¥330.0，预算上限 ¥1200.0，预计不超预算
+> 当前方案尚不可交付，仅供审阅。未解决：返程路线证据显示从杭州西湖到上海虹桥的公共交通耗时537分钟（约9小时），且为haversine估算，未证明能在21:30前到达上海。行程中唯一景点09:00开始游览150分钟，但返程建议最晚出发时间为12:03，与行程安排冲突，无法在截止时间前返回。；行程仅包含一个景点（西湖），缺少从上海虹桥出发至杭州的交通安排、返程交通安排以及具体时间节点，无法证明一日游的完整可行性。；城际交通（上海虹桥-杭州）仅有haversine估算，无真实公共交通班次、耗时及票价证据，无法验证行程可行性及预算准确性。。
+>
+> 当前候选未通过最终校验，ArtifactStore 中没有可交付的 current 行程。
 
 ### 评分
 
-- Harness strict：**通过**
+- Harness strict：**失败**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`missing`
+- Artifact type match：**失败**
 - 硬约束检查：**通过**
-- 行程检查：**通过**
-- Harness 主要问题：返程目标为 上海、截止 21:30；城际班次与进站余量未获实时库存证据，请预留返程缓冲并在购票平台复核。
+- 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-- 总分：**82/100**
-- 结论：**通过**
-- 分项：时间安排 18｜路线 18｜约束满足 13｜个性化 10｜完整性 9｜丰富度 9｜清晰度 5
-- 主要问题：
-- 用户明确要求'不要安排太多步行'且有一位 70 岁老人（mobility: low_walking）。行程安排了西湖（150 分钟）和湖滨步行街（90 分钟）两个高步行强度景点，且未指定游船、电瓶车等低体力消耗交通方式。候选核验 中'但不要安排太多步行'状态为 unsuitable_or_unverified。
-- 返程计划依赖'选择可在 21:30 前抵达上海的城际班次'，工具结果 仅提供 duration_min: 100 的估算，无具体车次余票证据。行程中已提示需在购票平台复核。
+- 状态：**未运行**
+- 说明：未运行：缺少预期行程产物
 
 ## dev_002 · 北京亲子两日游
 
@@ -90,39 +99,44 @@
 
 ### 回答
 
-**第 1 天｜文化体验**
-- 09:30–11:30　故宫博物院（博物馆）
-- 12:00–13:00　明园餐厅·烤鸭·北京菜(王府井店)（餐饮）
-  - 交通：从上一站乘公共交通，约 0.94 公里，约 5 分钟
-- 14:30–16:00　王府井步行街（街区/购物）
-  - 交通：从上一站乘公共交通，约 0.44 公里，约 5 分钟
+**第 1 天｜城市经典体验**
+- 09:30–11:15　大观园（景点）
+- 14:30–16:00　天安门广场（景点）
+  - 交通：从上一站乘公共交通，约 5.02 公里，约 29 分钟
+- 16:45–18:15　王府井步行街（街区/购物）
+  - 交通：从上一站乘公共交通，约 1.67 公里，约 18 分钟
 
-**第 2 天｜自然风光与本地美食**
-- 10:00–12:00　798艺术区（文化体验）
-- 13:00–14:00　小吊梨汤·北京菜·烤鸭(王府井银泰in88店)（餐饮）
-  - 交通：从上一站乘公共交通，约 10.43 公里，约 35 分钟
-- 14:45–16:15　MINIMARS亲子会所(久隆生活广场店)（景点）
-  - 交通：从上一站乘公共交通，约 8.77 公里，约 29 分钟
+**第 2 天｜文化体验**
+- 09:00–11:00　故宫博物院（博物馆）
+- 14:30–16:00　王府井商业街（街区/购物）
+  - 交通：从上一站乘公共交通，约 1.2 公里，约 16 分钟
+- 16:45–18:45　景山公园（景点）
+  - 交通：从上一站乘公共交通，约 1.8 公里，约 18 分钟
 
 
-**住宿**：JAMES JOYCE COFFETEL喆啡酒店(北京天安门广场王府井地铁站店)，王府井大街176号丹耀大厦F6层
+**住宿**：京春酒店(万里路国际青年酒店东四店)，东城区东四西大街弓箭大院AB座(近王府井大街、协和医院)
 
 **预算**：预计 ¥1965.0，预算上限 ¥4500.0，预计不超预算
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
 
 **LLM-as-Judge**
 
-- 总分：**90/100**
+- 总分：**88/100**
 - 结论：**通过**
-- 分项：时间安排 19｜路线 14｜约束满足 18｜个性化 15｜完整性 9｜丰富度 10｜清晰度 5
-- 主要问题：
-- 候选核验 将 dietary 约束'餐饮不要太辣'视为 POI 候选进行开放时间的核验，状态为 unsuitable_or_unverified，逻辑分类错误，虽未影响最终餐厅选择但显示规划证据链瑕疵
-- Day 2 行程从 798 艺术区返回王府井午餐，随后又前往距离王府井 8.77 公里的 MINIMARS 亲子会所，存在折返跑，路线效率较低
+- Rubric：`full_itinerary`
+- 分项：时间安排 17｜路线 17｜约束满足 19｜个性化 12｜完整性 9｜丰富度 9｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- Day 1: 11:15 (大观园结束) 至 14:30 (天安门广场开始) 间隔约 3 小时 15 分钟，午餐时段仅 11:30-12:30，剩余 2 小时未安排；Day 2: 11:00 (故宫结束) 至 14:30 (王府井商业街开始) 间隔约 3 小时 30 分钟，午餐时段仅 11:30-12:30，剩余 2 小时未安排。
 
 ## dev_003 · 厦门情侣慢节奏
 
@@ -133,47 +147,50 @@
 ### 回答
 
 **第 1 天｜自然风光与本地美食**
-- 10:00–11:45　东森自然美和美天地店（景点）
-- 12:30–13:30　好口味煎蟹馆(集源店)（餐饮）
-  - 交通：从上一站乘公共交通，约 6.14 公里，约 20 分钟
-- 14:30–16:15　自然美(海天路店)（景点）
-  - 交通：从上一站乘公共交通，约 7.74 公里，约 26 分钟
+- 09:30–12:00　鼓浪屿风景名胜区（景点）
+- 18:00–19:00　瑞幸咖啡(中山路旗舰店)（餐饮）
+  - 交通：从上一站乘公共交通，约 1.37 公里，约 17 分钟
+- 19:45–21:15　海湾公园（景点）
+  - 交通：从上一站乘公共交通，约 2.19 公里，约 19 分钟
 
-**第 2 天｜本地美食**
-- 09:30–10:45　nearTHEsea在海边（街区/购物）
-- 11:30–12:30　临家闽南菜(环岛路店)（餐饮）
-  - 交通：从上一站乘公共交通，约 5.8 公里，约 19 分钟
-- 14:30–15:45　海边极光珍珠馆（街区/购物）
-  - 交通：从上一站乘公共交通，约 3.73 公里，约 12 分钟
+**第 2 天｜自然风光与本地美食**
+- 09:30–11:15　鳌冠湾梦幻黄金海岸沙滩（景点）
+- 12:00–13:00　锅炉咖啡(联发华美空间店)（餐饮）
+  - 交通：从上一站乘公共交通，约 4.65 公里，约 27 分钟
+- 14:30–16:15　集美沙滩（景点）
+  - 交通：从上一站乘公共交通，约 5.65 公里，约 31 分钟
 
 **第 3 天｜自然风光与本地美食**
-- 09:30–11:15　厦门自然汽车美容(飞燕精洗五通店)（景点）
-- 12:15–13:15　佳丽海鲜酒楼(环岛路店)（餐饮）
-  - 交通：从上一站乘公共交通，约 12.82 公里，约 43 分钟
-- 14:30–16:15　多采自然(厦门运营中心)（景点）
-  - 交通：从上一站乘公共交通，约 6.74 公里，约 22 分钟
+- 09:30–11:15　健康步道林海线万石苍海（景点）
+- 12:00–13:00　临家闽南菜(环岛路店)（餐饮）
+  - 交通：从上一站乘公共交通，约 1.73 公里，约 18 分钟
+- 14:30–16:30　星巴克咖啡(厦门湖里万达店)（景点）
+  - 交通：从上一站乘公共交通，约 10.31 公里，约 46 分钟
 
 
-**住宿**：伊朵影院美宿(华天涉外学院店)，福祥路15号
+**住宿**：米朵轻居(翔安国际机场店)，翔安区环嶝南路双沪二里250号
 
 **预算**：预计 ¥3240.0
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
-- Harness 主要问题：用户偏好 `咖啡店` 没有在当前行程中得到明显覆盖。
 
 **LLM-as-Judge**
 
-- 总分：**55/100**
+- 总分：**73/100**
 - 结论：**未通过**
-- 分项：时间安排 10｜路线 12｜约束满足 10｜个性化 3｜完整性 10｜丰富度 5｜清晰度 5
-- 主要问题：
-- 回答 明确指出：'自动修正：未找到可覆盖 `咖啡店` 偏好的候选 POI。需复核：用户偏好 `咖啡店` 没有在当前行程中得到明显覆盖。'，且 行程 中无咖啡店。
-- 每日行程[0].stops[0].poi.name 为'东森自然美和美天地店'，category 为'scenic'，实际为美容店；每日行程[2].stops[0].poi.name 为'厦门自然汽车美容'，category 为'scenic'，实际为汽车美容店。
-- 用户要求中的interests 包含'海边'，但 行程 中匹配项为 nearTHEsea 在海边 (shopping) 和 海边极光珍珠馆 (shopping)，非实际海边景点。
+- Rubric：`full_itinerary`
+- 分项：时间安排 16｜路线 10｜约束满足 14｜个性化 11｜完整性 9｜丰富度 8｜清晰度 5
+- 主要失败原因（error/critical）：
+- 用户明确要求避免'网红排队特别久的地方'，但行程第1天安排鼓浪屿风景名胜区。鼓浪屿是厦门最热门景点之一，通常存在长时间排队情况，与用户avoid约束直接冲突。
+- 可选改进（warning）：
+- 酒店选定为米朵轻居(翔安国际机场店)，位于翔安区，而主要活动集中在思明区。lodging_route_anchors显示平均单程距离26.12km，每日往返通勤时间约200分钟（去程106min+返程100min），严重影响旅行体验。
 
 ## dev_004 · 西安清真饮食
 
@@ -183,47 +200,23 @@
 
 ### 回答
 
-**第 1 天｜自然风光与本地美食**
-- 09:30–11:00　西安城市运动公园（景点）
-- 11:45–14:15　西安城墙（景点）
-  - 交通：从上一站乘公共交通，约 7.63 公里，约 25 分钟
-- 14:45–15:45　清真·麻乃泡馍·烧烤(凤城二路店)（餐饮）
-  - 交通：从上一站乘公共交通，约 4.53 公里，约 15 分钟
-
-**第 2 天｜本地美食**
-- 09:30–11:00　回民街（街区/购物）
-- 11:30–12:30　清真·马文砂锅大全（餐饮）
-  - 交通：从上一站乘公共交通，约 0.61 公里，约 5 分钟
-- 18:00–20:00　大唐不夜城（夜间活动）
-  - 交通：从上一站乘公共交通，约 6.07 公里，约 20 分钟
-
-**第 3 天｜文化体验**
-- 09:30–11:00　秦始皇兵马俑博物馆（博物馆）
-- 12:00–13:00　清真回坊楼泡馍(步行街店)（餐饮）
-  - 交通：从上一站乘公共交通，约 12.15 公里，约 40 分钟
-- 14:30–16:30　华清宫（文化体验）
-  - 交通：从上一站乘公共交通，约 5.54 公里，约 18 分钟
-
-
-**住宿**：天天宾馆(兵马俑店)，秦陵北路西杨村兵马俑北门向西150米
-
-**预算**：预计 ¥5445.0，预算上限 ¥6000.0，预计不超预算
+> 当前方案尚不可交付，仅供审阅。未解决：第3天没有有证据支持的用餐安排，且第3天行程中未包含任何餐饮停靠点，无法满足全程清真饮食的约束。；第1天只有1个非餐饮活动，下午时段明显不完整，可能影响行程充实度。；第3天没有有证据支持的用餐安排。。
+>
+> 当前候选未通过最终校验，ArtifactStore 中没有可交付的 current 行程。
 
 ### 评分
 
-- Harness strict：**通过**
+- Harness strict：**失败**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`missing`
+- Artifact type match：**失败**
 - 硬约束检查：**通过**
-- 行程检查：**通过**
+- 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-- 总分：**83/100**
-- 结论：**未通过**
-- 分项：时间安排 12｜路线 12｜约束满足 20｜个性化 14｜完整性 10｜丰富度 10｜清晰度 5
-- 主要问题：
-- 住宿选定为'天天宾馆 (兵马俑店)'（临潼区），而第 1 天、第 2 天行程起点均为市区景点（城市运动公园、回民街），开始时间设为 09:30。根据 工具结果中的routes，兵马俑至城墙公共交通需 110 分钟，行程未预留从住宿地前往市区的首段通勤时间，导致 09:30 开始行程在实际住宿安排下不可行。
-- 预算计划中 risk_high_exceeds_limit 为 true，total_high_cny (6240.75) 超出用户总预算上限 (6000.0)，存在超支风险。
-- 连续 3 晚住宿在兵马俑附近（临潼），但仅第 3 天在该区域活动。第 1、2 天主要活动集中在市区（城墙、回民街、大唐不夜城），导致每日需往返约 42 公里，通勤效率极低。
+- 状态：**未运行**
+- 说明：未运行：缺少预期行程产物
 
 ## dev_005 · 苏州轮椅友好
 
@@ -233,30 +226,23 @@
 
 ### 回答
 
-**第 1 天｜城市经典体验**
-- 09:30–11:30　园林档案馆（景点）
-- 14:30–16:30　园林里南区（景点）
-  - 交通：从上一站乘公共交通，约 3.76 公里，约 13 分钟
-
-
-**预算**：预计 ¥1035.0
+> 当前方案尚不可交付，仅供审阅。未解决：计划中两个景点（西园戒幢律寺、七里山塘景区）均未提供无障碍设施证据（如无障碍入口、电梯、平坦路面等），且路线证据中仅有一条低可信估算（haversine_recovery_estimate），无法证明全程无障碍。用户明确要求轮椅出行且无障碍优先，需补充具体无障碍信息或调整景点。；两个景点之间的路线仅使用haversine估算，无实际公共交通路线证据，无法确认可达性及耗时。需补充实际公交/地铁路线及步行距离，确保符合无障碍要求。；用户兴趣为园林，但当前行程仅包含西园戒幢律寺（寺庙）和七里山塘景区（历史街区），未明确覆盖园林。建议考虑替换或增加无障碍友好的园林景点（如拙政园、留园等，需确认无障碍条件）。。
+>
+> 当前候选未通过最终校验，ArtifactStore 中没有可交付的 current 行程。
 
 ### 评分
 
 - Harness strict：**失败**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`missing`
+- Artifact type match：**失败**
 - 硬约束检查：**通过**
-- 行程检查：**失败**
-- Harness 主要问题：第1天没有有证据支持的用餐安排。；当前工具证据不足以确认全程无障碍；请在出发前向场馆和交通运营方核实无障碍入口、电梯及路面情况。
+- 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-- 总分：**45/100**
-- 结论：**未通过**
-- 分项：时间安排 15｜路线 5｜约束满足 5｜个性化 6｜完整性 5｜丰富度 5｜清晰度 4
-- 主要问题：
-- 回答 明确指出'两个景点均未提供无障碍设施证据，且用户明确要求轮椅无障碍并避免大量石板路'；候选核验 中'避免石板路太多的安排'状态为 unsuitable_or_unverified。
-- 每日行程[0].stops 使用 POI 为'园林档案馆'和'园林里南区'，但 工具结果中的routes 中规划路线的起点终点为'拙政园'和'留园'，行程与路线事实不匹配。
-- 回答 指出'第 1 天没有安排任何餐饮停靠点'；每日行程[0].stops 中无餐饮安排；工具结果中的restaurants 为空列表。
+- 状态：**未运行**
+- 说明：未运行：缺少预期行程产物
 
 ## dev_006 · 只需机场到酒店路线
 
@@ -266,18 +252,24 @@
 
 ### 回答
 
-> 为确保我能给出可执行方案，请先补齐：days。
-> 为了给你规划合适的行程，计划玩几天？
+> Artifact：route_plan
+> - subject：None
+> - evidence：[{'artifact_id': 'candidates_21d82d71', 'kind': 'candidates'}, {'artifact_id': 'candidates_4fb692d5', 'kind': 'candidates'}, {'artifact_id': 'candidates_e0058f26', 'kind': 'candidates'}, {'artifact_id': 'candidates_4ca9b8ee', 'kind': 'candidates'}, {'artifact_id': 'candidates_ecdcee83', 'kind': 'candidates'}, {'artifact_id': 'routes_c00654b8', 'kind': 'routes'}, {'artifact_id': 'routes_1a3df5dc', 'kind': 'routes'}, {'artifact_id': 'routes_ad5c6d0a', 'kind': 'routes'}, {'artifact_id': 'routes_791df35d', 'kind': 'routes'}]
+> - limitations：[]
 
 ### 评分
 
-- Harness strict：**失败**
+- Harness strict：**通过**
+- Expected artifact：`route_plan`
+- Actual artifact：`route_plan`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_007 · 仅比较住宿区域
 
@@ -287,23 +279,31 @@
 
 ### 回答
 
-> 已按工具证据整理如下：
-> - 天气：南京 阴，25°C（来源：amap）
-> - 候选：中山陵景区（scenic；评分 4.9；营业/开放时间 08:30-17:00(周一闭馆)；法定节假日及孙中山先生诞辰、逝世纪念日正常开放,墓室仅周二至周五开放(数据来源:江苏省文旅厅公共服务平台苏心游)；地址 石象路7号；来源 amap）
-> - 候选：总统府（scenic；评分 4.9；营业/开放时间 08:30-18:00（17:00停止入场，周一闭馆）(数据来源:江苏省文旅厅公共服务平台苏心游)；地址 长江路292号；来源 amap）
-> - 候选：南京夫子庙（scenic；评分 4.9；营业/开放时间 周一至周日 09:00-22:00；地址 贡院街152号；来源 amap）
-> - 候选：夫子庙秦淮风光带（scenic；评分 4.9；营业/开放时间 周一至周日 09:00-22:00；地址 平江府路80-1(夫子庙地铁站2号口步行170米)；来源 amap）
-> - 候选：南京博物院（museum；评分 4.9；营业/开放时间 周一 闭馆(法定节假日除外)；周二至周日 09:00-17:00开放(16:00停止入园)；地址 中山东路321号；来源 amap）
+> 当前方案尚不可交付，仅供审阅。未解决：交付 Gate 未通过，仍有未解决问题。
+>
+> 当前没有可交付的 current 行程。
+>
+> Artifact：candidate_comparison
+> - subject：{'destination_city': '南京', 'target_anchor': None, 'accessibility_mode': 'unanchored'}
+> - candidates：[{'name': '新街口'}, {'name': '夫子庙'}, {'name': '玄武湖'}]
+> - comparison_dimensions：['accessibility', 'accessibility_needs']
+> - recommendation：None
+> - evidence：[]
+> - limitations：['核心维度：候选「新街口」的 accessibility 证据', '核心维度：候选「夫子庙」的 accessibility 证据', '核心维度：候选「玄武湖」的 accessibility 证据', '至少一个覆盖全部候选的完整可比维度', '候选「新街口」的 accessibility 证据', '候选「新街口」的 accessibility_needs 证据', '候选「夫子庙」的 accessibility 证据', '候选「夫子庙」的 accessibility_needs 证据', '候选「玄武湖」的 accessibility 证据', '候选「玄武湖」的 accessibility_needs 证据', 'accessibility_needs 未覆盖全部候选，不据此声称适老或无障碍优势']
 
 ### 评分
 
-- Harness strict：**通过**
+- Harness strict：**失败**
+- Expected artifact：`candidate_comparison`
+- Actual artifact：`missing`
+- Artifact type match：**失败**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_008 · 只找餐厅
 
@@ -313,21 +313,27 @@
 
 ### 回答
 
-> 已按工具证据整理如下：
-> - 路线：成都太古里 → 饕林餐厅(宽窄巷子吉祥街店)，walk，约 57 分钟 / 4.29 公里（来源：amap）
-> - 候选：饕林餐厅(宽窄巷子吉祥街店)（food；评分 4.6；营业/开放时间 周一至周日 11:00-21:30 2026-05-01至2026-05-05 周一至周日 11:00-21:30；人均约 65.0 元；地址 吉祥街37号；来源 amap）
-> - 候选：成都太古里（shopping；评分 4.9；营业/开放时间 周一至周四 10:00-22:00；周五至周日 10:00-22:30；地址 中纱帽街8号；来源 amap）
-> - 候选：IFS国际金融中心（scenic；评分 4.9；营业/开放时间 周一至周日 10:00-22:00；地址 红星路三段1号(春熙路地铁站出入口旁)；来源 amap）
+> Artifact：candidate_comparison
+> - subject：{'destination_city': '成都', 'target_anchor': '太古里', 'accessibility_mode': 'anchored'}
+> - candidates：[{'name': '太古里·锦街'}, {'name': '太古里东广场'}]
+> - comparison_dimensions：['accessibility', 'ambience']
+> - recommendation：{'candidate': '太古里·锦街', 'decision': '基于 2 个完整可比维度有限推荐 太古里·锦街', 'dimensions_used': ['accessibility', 'ambience'], 'comparable_metrics': ['duration_min', 'rating'], 'basis': [{'dimension': 'accessibility', 'candidate': '太古里·锦街', 'metric': 'duration_min', 'value': 5.0, 'source_artifact_id': 'routes_835fac32', 'source_artifact_ids': ['routes_835fac32', 'routes_66826965']}, {'dimension': 'ambience', 'candidate': '太古里·锦街', 'metric': 'rating', 'value': 2.7, 'source_artifact_id': 'candidates_68fd98fc', 'source_artifact_ids': ['candidates_68fd98fc']}], 'source_artifact_ids': ['routes_835fac32', 'routes_66826965', 'candidates_68fd98fc']}
+> - evidence：[{'candidate': '太古里·锦街', 'dimension': 'ambience', 'source_artifact_id': 'candidates_68fd98fc', 'source_kind': 'candidates', 'source_agent': 'transport', 'source_task_id': 'transport-32843441', 'facts': {'entities': [{'name': '太古里·锦街', 'canonical_name': '太古里·锦街', 'address': '锦江区锦官驿街道油篓街38号太古里锦街B栋', 'category': 'shopping', 'entity_type': 'district', 'tags': ['shopping', 'citywalk'], 'rating': 2.7, 'popularity': 0.88, 'price_level': 'unknown', 'source': 'amap'}]}}, {'candidate': '太古里东广场', 'dimension': 'ambience', 'source_artifact_id': 'candidates_68fd98fc', 'source_kind': 'candidates', 'source_agent': 'transport', 'source_task_id': 'transport-32843441', 'facts': {'entities': [{'name': '太古里东广场', 'canonical_name': '太古里东广场', 'address': '锦江区纱帽街8号(春熙路地铁站出入口步行410米)', 'category': 'scenic', 'entity_type': 'attraction', 'tags': ['classic', 'sightseeing'], 'rating': 4.5, 'popularity': 0.82, 'price_level': 'unknown', 'source': 'amap'}, {'name': 'Apple 成都太古里', 'canonical_name': 'Apple 成都太古里', 'address': '锦江区中纱帽街8号成都太古里东广场1349&2349号', 'category': 'shopping', 'entity_type': 'retail', 'tags': ['shopping', 'citywalk'], 'rating': 4.7, 'popularity': 0.91, 'price_level': 'unknown', 'source': 'amap'}]}}, {'candidate': '太古里·锦街', 'dimension': 'accessibility', 'source_artifact_id': 'routes_835fac32', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-32843441', 'facts': {'origin_name': '太古里东广场', 'destination_name': '太古里·锦街', 'duration_min': 5, 'distance_km': 0.36, 'mode': 'walk', 'walking_distance_km': 0.36, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '太古里东广场', 'dimension': 'accessibility', 'source_artifact_id': 'routes_835fac32', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-32843441', 'facts': {'origin_name': '太古里东广场', 'destination_name': '太古里·锦街', 'duration_min': 5, 'distance_km': 0.36, 'mode': 'walk', 'walking_distance_km': 0.36, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '太古里·锦街', 'dimension': 'accessibility', 'source_artifact_id': 'routes_66826965', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-32843441', 'facts': {'origin_name': '成都太古里', 'destination_name': '太古里·锦街', 'duration_min': 5, 'distance_km': 0.38, 'mode': 'walk', 'walking_distance_km': 0.38, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}]
+> - limitations：[]
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`candidate_comparison`
+- Actual artifact：`candidate_comparison`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_009 · 只做候选景点排序
 
@@ -337,21 +343,27 @@
 
 ### 回答
 
-> 已按工具证据整理如下：
-> - 天气：上海 阴，27°C（来源：amap）
-> - 候选：南京路步行街（shopping；评分 4.9；营业/开放时间 周一至周日 00:00-24:00；地址 南京东路558号；来源 amap）
-> - 候选：外滩（scenic；评分 4.9；营业/开放时间 周一至周日 00:00-24:00；地址 中山东二路1号；来源 amap）
-> - 候选：上海新天地（shopping；评分 4.9；营业/开放时间 周一至周日 00:00-24:00；地址 太仓路181弄6-15号；来源 amap）
+> Artifact：candidate_comparison
+> - subject：{'destination_city': '上海', 'target_anchor': '人民广场', 'accessibility_mode': 'anchored'}
+> - candidates：[{'name': '上海博物馆'}, {'name': '豫园'}, {'name': '外滩'}, {'name': '上海中心'}]
+> - comparison_dimensions：['accessibility']
+> - recommendation：{'candidate': '上海中心', 'decision': '基于 1 个完整可比维度有限推荐 上海中心', 'dimensions_used': ['accessibility'], 'comparable_metrics': ['duration_min'], 'basis': [{'dimension': 'accessibility', 'candidate': '上海中心', 'metric': 'duration_min', 'value': 30.0, 'source_artifact_id': 'routes_6ad0b56c', 'source_artifact_ids': ['routes_6ad0b56c']}], 'source_artifact_ids': ['routes_1f196312', 'routes_40f47926', 'routes_6ad0b56c']}
+> - evidence：[{'candidate': '上海博物馆', 'dimension': 'accessibility', 'source_artifact_id': 'routes_1f196312', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-9e3f10b4', 'facts': {'origin_name': '上海豫园', 'destination_name': '上海博物馆(人民广场馆)', 'duration_min': 31, 'distance_km': 2.18, 'mode': 'public_transport', 'walking_distance_km': 1.3, 'estimated_cost': 4.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '豫园', 'dimension': 'accessibility', 'source_artifact_id': 'routes_1f196312', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-9e3f10b4', 'facts': {'origin_name': '上海豫园', 'destination_name': '上海博物馆(人民广场馆)', 'duration_min': 31, 'distance_km': 2.18, 'mode': 'public_transport', 'walking_distance_km': 1.3, 'estimated_cost': 4.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '上海博物馆', 'dimension': 'accessibility', 'source_artifact_id': 'routes_40f47926', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-9e3f10b4', 'facts': {'origin_name': 'Paradox Museum悖论博物馆(外滩店)', 'destination_name': '上海博物馆(人民广场馆)', 'duration_min': 33, 'distance_km': 2.65, 'mode': 'public_transport', 'walking_distance_km': 1.5, 'estimated_cost': 4.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '外滩', 'dimension': 'accessibility', 'source_artifact_id': 'routes_40f47926', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-9e3f10b4', 'facts': {'origin_name': 'Paradox Museum悖论博物馆(外滩店)', 'destination_name': '上海博物馆(人民广场馆)', 'duration_min': 33, 'distance_km': 2.65, 'mode': 'public_transport', 'walking_distance_km': 1.5, 'estimated_cost': 4.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '上海博物馆', 'dimension': 'accessibility', 'source_artifact_id': 'routes_6ad0b56c', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3dc0b432', 'facts': {'origin_name': '上海中心大厦地下停车场', 'destination_name': '上海博物馆(人民广场馆)', 'duration_min': 30, 'distance_km': 3.47, 'mode': 'public_transport', 'walking_distance_km': 1.1, 'estimated_cost': 4.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '上海中心', 'dimension': 'accessibility', 'source_artifact_id': 'routes_6ad0b56c', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3dc0b432', 'facts': {'origin_name': '上海中心大厦地下停车场', 'destination_name': '上海博物馆(人民广场馆)', 'duration_min': 30, 'distance_km': 3.47, 'mode': 'public_transport', 'walking_distance_km': 1.1, 'estimated_cost': 4.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}]
+> - limitations：[]
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`candidate_comparison`
+- Actual artifact：`candidate_comparison`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_010 · 天气局部调整
 
@@ -361,23 +373,27 @@
 
 ### 回答
 
-> 已按工具证据整理如下：
-> - 天气：青岛 阴，28°C（来源：amap）
-> - 候选：五四广场（scenic；评分 4.9；营业/开放时间 周一至周日 00:00-24:00；地址 东海西路(五四广场地铁站C口步行170米)；来源 amap）
-> - 候选：青岛啤酒博物馆（museum；评分 4.9；营业/开放时间 8:00-17:30；地址 登州路56-1；来源 amap）
-> - 候选：栈桥景区（scenic；评分 4.9；营业/开放时间 周一至周日 00:00-24:00；地址 太平路12号(青岛站地铁站G口步行320米)；来源 amap）
-> - 候选：中国人民解放军海军博物馆（museum；评分 4.9；营业/开放时间 01/01-12/31 周二-周日 09:00-17:00开放 最晚进入16:00；01/01-12/31 周一 全天不开放；清明节,劳动节,端午节,中秋节,国庆节,春节 09:00-17:00开放 最晚进入16:00；地址 琴屿路22号；来源 amap）
-> - 候选：崂山风景区（scenic；评分 4.8；营业/开放时间 3月至6月,9月至11月 周一至周日 07:00-17:30；7月至8月 周一至周日 06:00-19:00；12月,1月至2月 周一至周日 07:30-17:00；地址 崂山景区旅游专用路；来源 amap）
+> Artifact：local_adjustment_advice
+> - subject：崂山
+> - recommendation：保留，但出发前复核实时条件
+> - alternatives：['中国人民解放军海军博物馆', '青岛啤酒博物馆', '青岛啤酒博物馆A馆', '青岛啤酒博物馆B馆', '青岛市博物馆']
+> - evidence：[{'artifact_id': 'weather_f6566069', 'kind': 'weather'}, {'artifact_id': 'candidates_7d3a6732', 'kind': 'candidates'}, {'artifact_id': 'candidates_e7df4c23', 'kind': 'candidates'}, {'artifact_id': 'weather_97dac5db', 'kind': 'weather'}]
+> - limitations：[]
+> - apply_status：advice_only_no_itinerary_modified
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`local_adjustment_advice`
+- Actual artifact：`local_adjustment_advice`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_011 · 同名地点消歧
 
@@ -387,19 +403,24 @@
 
 ### 回答
 
-> 已按工具证据整理如下：
-> - 路线：杭州东站 → 杭州湖滨银泰广场，walk，约 107 分钟 / 8.0 公里（来源：amap）
-> - 路线：杭州东站 → 杭州湖滨银泰广场，public_transport，约 19 分钟 / 8.3 公里（来源：amap）
+> Artifact：route_plan
+> - subject：None
+> - evidence：[{'artifact_id': 'candidates_29780195', 'kind': 'candidates'}, {'artifact_id': 'candidates_e1b4257c', 'kind': 'candidates'}, {'artifact_id': 'routes_859835fc', 'kind': 'routes'}, {'artifact_id': 'routes_0c80fb64', 'kind': 'routes'}]
+> - limitations：[]
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`route_plan`
+- Actual artifact：`route_plan`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_012 · 多候选路线矩阵
 
@@ -409,18 +430,27 @@
 
 ### 回答
 
-> 已按工具证据整理如下：
-> - 路线：深圳南山青青世界 → 深圳世界之窗，public_transport，约 59 分钟 / 11.93 公里（来源：amap）
+> Artifact：candidate_comparison
+> - subject：{'destination_city': '深圳', 'target_anchor': '深圳北站', 'accessibility_mode': 'anchored'}
+> - candidates：[{'name': '世界之窗'}, {'name': '深圳博物馆'}, {'name': '大梅沙'}]
+> - comparison_dimensions：['accessibility']
+> - recommendation：{'candidate': '深圳博物馆', 'decision': '基于 1 个完整可比维度有限推荐 深圳博物馆', 'dimensions_used': ['accessibility'], 'comparable_metrics': ['duration_min'], 'basis': [{'dimension': 'accessibility', 'candidate': '深圳博物馆', 'metric': 'duration_min', 'value': 34.0, 'source_artifact_id': 'routes_a63d5f0d', 'source_artifact_ids': ['routes_a63d5f0d']}], 'source_artifact_ids': ['routes_489f3651', 'routes_a63d5f0d', 'routes_65a28071']}
+> - evidence：[{'candidate': '世界之窗', 'dimension': 'accessibility', 'source_artifact_id': 'routes_489f3651', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3f54ec95', 'facts': {'origin_name': '深圳世界之窗', 'destination_name': '深圳北站东广场', 'duration_min': 57, 'distance_km': 19.68, 'mode': 'public_transport', 'walking_distance_km': 0.89, 'estimated_cost': 7.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '深圳博物馆', 'dimension': 'accessibility', 'source_artifact_id': 'routes_a63d5f0d', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-7c3b2921', 'facts': {'origin_name': '深圳博物馆金田路馆', 'destination_name': '深圳北站东广场', 'duration_min': 34, 'distance_km': 9.65, 'mode': 'public_transport', 'walking_distance_km': 0.92, 'estimated_cost': 7.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '大梅沙', 'dimension': 'accessibility', 'source_artifact_id': 'routes_65a28071', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-abba9425', 'facts': {'origin_name': '大梅沙海滨公园', 'destination_name': '深圳北站东广场', 'duration_min': 89, 'distance_km': 41.24, 'mode': 'public_transport', 'walking_distance_km': 0.83, 'estimated_cost': 7.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}]
+> - limitations：[]
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`candidate_comparison`
+- Actual artifact：`candidate_comparison`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_013 · 步行上限路线
 
@@ -431,28 +461,32 @@
 ### 回答
 
 **第 1 天｜文化体验**
-- 09:30–11:30　湖北省博物馆（博物馆）
-- 14:30–17:00　黄鹤楼（景点）
-  - 交通：从上一站乘公共交通，约 6.32 公里，约 21 分钟
-- 17:30–19:00　昙华林艺术创作基地（博物馆）
-  - 交通：从上一站乘公共交通，约 1.09 公里，约 5 分钟
+- 09:00–11:00　湖北省博物馆（博物馆）
+- 12:00–14:30　黄鹤楼（景点）
+  - 交通：从上一站乘公共交通，约 6.32 公里，约 33 分钟
+- 15:00–16:45　昙华林（景点）
+  - 交通：从上一站乘公共交通，约 1.01 公里，约 15 分钟
 
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
-- Harness 主要问题：第1天没有有证据支持的用餐安排。
 
 **LLM-as-Judge**
 
-- 总分：**88/100**
+- 总分：**93/100**
 - 结论：**通过**
-- 分项：时间安排 15｜路线 18｜约束满足 20｜个性化 15｜完整性 5｜丰富度 10｜清晰度 5
-- 主要问题：
-- 回答 explicitly states '第 1 天没有有证据支持的用餐安排' (Day 1 has no evidence-supported dining arrangement). Itinerary covers 09:30 to 19:00 without meal stops.
-- Hubei Provincial Museum is closed on Mondays (except holidays). start_date is null in 最终记录, so opening day cannot be verified.
+- Rubric：`full_itinerary`
+- 分项：时间安排 18｜路线 17｜约束满足 20｜个性化 14｜完整性 9｜丰富度 10｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- 湖北省博物馆周一闭馆（法定节假日除外），行程未指定具体日期（start_date 为 null），若用户实际出行日为周一且非节假日，该必访点无法参观。
 
 ## dev_014 · 周一营业状态
 
@@ -464,28 +498,32 @@
 
 **第 1 天｜文化体验**
 - 09:30–11:00　天津·海河意式风情区（街区/购物）
-- 14:30–16:00　五大道历史博物馆（博物馆）
-  - 交通：从上一站乘公共交通，约 2.65 公里，约 9 分钟
-- 16:30–18:15　天津博物馆-票务中心（景点）
-  - 交通：从上一站乘公共交通，约 3.08 公里，约 10 分钟
+- 14:30–16:00　瓷房子（博物馆）
+  - 交通：从上一站乘公共交通，约 1.28 公里，约 16 分钟
+- 16:45–19:15　天津五大道文化旅游区（景点）
+  - 交通：从上一站乘公共交通，约 1.59 公里，约 17 分钟
 
 
 ### 评分
 
-- Harness strict：**失败**
+- Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
-- Harness 主要问题：第1天没有有证据支持的用餐安排。
 
 **LLM-as-Judge**
 
-- 总分：**40/100**
-- 结论：**未通过**
-- 分项：时间安排 5｜路线 5｜约束满足 4｜个性化 8｜完整性 5｜丰富度 8｜清晰度 5
-- 主要问题：
-- User requested 'Tianjin Museum' on 'Monday'. 工具结果中的candidates shows Tianjin Museum is '01/01-12/31 周一 全天不开放' (Closed all day Monday). Itinerary schedules 'Tianjin Museum - Ticket Center' at 16:30 on Monday. 回答 admits this constitutes a 'hard constraint conflict'.
-- Itinerary claims public_transport from Five Great Avenues to Tianjin Museum (3.08km) takes 10 minutes. 工具结果中的routes shows a similar public transport route (5.8km) takes 48 minutes. 3km in 10 mins via public transport is physically unrealistic.
-- 行程.候选核验 results show Tianjin Museum status as 'unsuitable_or_unverified' with reason 'Closed on this day'. However, the 每日行程[].stops still includes this location as a planned stop.
+- 总分：**73/100**
+- 结论：**通过**
+- Rubric：`full_itinerary`
+- 分项：时间安排 10｜路线 8｜约束满足 20｜个性化 13｜完整性 8｜丰富度 9｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- Day 1 Stop 1 ends at 11:00, Stop 2 starts at 14:30. Gap is 3.5 hours. Lunch is 1 hour (11:30-12:30). Approximately 2.5 hours unaccounted for in a 1-day trip.
+- itinerary.days[].stops route legs (Italian Style Town -> Porcelain House -> Five Great Avenues) are not supported by tool_facts.routes. tool_facts.routes describes a different chain (Post Museum -> Confucian Temple -> Folk Museum -> Natural Museum -> Five Great Avenues). Itinerary relies on haversine_recovery_estimate without matching tool verification.
 
 ## dev_015 · 雨天短步行晚餐
 
@@ -495,27 +533,27 @@
 
 ### 回答
 
-> 已按工具证据整理如下：
-> - 天气：杭州 雾，29°C（来源：amap）
-> - 路线：星光大道 → 杭州钱潮开元酒店·忆江南·宋词餐厅，walk，约 6 分钟 / 0.44 公里（来源：amap）
-> - 路线：星光大道 → 菲滋意式餐厅，walk，约 3 分钟 / 0.25 公里（来源：amap）
-> - 路线：星光大道 → 菲滋意式餐厅(星光大道店)，walk，约 5 分钟 / 0.35 公里（来源：amap）
-> - 路线：星光大道 → 小牛滚滚贵州黄牛肉火锅(中财店)，walk，约 11 分钟 / 0.84 公里（来源：amap）
-> - 候选：菲滋意式餐厅(星光大道店)（food；评分 4.5；营业/开放时间 周一至周日 11:00-22:00；人均约 68.0 元；地址 长河街道滨盛路1766号4楼；来源 amap）
-> - 候选：杭州钱潮开元酒店·忆江南·宋词餐厅（food；评分 4.5；营业/开放时间 周一至周日 10:00-14:00；人均约 87.0 元；地址 江南大道288号钱潮开元酒店26楼；来源 amap）
-> - 候选：小牛滚滚贵州黄牛肉火锅(中财店)（food；评分 4.8；营业/开放时间 周一至周日 10:00-01:00；人均约 71.0 元；地址 通和路68号中财大厦F1层；来源 amap）
-> - 候选：乔村二十八道(钱江世纪城店)（food；评分 4.9；营业/开放时间 周一至周五 11:00-14:00,17:00-21:00；周六至周日 11:00-14:00,16:30-21:00；人均约 166.0 元；地址 盈丰街道左右商务中心2幢；来源 amap）
-> - 候选：群乐饭店(信诚路店)（food；评分 4.9；营业/开放时间 周一至周日 11:00-13:30,16:00-20:30；人均约 112.0 元；地址 滨安路1197号(近信诚路)；来源 amap）
+> Artifact：candidate_comparison
+> - subject：{'destination_city': '杭州', 'target_anchor': '杭州滨江区星光大道', 'accessibility_mode': 'anchored'}
+> - candidates：[{'name': '白洋桥青潮园 chill land'}, {'name': '银龙坞山庄'}, {'name': '茶浪烤全羊+私房菜(杭州龙坞店)'}, {'name': '鱼町刺身(西子铭苑南区店)'}, {'name': '海煮叹鲜(赛银国际商务中心1幢店)'}]
+> - comparison_dimensions：['accessibility', 'cost', 'accessibility_needs']
+> - recommendation：{'candidate': '鱼町刺身(西子铭苑南区店)', 'decision': '基于 2 个完整可比维度有限推荐 鱼町刺身(西子铭苑南区店)', 'dimensions_used': ['accessibility', 'accessibility_needs'], 'comparable_metrics': ['duration_min', 'average_walking_distance_km'], 'basis': [{'dimension': 'accessibility', 'candidate': '鱼町刺身(西子铭苑南区店)', 'metric': 'duration_min', 'value': 156.0, 'source_artifact_id': 'routes_02c75905', 'source_artifact_ids': ['routes_02c75905']}, {'dimension': 'accessibility_needs', 'candidate': '鱼町刺身(西子铭苑南区店)', 'metric': 'average_walking_distance_km', 'value': 11.73, 'source_artifact_id': 'routes_02c75905', 'source_artifact_ids': ['routes_02c75905']}], 'source_artifact_ids': ['routes_ffbbbe58', 'routes_a50c6094', 'routes_a7b0d020', 'routes_02c75905', 'routes_788b4b8c']}
+> - evidence：[{'candidate': '白洋桥青潮园 chill land', 'dimension': 'cost', 'source_artifact_id': 'restaurants_6b28f8f2', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-f101f023', 'facts': {'entities': [{'name': '白洋桥青潮园 chill land', 'canonical_name': '白洋桥青潮园 chill land', 'address': '钱塘区15号大街与10号大街交叉口西120米', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.6, 'popularity': 1.0, 'price_level': 'unknown', 'source': 'amap'}], 'area': '滨江区星光大道'}}, {'candidate': '银龙坞山庄', 'dimension': 'cost', 'source_artifact_id': 'restaurants_6b28f8f2', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-f101f023', 'facts': {'entities': [{'name': '银龙坞山庄', 'canonical_name': '银龙坞山庄', 'address': '临安区龙潭路12号', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.5, 'popularity': 0.94, 'price_level': 'unknown', 'source': 'amap'}], 'area': '滨江区星光大道'}}, {'candidate': '茶浪烤全羊+私房菜(杭州龙坞店)', 'dimension': 'cost', 'source_artifact_id': 'restaurants_6b28f8f2', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-f101f023', 'facts': {'entities': [{'name': '茶浪烤全羊+私房菜(杭州龙坞店)', 'canonical_name': '茶浪烤全羊+私房菜(杭州龙坞店)', 'address': '西湖区龙坞茶村狗多子5号', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.7, 'popularity': 0.85, 'price_level': 'unknown', 'average_cost': 100.0, 'source': 'amap'}], 'area': '滨江区星光大道'}}, {'candidate': '鱼町刺身(西子铭苑南区店)', 'dimension': 'cost', 'source_artifact_id': 'restaurants_6b28f8f2', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-f101f023', 'facts': {'entities': [{'name': '鱼町刺身(西子铭苑南区店)', 'canonical_name': '鱼町刺身(西子铭苑南区店)', 'address': '拱墅区武林商圈武林路桃花河弄7号', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.7, 'popularity': 0.73, 'price_level': 'unknown', 'average_cost': 387.0, 'source': 'amap'}], 'area': '滨江区星光大道'}}, {'candidate': '海煮叹鲜(赛银国际商务中心1幢店)', 'dimension': 'cost', 'source_artifact_id': 'restaurants_6b28f8f2', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-f101f023', 'facts': {'entities': [{'name': '海煮叹鲜(赛银国际商务中心1幢店)', 'canonical_name': '海煮叹鲜(赛银国际商务中心1幢店)', 'address': '余杭区五常街道赛银国际广场1幢105', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.7, 'popularity': 0.7, 'price_level': 'unknown', 'average_cost': 109.0, 'source': 'amap'}], 'area': '滨江区星光大道'}}, {'candidate': '白洋桥青潮园 chill land', 'dimension': 'accessibility', 'source_artifact_id': 'routes_ffbbbe58', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3af7723b', 'facts': {'origin_name': '白洋桥青潮园 chill land', 'destination_name': '星光大道', 'duration_min': 308, 'distance_km': 23.08, 'mode': 'walk', 'walking_distance_km': 23.08, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '银龙坞山庄', 'dimension': 'accessibility', 'source_artifact_id': 'routes_a50c6094', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3af7723b', 'facts': {'origin_name': '银龙坞山庄', 'destination_name': '星光大道', 'duration_min': 1711, 'distance_km': 128.34, 'mode': 'walk', 'walking_distance_km': 128.34, 'estimated_cost': 0.0, 'source': 'amap_fallback_estimate', 'evidence_status': 'haversine_estimate'}}, {'candidate': '茶浪烤全羊+私房菜(杭州龙坞店)', 'dimension': 'accessibility', 'source_artifact_id': 'routes_a7b0d020', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3af7723b', 'facts': {'origin_name': '茶浪烤全羊+私房菜(杭州龙坞店)', 'destination_name': '星光大道', 'duration_min': 276, 'distance_km': 20.69, 'mode': 'walk', 'walking_distance_km': 20.69, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '鱼町刺身(西子铭苑南区店)', 'dimension': 'accessibility', 'source_artifact_id': 'routes_02c75905', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3af7723b', 'facts': {'origin_name': '鱼町刺身(西子铭苑南区店)', 'destination_name': '星光大道', 'duration_min': 156, 'distance_km': 11.73, 'mode': 'walk', 'walking_distance_km': 11.73, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '海煮叹鲜(赛银国际商务中心1幢店)', 'dimension': 'accessibility', 'source_artifact_id': 'routes_788b4b8c', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3af7723b', 'facts': {'origin_name': '海煮叹鲜(赛银国际商务中心1幢店)', 'destination_name': '星光大道', 'duration_min': 349, 'distance_km': 26.18, 'mode': 'walk', 'walking_distance_km': 26.18, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '白洋桥青潮园 chill land', 'dimension': 'accessibility_needs', 'source_artifact_id': 'routes_ffbbbe58', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3af7723b', 'facts': {'origin_name': '白洋桥青潮园 chill land', 'destination_name': '星光大道', 'duration_min': 308, 'distance_km': 23.08, 'mode': 'walk', 'walking_distance_km': 23.08, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '银龙坞山庄', 'dimension': 'accessibility_needs', 'source_artifact_id': 'routes_a50c6094', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3af7723b', 'facts': {'origin_name': '银龙坞山庄', 'destination_name': '星光大道', 'duration_min': 1711, 'distance_km': 128.34, 'mode': 'walk', 'walking_distance_km': 128.34, 'estimated_cost': 0.0, 'source': 'amap_fallback_estimate', 'evidence_status': 'haversine_estimate'}}, {'candidate': '茶浪烤全羊+私房菜(杭州龙坞店)', 'dimension': 'accessibility_needs', 'source_artifact_id': 'routes_a7b0d020', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3af7723b', 'facts': {'origin_name': '茶浪烤全羊+私房菜(杭州龙坞店)', 'destination_name': '星光大道', 'duration_min': 276, 'distance_km': 20.69, 'mode': 'walk', 'walking_distance_km': 20.69, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '鱼町刺身(西子铭苑南区店)', 'dimension': 'accessibility_needs', 'source_artifact_id': 'routes_02c75905', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3af7723b', 'facts': {'origin_name': '鱼町刺身(西子铭苑南区店)', 'destination_name': '星光大道', 'duration_min': 156, 'distance_km': 11.73, 'mode': 'walk', 'walking_distance_km': 11.73, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '海煮叹鲜(赛银国际商务中心1幢店)', 'dimension': 'accessibility_needs', 'source_artifact_id': 'routes_788b4b8c', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-3af7723b', 'facts': {'origin_name': '海煮叹鲜(赛银国际商务中心1幢店)', 'destination_name': '星光大道', 'duration_min': 349, 'distance_km': 26.18, 'mode': 'walk', 'walking_distance_km': 26.18, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}]
+> - limitations：[]
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`candidate_comparison`
+- Actual artifact：`candidate_comparison`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_016 · 成都固定预约
 
@@ -525,42 +563,42 @@
 
 ### 回答
 
-**第 1 天｜文化体验**
-- 09:30–11:00　成都杜甫草堂博物馆（博物馆）
-- 11:45–12:45　三缺一·成都味川菜(科华路店)（餐饮）
-  - 交通：从上一站乘公共交通，约 4.95 公里，约 17 分钟
-- 14:30–16:30　武侯祠（文化体验）
-  - 交通：从上一站乘公共交通，约 2.93 公里，约 10 分钟
+**第 1 天｜城市经典体验**
+- 09:30–11:15　温江文庙（景点）
+- 14:30–17:00　国色天乡乐园（景点）
+  - 交通：从上一站乘公共交通，约 2.94 公里，约 22 分钟
 
 **第 2 天｜文化体验**
 - 15:00–17:00　三星堆博物馆（博物馆）
 
-**第 3 天｜本地美食**
-- 09:30–11:00　宽窄巷子景区（街区/购物）
-- 11:30–12:30　许家菜(望江店)（餐饮）
-  - 交通：从上一站乘公共交通，约 4.58 公里，约 15 分钟
-- 14:30–16:30　太古里（街区/购物）
-  - 交通：从上一站乘公共交通，约 1.89 公里，约 6 分钟
+**第 3 天｜城市经典体验**
+- 09:30–12:00　成都大熊猫繁育研究基地（景点）
+- 14:30–17:00　东郊记忆（景点）
+  - 交通：从上一站乘公共交通，约 8.12 公里，约 39 分钟
 
 
-**住宿**：SFEEL设计师酒店(成都太古里春熙路步行街店)，城守街73号5楼(春熙路地铁站D口步行290米)
+**住宿**：成都熙和驿站酒店公寓，锦江区春熙路正科甲巷48号科甲大厦8层10号
 
 ### 评分
 
-- Harness strict：**失败**
+- Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
-- Harness 主要问题：第2天只有1个安排，行程明显不完整。；第2天只有1个非餐饮活动，多日行程的下午时段明显不完整。；第2天没有有证据支持的用餐安排。
+- 可选改进：第2天仅有固定活动/自由时段。
 
 **LLM-as-Judge**
 
-- 总分：**64/100**
+- 总分：**96/100**
 - 结论：**未通过**
-- 分项：时间安排 8｜路线 10｜约束满足 20｜个性化 10｜完整性 5｜丰富度 8｜清晰度 3
-- 主要问题：
-- 回答 明确指出'第 2 天行程仅包含三星堆博物馆固定时段（15:00-17:00），但未安排从春熙路到三星堆的交通时间...15:00 到达需至少 13:00 出发，但当天无任何前置安排或交通预留，存在硬性时间冲突风险'。每日行程[1].stops 显示活动开始时间为 15:00，无交通缓冲。
-- 每日行程[1].stops 仅包含 1 个景点，无餐饮安排。回答 指出'第 2 天没有任何餐饮安排...行程完整性不足'。
-- 回答 开头称'当前方案尚不可交付，仅供审阅'，结尾却称'成都 3 天标准行程草案 已排好'，前后状态描述矛盾，误导用户。
+- Rubric：`full_itinerary`
+- 分项：时间安排 18｜路线 20｜约束满足 20｜个性化 13｜完整性 10｜丰富度 10｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- 无
 
 ## dev_017 · 南京返程约束
 
@@ -571,27 +609,33 @@
 ### 回答
 
 **第 1 天｜文化体验**
-- 09:30–11:30　南京博物院（博物馆）
-- 14:30–16:30　中山陵景区（景点）
-  - 交通：从上一站乘公共交通，约 6.04 公里，约 54 分钟
+- 09:00–11:00　南京博物院（博物馆）
+- 12:00–14:00　中山陵景区（景点）
+  - 交通：从上一站乘公共交通，约 3.13 公里，约 22 分钟
+- 15:00–17:30　南京夫子庙（景点）
+  - 交通：从上一站乘公共交通，约 7.21 公里，约 36 分钟
 
 
 ### 评分
 
-- Harness strict：**失败**
+- Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
-- 行程检查：**失败**
-- Harness 主要问题：第1天没有有证据支持的用餐安排。；行程没有包含必去地点：夫子庙。
+- 行程检查：**通过**
 
 **LLM-as-Judge**
 
-- 总分：**49/100**
+- 总分：**83/100**
 - 结论：**未通过**
-- 分项：时间安排 12｜路线 8｜约束满足 5｜个性化 10｜完整性 5｜丰富度 5｜清晰度 4
-- 主要问题：
-- 最终记录中的must_visit 包含'夫子庙'，用户要求中的candidate_attractions 包含'夫子庙'，但 每日行程[0].stops 中未包含该景点，且未提供省略的充分理由或替代方案。
-- 回答 字段明确声明'当前方案尚不可交付，仅供审阅'，表明生成模型自身判定计划未完成。
-- 每日行程[0].stops[0] (南京博物院) 的 route_from_previous 为 null，且 工具结果中的routes 中缺乏从 origin (南京南站) 到第一站点的交通路线证据。
+- Rubric：`full_itinerary`
+- 分项：时间安排 12｜路线 16｜约束满足 18｜个性化 13｜完整性 9｜丰富度 10｜清晰度 5
+- 主要失败原因（error/critical）：
+- 行程中【午餐时段】设定为 12:00-13:00，但【中山陵景区】游览开始时间也设定为 12:00，时间完全冲突，用户无法同时用餐和游览。
+- 可选改进（warning）：
+- return_plan.terminal_transfer.origin_name 显示为'中山陵景区'，但实际当日最后一站 stops[-1] 为'南京夫子庙'，且 required_route_anchors 中返程起点已正确绑定为夫子庙，存在元数据不一致。
+- final_profile 中 transport_mode 为'public_transport'，但 required_route_anchors 中第一程（南京南站->南京博物院）模式为'taxi'，与档案偏好不符。
 
 ## dev_018 · 重庆低换乘
 
@@ -601,41 +645,43 @@
 
 ### 回答
 
-**第 1 天｜文化体验**
-- 09:30–11:15　李子坝单轨穿楼观景平台（景点）
-- 14:30–16:00　重庆中国三峡博物馆（博物馆）
-  - 交通：从上一站乘公共交通，约 2.87 公里，约 18 分钟
-- 16:30–18:00　北仓文创街区（街区/购物）
-  - 交通：从上一站乘公共交通，约 2.16 公里，约 7 分钟
+**第 1 天｜城市经典体验**
+- 09:00–10:30　洪崖洞异国美食街（街区/购物）
+- 12:00–13:45　李子坝单轨穿楼观景平台（景点）
+  - 交通：从上一站乘公共交通，约 5.54 公里，约 33 分钟
+- 15:00–16:45　李子坝石碉堡遗址（景点）
+  - 交通：从上一站乘walk，约 0.43 公里，约 13 分钟
 
 **第 2 天｜城市经典体验**
-- 09:30–11:15　洪崖洞高空观光（景点）
-- 14:30–16:15　洪崖洞民俗风貌区（景点）
-  - 交通：从上一站乘公共交通，约 0.11 公里，约 5 分钟
-- 16:45–18:00　地标时代购物广场（街区/购物）
-  - 交通：从上一站乘公共交通，约 0.82 公里，约 5 分钟
+- 12:30–14:30　洪崖洞洞见山城（景点）
+- 15:00–16:45　洪崖洞高空观光（景点）
+  - 交通：从上一站乘walk，约 0.22 公里，约 13 分钟
+- 17:15–18:45　重庆解放碑-洪崖洞街区（景点）
+  - 交通：从上一站乘walk，约 0.06 公里，约 12 分钟
 
 
-**住宿**：重庆北欧素简民宿(解放碑洪崖洞店)，合景·聚融广场-二单元(民生路1号)(较场口地铁站7号口旁)
-
-**预算**：预计 ¥1965.0
+**住宿**：新华酒店(解放碑店)，渝中区青年路9号(临江门地铁站1号口步行130米)
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
-- Harness 主要问题：第1天没有有证据支持的用餐安排。；第2天没有有证据支持的用餐安排。
+- 可选改进：行程中 `scenic` 类型占比过高，体验可能偏单一。
 
 **LLM-as-Judge**
 
-- 总分：**75/100**
-- 结论：**人工复核为 Judge 误判：110 米路段的交通标签有瑕疵，但不足以判整份行程失败。**
-- 分项：时间安排 16｜路线 12｜约束满足 15｜个性化 11｜完整性 7｜丰富度 9｜清晰度 5
-- 主要问题：
-- Day 2 Stop 1 (Hongya High) to Stop 2 (Hongya Folk) route labeled as 'public_transport' with distance 0.11km; this distance is walkable and public transport is not feasible.
-- User requested to avoid 'continuous steep slopes and long stairs' for parents, but Hongya Cave (known for complex terrain) is included without specific elevator/accessibility route notes.
-- Final answer explicitly states 'Day 1 no evidence-supported meal arrangement; Day 2 no evidence-supported meal arrangement'; 工具结果中的restaurants is empty.
+- 总分：**83/100**
+- 结论：**通过**
+- Rubric：`full_itinerary`
+- 分项：时间安排 18｜路线 15｜约束满足 16｜个性化 12｜完整性 9｜丰富度 8｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- mobility_plan.venue_internal_access 所有景点 evidence_status 均为 'unverified'，且要求 'verify_step_free_access_before_departure'。对于带父母且明确约束 '避免长楼梯/连续爬坡' 的行程，未验证的无障碍证据存在较高风险。
 
 ## dev_019 · 长沙剩余预算
 
@@ -645,19 +691,40 @@
 
 ### 回答
 
-> 当前方案尚不可交付，仅供审阅。未解决：未检索到必去地点：湖南博物院。
->
-> 当前缺少安全规划所需的关键证据：景点候选、住宿证据。未强行启动 Planner，也未生成行程。
+**第 1 天｜文化体验**
+- 09:00–11:00　湖南省博物馆（博物馆）
+- 14:30–16:30　湖南省博物馆-特展一厅（景点）
+  - 交通：从上一站乘walk，约 0.02 公里，约 12 分钟
+
+**第 2 天｜城市经典体验**
+- 09:00–11:30　橘子洲风景名胜区（景点）
+- 14:30–17:00　岳麓山风景名胜区（景点）
+  - 交通：从上一站乘公共交通，约 3.01 公里，约 22 分钟
+
+
+**住宿**：未选定
+
+**预算**：预计 ¥660.0，预算上限 ¥1200.0，预计不超预算
 
 ### 评分
 
-- Harness strict：**失败**
-- 硬约束检查：**失败**
-- 行程检查：**不适用**
+- Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
+- 硬约束检查：**通过**
+- 行程检查：**通过**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 总分：**90/100**
+- 结论：**通过**
+- Rubric：`full_itinerary`
+- 分项：时间安排 15｜路线 18｜约束满足 20｜个性化 14｜完整性 9｜丰富度 9｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- 湖南省博物馆 opening_hours 显示周一全天不开放，但 final_profile.start_date 为 null，无法核验行程是否避开周一。
 
 ## dev_020 · 广州高温午休
 
@@ -668,26 +735,30 @@
 ### 回答
 
 **第 1 天｜城市经典体验**
-- 09:30–12:00　陈家祠堂（景点）
-- 14:30–17:00　广州塔（景点）
-  - 交通：从上一站乘公共交通，约 11.14 公里，约 34 分钟
+- 09:00–11:30　陈家祠堂（景点）
+- 18:00–20:30　广州塔（景点）
+  - 交通：从上一站乘公共交通，约 11.34 公里，约 35 分钟
 
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
-- Harness 主要问题：第1天没有有证据支持的用餐安排。
 
 **LLM-as-Judge**
 
-- 总分：**78/100**
+- 总分：**83/100**
 - 结论：**通过**
-- 分项：时间安排 15｜路线 18｜约束满足 19｜个性化 10｜完整性 5｜丰富度 6｜清晰度 5
-- 主要问题：
-- 回答 明确指出“第 1 天没有有证据支持的用餐安排”，且行程 12:00-14:30 存在 2.5 小时空白未安排午餐。
-- 陈家祠堂 opening_hours 显示“周二 全天关闭”，工具结果 未提供 2026-08-22 的星期几验证，存在闭馆风险。
+- Rubric：`full_itinerary`
+- 分项：时间安排 16｜路线 14｜约束满足 20｜个性化 12｜完整性 8｜丰富度 8｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- itinerary.days[0].stops[1].route_from_previous claims 11.34km/35min public transport between Chen Clan and Canton Tower, but tool_facts.routes list only contains micro-walking segments around Chen Clan and lacks the main inter-POI route query result.
 
 ## dev_021 · 老人约束保留预算
 
@@ -699,19 +770,47 @@
 
 ### 回答
 
-> 当前方案尚不可交付，仅供审阅。未解决：交付 Gate 未通过，仍有未解决问题。
->
-> 当前缺少安全规划所需的关键证据：住宿证据。未强行启动 Planner，也未生成行程。
+**第 1 天｜城市经典体验**
+- 09:30–12:00　灵隐寺（景点）
+- 14:30–17:00　雷峰塔景区（景点）
+  - 交通：从上一站乘公共交通，约 4.69 公里，约 28 分钟
+
+**第 2 天｜城市经典体验**
+- 09:30–11:15　拱宸桥（景点）
+- 14:30–16:15　岳王庙-岳墓栖霞（景点）
+  - 交通：从上一站乘公共交通，约 7.34 公里，约 36 分钟
+
+**第 3 天｜城市经典体验**
+- 09:30–11:30　跨湖桥景区（景点）
+- 14:30–16:15　鼓楼（景点）
+  - 交通：从上一站乘公共交通，约 11.82 公里，约 51 分钟
+
+
+**住宿**：杭州漳州忆江南客栈(虎跑路分店)，西湖区虎跑路40号杭州动物园内(东侧)
+
+**预算**：预计 ¥1620.0，预算上限 ¥3000.0，预计不超预算
 
 ### 评分
 
-- Harness strict：**失败**
+- Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
-- 行程检查：**不适用**
+- 行程检查：**通过**
+- 可选改进：行程中 `scenic` 类型占比过高，体验可能偏单一。
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 总分：**73/100**
+- 结论：**通过**
+- Rubric：`full_itinerary`
+- 分项：时间安排 17｜路线 14｜约束满足 13｜个性化 10｜完整性 9｜丰富度 5｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- mobility_plan 中 known_walking_km 均为 0.0，unknown_walking_legs 标记为'上一站→下一站'，仅依赖 taxi_fallback_required 策略，未提供实际步行距离核算证据。72 岁老人每日 6km 步行上限无法通过现有数据验证。
+- 第 3 天跨湖桥景区距酒店 11.64km（单程），鼓楼返程 4.43km，对于 72 岁老人而言单日交通跨度较大，虽预算允许出租车 fallback，但未评估老人体力承受度。
 
 ## dev_022 · 替换而非追加
 
@@ -724,18 +823,16 @@
 ### 回答
 
 **第 1 天｜文化体验**
-- 09:30–11:00　苏州博物馆西馆（博物馆）
-- 14:30–16:00　苏州革命博物馆（博物馆）
-  - 交通：从上一站乘公共交通，约 3.23 公里，约 11 分钟
-- 16:45–19:15　拙政园（景点）
-  - 交通：从上一站乘公共交通，约 5.49 公里，约 18 分钟
+- 10:00–12:00　山塘街白居易码头游船（景点）
+- 13:00–14:30　苏州革命博物馆（博物馆）
+  - 交通：从上一站乘公共交通，约 2.99 公里，约 22 分钟
+- 15:15–16:45　海市山塘（街区/购物）
+  - 交通：从上一站乘公共交通，约 2.95 公里，约 22 分钟
 
 **第 2 天｜文化体验**
-- 09:30–11:00　石路步行街（街区/购物）
-- 11:30–13:00　苏州博物馆(本馆)（博物馆）
-  - 交通：从上一站乘公共交通，约 2.74 公里，约 9 分钟
-- 14:30–16:30　山塘街白居易码头游船（景点）
-  - 交通：从上一站乘公共交通，约 2.41 公里，约 8 分钟
+- 09:00–10:30　苏州博物馆(本馆)（博物馆）
+- 12:00–14:30　拙政园（景点）
+  - 交通：从上一站乘walk，约 0.19 公里，约 13 分钟
 
 
 **住宿**：未选定
@@ -743,17 +840,22 @@
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
-- Harness 主要问题：第1天没有有证据支持的用餐安排。；第2天没有有证据支持的用餐安排。
 
 **LLM-as-Judge**
 
-- 总分：**85/100**
+- 总分：**88/100**
 - 结论：**通过**
-- 分项：时间安排 14｜路线 18｜约束满足 20｜个性化 14｜完整性 5｜丰富度 9｜清晰度 5
-- 主要问题：
-- 第 1 天拙政园安排 16:45 开始，时长 150 分钟（至 19:15）。根据工具事实，拙政园 3-10 月 17:00 停止入园，17:30 闭园；夜场 18:30 开始。若按日场，游客仅能游览 45 分钟而非计划的 150 分钟；若按夜场，16:45 到达需等待近 2 小时。行程时间与景点开放时间存在明显冲突。
+- Rubric：`full_itinerary`
+- 分项：时间安排 18｜路线 14｜约束满足 20｜个性化 14｜完整性 8｜丰富度 9｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- Day 1 route involves backtracking: Starts at Shantang Street (Northwest), travels to Suzhou Revolution Museum (Southeast, ~3km away), then returns to Haishi Shantang (Northwest) near the starting point. This wastes travel time.
 
 ## dev_023 · 新增固定预约
 
@@ -765,37 +867,49 @@
 
 ### 回答
 
-**第 1 天｜自然风光与本地美食**
+**第 1 天｜城市经典体验**
 - 09:30–11:00　西安城市运动公园（景点）
-- 12:00–13:00　粉巷13号餐厅(钟楼店)（餐饮）
-  - 交通：从上一站乘公共交通，约 9.9 公里，约 33 分钟
 - 14:30–16:00　回民街（街区/购物）
-  - 交通：从上一站乘公共交通，约 1.3 公里，约 5 分钟
+  - 交通：从上一站乘公共交通，约 8.9 公里，约 42 分钟
+- 17:00–18:30　长安十二时辰主题街区（街区/购物）
+  - 交通：从上一站乘公共交通，约 6.45 公里，约 34 分钟
 
 **第 2 天｜文化体验**
+- 09:30–11:00　西安碑林博物馆（博物馆）
 - 14:30–16:30　陕西历史博物馆（博物馆）
-- 18:00–19:00　虎子水盆羊肉(翠华路总店)（餐饮）
-  - 交通：从上一站乘公共交通，约 0.49 公里，约 5 分钟
+  - 交通：从上一站乘公共交通，约 5.1 公里，约 51 分钟
+
+**第 3 天｜文化体验**
+- 09:30–11:00　西安半坡博物馆（博物馆）
+- 14:30–16:00　曲江海洋极地公园（景点）
+  - 交通：从上一站乘公共交通，约 9.27 公里，约 43 分钟
+- 16:45–18:15　西安小寨历史博物馆（博物馆）
+  - 交通：从上一站乘公共交通，约 2.49 公里，约 20 分钟
 
 
-**住宿**：西安钟楼森德酒店，东大街619号东翼楼1-5层
+**住宿**：西安钟鼓楼回民街静宜家庭公寓，碑林区竹笆市街49号附近南院门钟楼小区
 
 ### 评分
 
-- Harness strict：**通过**
+- Harness strict：**失败**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`partial_itinerary`
+- Artifact type match：**失败**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
-- Harness 主要问题：第2天只有1个非餐饮活动，多日行程的下午时段明显不完整。；用户偏好 `历史景点` 没有在当前行程中得到明显覆盖。
+- 可选改进：用户偏好 `历史景点` 没有在当前行程中得到明显覆盖。
 
 **LLM-as-Judge**
 
-- 总分：**54/100**
-- 结论：**未通过**
-- 分项：时间安排 10｜路线 14｜约束满足 8｜个性化 5｜完整性 4｜丰富度 8｜清晰度 5
-- 主要问题：
-- 用户请求日期为 2026-09-14 至 2026-09-16（共 3 天 2 晚），但行程仅规划 2 天（day_index 1-2），住宿仅 1 晚（nights: 1），缺失第 3 天行程及第 2 晚住宿。
-- 用户明确要求“想看主要历史景点”，但第 1 天核心景点安排为“西安城市运动公园”（scenic/自然风光），且 工具结果 中存在的“西安钟楼”（历史地标）未被纳入行程，导致历史偏好覆盖不足。
-- 第 2 天上午时段（09:00-14:30）完全空白，仅安排下午固定博物馆行程及晚餐，日间利用率低。
+- 总分：**74/100**
+- 结论：**通过**
+- Rubric：`partial_itinerary`
+- 分项：时间安排 18｜路线 14｜约束满足 16｜个性化 7｜完整性 8｜丰富度 6｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- 用户明确要求'想看主要历史景点'，但行程第 1 天安排的'西安城市运动公园'、'回民街'、'长安十二时辰主题街区'均非核心历史景点（类别为 scenic/shopping），与用户核心兴趣偏离。
+- final_answer 中明确声明'需复核：用户偏好 `历史景点` 没有在当前行程中得到明显覆盖'，系统自认未满足兴趣约束。
 
 ## dev_024 · 取消自驾
 
@@ -807,19 +921,51 @@
 
 ### 回答
 
-> 当前方案尚不可交付，仅供审阅。未解决：交付 Gate 未通过，仍有未解决问题。
->
-> 当前缺少安全规划所需的关键证据：住宿证据。未强行启动 Planner，也未生成行程。
+**第 1 天｜城市经典体验**
+- 09:30–11:15　飞翔的鸥（景点）
+- 14:30–16:00　栈桥景区（景点）
+  - 交通：从上一站乘公共交通，约 7.28 公里，约 36 分钟
+- 16:30–18:15　美国领事馆旧址（景点）
+  - 交通：从上一站乘公共交通，约 0.82 公里，约 15 分钟
+
+**第 2 天｜城市经典体验**
+- 09:30–11:30　青岛湛山寺（景点）
+- 14:30–16:00　青岛太平角公园（景点）
+  - 交通：从上一站乘公共交通，约 1.38 公里，约 17 分钟
+- 16:45–18:30　情人坝（景点）
+  - 交通：从上一站乘公共交通，约 2.7 公里，约 21 分钟
+
+**第 3 天｜城市经典体验**
+- 09:30–12:00　中国雕塑院·青岛雕塑园（景点）
+- 14:30–16:00　燕儿岛智慧公园（景点）
+  - 交通：从上一站乘公共交通，约 5.17 公里，约 29 分钟
+- 16:45–19:15　青岛奥帆海洋文化旅游区（景点）
+  - 交通：从上一站乘公共交通，约 1.48 公里，约 17 分钟
+
+
+**住宿**：如家酒店(青岛栈桥中山路地铁站店)，市北区市南区中山路149号(中山路地铁站D口步行120米)
 
 ### 评分
 
-- Harness strict：**失败**
+- Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
-- 行程检查：**不适用**
+- 行程检查：**通过**
+- 可选改进：行程中 `scenic` 类型占比过高，体验可能偏单一。
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 总分：**86/100**
+- 结论：**通过**
+- Rubric：`full_itinerary`
+- 分项：时间安排 15｜路线 18｜约束满足 20｜个性化 12｜完整性 10｜丰富度 6｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- 每日上午活动结束与下午活动开始之间存在 1.5-3 小时未安排时段（如第 1 天 11:15-14:30），仅午餐占用 1 小时，剩余时间未说明用途，导致行程效率偏低。
+- 所有行程站点（stops）类别均为'scenic'（景点），缺乏餐饮、购物或文化体验等多样化活动，系统最终答案也提示'体验可能偏单一'。
 
 ## dev_025 · 预算下调
 
@@ -831,47 +977,52 @@
 
 ### 回答
 
-**第 1 天｜自然风光与本地美食**
-- 09:30–11:00　鼓浪屿钢琴博物馆（博物馆）
-- 11:30–12:30　林四喜·闽南传家菜(鼓浪屿店)（餐饮）
-  - 交通：从上一站乘公共交通，约 0.75 公里，约 5 分钟
-- 14:30–16:15　大德记沙滩（景点）
-  - 交通：从上一站乘公共交通，约 0.69 公里，约 5 分钟
+**第 1 天｜城市经典体验**
+- 09:00–11:30　鼓浪屿风景名胜区（景点）
+- 13:00–14:45　鳌冠湾梦幻黄金海岸沙滩（景点）
+  - 交通：从上一站乘公共交通，约 9.23 公里，约 43 分钟
+- 15:45–17:15　海湾公园（景点）
+  - 交通：从上一站乘公共交通，约 6.35 公里，约 33 分钟
 
-**第 2 天｜自然风光与本地美食**
-- 09:30–11:00　海湾公园（景点）
-- 11:30–12:30　鑫坞堂 海鲜热炒(中山路总店)（餐饮）
-  - 交通：从上一站乘公共交通，约 2.1 公里，约 7 分钟
-- 14:30–15:45　海边极光珍珠馆（街区/购物）
-  - 交通：从上一站乘公共交通，约 2.35 公里，约 8 分钟
+**第 2 天｜城市经典体验**
+- 09:30–11:15　彩虹沙滩（景点）
+- 14:30–16:15　五缘湾沙滩（景点）
+  - 交通：从上一站乘公共交通，约 11.12 公里，约 49 分钟
 
-**第 3 天｜自然风光与本地美食**
-- 09:30–11:15　黄厝海滩（景点）
-- 12:30–13:30　六年私厨（餐饮）
-  - 交通：从上一站乘公共交通，约 9.94 公里，约 33 分钟
-- 14:30–16:15　环岛海滨浴场（景点）
-  - 交通：从上一站乘公共交通，约 6.51 公里，约 22 分钟
+**第 3 天｜城市经典体验**
+- 09:30–11:15　会展中心沙滩（景点）
+- 14:30–16:15　黄厝海滩妈祖铜像（景点）
+  - 交通：从上一站乘公共交通，约 1.63 公里，约 17 分钟
+- 17:15–18:45　厦门白鹭洲公园（景点）
+  - 交通：从上一站乘公共交通，约 8.7 公里，约 41 分钟
 
 
-**住宿**：未选定
+**住宿**：米朵轻居(翔安国际机场店)，翔安区环嶝南路双沪二里250号
 
-**预算**：预计 ¥1550.0，预算上限 ¥3500.0，预计不超预算
+**预算**：预计 ¥1620.0，预算上限 ¥3500.0，预计不超预算
 
 ### 评分
 
-- Harness strict：**失败**
+- Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
+- 可选改进：行程中 `scenic` 类型占比过高，体验可能偏单一。
 
 **LLM-as-Judge**
 
-- 总分：**63/100**
+- 总分：**68/100**
 - 结论：**未通过**
-- 分项：时间安排 16｜路线 12｜约束满足 8｜个性化 13｜完整性 2｜丰富度 8｜清晰度 4
-- 主要问题：
-- 工具结果中的hotels is empty [], but 住宿方案.required is true and 住宿方案.status is 'evidence_unavailable'.
-- 回答 explicitly states '当前方案尚不可交付' (Current plan is not deliverable) due to unresolved budget and accommodation verification.
-- 回答 warns about 9.94km distance with only public_transport estimate; 工具结果中的routes lacks specific details for this leg.
+- Rubric：`full_itinerary`
+- 分项：时间安排 12｜路线 10｜约束满足 20｜个性化 10｜完整性 7｜丰富度 5｜清晰度 4
+- 主要失败原因（error/critical）：
+- 鼓浪屿安排时长仅 150 分钟（09:00-11:30），对于必须打卡的岛屿景区，未包含往返轮渡排队及候船时间，实际游览时间严重不足，难以满足'必须去'的体验预期。
+- 可选改进（warning）：
+- 第一天路线存在明显折返：鼓浪屿（思明）-> 鳌冠湾（集美/翔安交界）-> 海湾公园（思明）。海湾公园紧邻轮渡码头，应与鼓浪屿安排在一起，中间插入鳌冠湾导致无效路程增加。
+- 酒店位于翔安机场附近，距主要活动区平均单程 21.55 公里，每日通勤耗时约 3-4 小时。虽符合'可降档'约束，但严重压缩有效游览时间并增加疲劳度，影响整体行程质量。
+- 第一天 09:00 开始游览鼓浪屿，酒店出发需 106 分钟，06:59 出发抵达码头约 08:45，预留候船及登船时间仅 15 分钟，风险极高，一旦延误将破坏首日安排。
 
 ## dev_026 · POI空结果扩大搜索
 
@@ -881,18 +1032,27 @@
 
 ### 回答
 
-> 为确保我能给出可执行方案，请先补齐：destination。
-> 为了给你规划合适的行程，你想去哪个城市或地区？
+> Artifact：candidate_comparison
+> - subject：{'destination_city': None, 'target_anchor': None, 'accessibility_mode': 'unanchored'}
+> - candidates：[{'name': '小山村饭店'}, {'name': '正宗本地人斌斌农家菜'}, {'name': '陕西面馆(东钱湖店)'}]
+> - comparison_dimensions：['cost']
+> - recommendation：{'candidate': '陕西面馆(东钱湖店)', 'decision': '基于 1 个完整可比维度有限推荐 陕西面馆(东钱湖店)', 'dimensions_used': ['cost'], 'comparable_metrics': ['average_cost'], 'basis': [{'dimension': 'cost', 'candidate': '陕西面馆(东钱湖店)', 'metric': 'average_cost', 'value': 17.0, 'source_artifact_id': 'restaurants_b04fb6b0', 'source_artifact_ids': ['restaurants_b04fb6b0']}], 'source_artifact_ids': ['restaurants_b04fb6b0']}
+> - evidence：[{'candidate': '小山村饭店', 'dimension': 'cost', 'source_artifact_id': 'restaurants_b04fb6b0', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-a203f41c', 'facts': {'entities': [{'name': '小山村饭店', 'canonical_name': '小山村饭店', 'address': '鄞州区东钱湖旅游度假区环湖东路88号', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.5, 'popularity': 1.0, 'price_level': 'unknown', 'average_cost': 82.0, 'source': 'amap'}], 'area': '东钱湖'}}, {'candidate': '正宗本地人斌斌农家菜', 'dimension': 'cost', 'source_artifact_id': 'restaurants_b04fb6b0', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-a203f41c', 'facts': {'entities': [{'name': '正宗本地人斌斌农家菜', 'canonical_name': '正宗本地人斌斌农家菜', 'address': '鄞州区东钱湖旅游度假区韩岭车站(环湖南路5号)', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.5, 'popularity': 0.91, 'price_level': 'unknown', 'average_cost': 86.0, 'source': 'amap'}], 'area': '东钱湖'}}, {'candidate': '陕西面馆(东钱湖店)', 'dimension': 'cost', 'source_artifact_id': 'restaurants_b04fb6b0', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-a203f41c', 'facts': {'entities': [{'name': '陕西面馆(东钱湖店)', 'canonical_name': '陕西面馆(东钱湖店)', 'address': '鄞州区东钱湖旅游度假区东街8号', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.3, 'popularity': 0.88, 'price_level': 'unknown', 'average_cost': 17.0, 'source': 'amap'}], 'area': '东钱湖'}}]
+> - limitations：[]
 
 ### 评分
 
-- Harness strict：**失败**
+- Harness strict：**通过**
+- Expected artifact：`candidate_comparison`
+- Actual artifact：`candidate_comparison`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_027 · 路线超时降级
 
@@ -902,19 +1062,24 @@
 
 ### 回答
 
-> 已按工具证据整理如下：
-> - 路线：虹桥综合交通枢纽 → 上海迪士尼度假区，taxi，约 68 分钟 / 43.55 公里（来源：amap）
-> - 路线：虹桥综合交通枢纽 → 上海迪士尼度假区，public_transport，约 75 分钟 / 40.63 公里（来源：amap）
+> Artifact：route_plan
+> - subject：None
+> - evidence：[{'artifact_id': 'candidates_2c9d30d7', 'kind': 'candidates'}, {'artifact_id': 'candidates_e16e96a2', 'kind': 'candidates'}, {'artifact_id': 'routes_2c2fe107', 'kind': 'routes'}, {'artifact_id': 'routes_f7e59631', 'kind': 'routes'}]
+> - limitations：[]
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`route_plan`
+- Actual artifact：`route_plan`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_028 · 距离字段缺失
 
@@ -924,26 +1089,27 @@
 
 ### 回答
 
-> 已按工具证据整理如下：
-> - 路线：北京商务中心区(北京CBD) → 胡大饭馆24h(簋街总店)，walk，约 87 分钟 / 6.54 公里（来源：amap）
-> - 路线：北京商务中心区(北京CBD) → 胡大饭馆(簋街三店)，walk，约 90 分钟 / 6.72 公里（来源：amap）
-> - 路线：北京商务中心区(北京CBD) → 南门涮肉(天坛南门店)，walk，约 121 分钟 / 9.08 公里（来源：amap）
-> - 路线：北京商务中心区(北京CBD) → 牛街清真满恒記(平安里西大街店)，walk，约 135 分钟 / 10.16 公里（来源：amap）
-> - 候选：胡大饭馆24h(簋街总店)（food；评分 4.9；营业/开放时间 周一至周日 00:00-24:00；人均约 152.0 元；地址 东直门内大街233号；来源 amap）
-> - 候选：胡大饭馆(簋街三店)（food；评分 4.9；营业/开放时间 周一至周四,周日 11:00-01:00；周五至周六 11:00-02:00 2026-06-18至2026-06-18 11:00-02:00；2026-06-19至2026-06-21 10:00-02:00；人均约 137.0 元；地址 东直门内大街284号；来源 amap）
-> - 候选：南门涮肉(天坛南门店)（food；评分 4.8；营业/开放时间 周一至周日 10:30-22:30；人均约 102.0 元；地址 永定门东街东里13-1-2；来源 amap）
-> - 候选：牛街清真满恒記(平安里西大街店)（food；评分 4.8；营业/开放时间 周一至周日 11:00-24:00；人均约 75.0 元；地址 北京城区平安里西大街14号；来源 amap）
-> - 候选：故宫博物院（culture；评分 4.9；营业/开放时间 08:30-17:00；来源 seed）
+> Artifact：candidate_comparison
+> - subject：{'destination_city': '北京', 'target_anchor': '国贸', 'accessibility_mode': 'anchored'}
+> - candidates：[{'name': '晨记烧烤'}, {'name': '大红果(顺义东海洪店)'}, {'name': '紫雲軒 GREEN T.HOUSE'}, {'name': '柳沟68号院·甄选豆腐宴'}, {'name': '鱼师傅·怀柔土菜'}]
+> - comparison_dimensions：['accessibility', 'cost']
+> - recommendation：{'candidate': '晨记烧烤', 'decision': '基于 2 个完整可比维度有限推荐 晨记烧烤', 'dimensions_used': ['accessibility', 'cost'], 'comparable_metrics': ['duration_min', 'average_cost'], 'basis': [{'dimension': 'accessibility', 'candidate': '晨记烧烤', 'metric': 'duration_min', 'value': 95.0, 'source_artifact_id': 'routes_1dde19ea', 'source_artifact_ids': ['routes_1dde19ea']}, {'dimension': 'cost', 'candidate': '晨记烧烤', 'metric': 'average_cost', 'value': 27.0, 'source_artifact_id': 'restaurants_5c310f70', 'source_artifact_ids': ['restaurants_5c310f70']}], 'source_artifact_ids': ['routes_1dde19ea', 'routes_fa5a9fbb', 'routes_9d2f1dec', 'routes_9078c2cd', 'routes_cec4dd67', 'restaurants_5c310f70']}
+> - evidence：[{'candidate': '晨记烧烤', 'dimension': 'cost', 'source_artifact_id': 'restaurants_5c310f70', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-6140c378', 'facts': {'entities': [{'name': '晨记烧烤', 'canonical_name': '晨记烧烤', 'address': '朝阳区青年路国美第一城3号院6号楼底商', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.7, 'popularity': 0.97, 'price_level': 'unknown', 'average_cost': 27.0, 'source': 'amap'}], 'area': '国贸'}}, {'candidate': '大红果(顺义东海洪店)', 'dimension': 'cost', 'source_artifact_id': 'restaurants_5c310f70', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-6140c378', 'facts': {'entities': [{'name': '大红果(顺义东海洪店)', 'canonical_name': '大红果(顺义东海洪店)', 'address': '顺义区南法信镇东海洪村5号', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.7, 'popularity': 0.94, 'price_level': 'unknown', 'average_cost': 75.0, 'source': 'amap'}], 'area': '国贸'}}, {'candidate': '紫雲軒 GREEN T.HOUSE', 'dimension': 'cost', 'source_artifact_id': 'restaurants_5c310f70', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-6140c378', 'facts': {'entities': [{'name': '紫雲軒 GREEN T.HOUSE', 'canonical_name': '紫雲軒 GREEN T.HOUSE', 'address': '朝阳区崔各庄乡何各庄村318号', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.6, 'popularity': 0.91, 'price_level': 'unknown', 'average_cost': 544.0, 'source': 'amap'}], 'area': '国贸'}}, {'candidate': '柳沟68号院·甄选豆腐宴', 'dimension': 'cost', 'source_artifact_id': 'restaurants_5c310f70', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-6140c378', 'facts': {'entities': [{'name': '柳沟68号院·甄选豆腐宴', 'canonical_name': '柳沟68号院·甄选豆腐宴', 'address': '延庆区北京城区井庄镇柳果路柳沟村68号', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.7, 'popularity': 0.61, 'price_level': 'unknown', 'average_cost': 52.0, 'source': 'amap'}], 'area': '国贸'}}, {'candidate': '鱼师傅·怀柔土菜', 'dimension': 'cost', 'source_artifact_id': 'restaurants_5c310f70', 'source_kind': 'restaurants', 'source_agent': 'restaurant', 'source_task_id': 'restaurant-6140c378', 'facts': {'entities': [{'name': '鱼师傅·怀柔土菜', 'canonical_name': '鱼师傅·怀柔土菜', 'address': '怀柔区北京城区渤海镇苇店村北50米', 'category': 'food', 'entity_type': 'restaurant', 'tags': ['food', 'local'], 'rating': 4.7, 'popularity': 0.55, 'price_level': 'unknown', 'average_cost': 85.0, 'source': 'amap'}], 'area': '国贸'}}, {'candidate': '晨记烧烤', 'dimension': 'accessibility', 'source_artifact_id': 'routes_1dde19ea', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-51dc7aa8', 'facts': {'origin_name': '晨记烧烤', 'destination_name': '国贸(地铁站)', 'duration_min': 95, 'distance_km': 7.16, 'mode': 'walk', 'walking_distance_km': 7.16, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '大红果(顺义东海洪店)', 'dimension': 'accessibility', 'source_artifact_id': 'routes_fa5a9fbb', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-51dc7aa8', 'facts': {'origin_name': '大红果(顺义东海洪店)', 'destination_name': '国贸(地铁站)', 'duration_min': 438, 'distance_km': 32.87, 'mode': 'walk', 'walking_distance_km': 32.87, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '紫雲軒 GREEN T.HOUSE', 'dimension': 'accessibility', 'source_artifact_id': 'routes_9d2f1dec', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-51dc7aa8', 'facts': {'origin_name': '紫雲軒 GREEN T.HOUSE', 'destination_name': '国贸(地铁站)', 'duration_min': 232, 'distance_km': 17.38, 'mode': 'walk', 'walking_distance_km': 17.38, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '柳沟68号院·甄选豆腐宴', 'dimension': 'accessibility', 'source_artifact_id': 'routes_9078c2cd', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-51dc7aa8', 'facts': {'origin_name': '柳沟68号院·甄选豆腐宴', 'destination_name': '国贸(地铁站)', 'duration_min': 1078, 'distance_km': 80.84, 'mode': 'walk', 'walking_distance_km': 80.84, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}, {'candidate': '鱼师傅·怀柔土菜', 'dimension': 'accessibility', 'source_artifact_id': 'routes_cec4dd67', 'source_kind': 'routes', 'source_agent': 'transport', 'source_task_id': 'transport-51dc7aa8', 'facts': {'origin_name': '鱼师傅·怀柔土菜', 'destination_name': '国贸(地铁站)', 'duration_min': 834, 'distance_km': 62.54, 'mode': 'walk', 'walking_distance_km': 62.54, 'estimated_cost': 0.0, 'source': 'amap', 'evidence_status': 'provider_verified'}}]
+> - limitations：[]
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`candidate_comparison`
+- Actual artifact：`candidate_comparison`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_029 · 重复POI去重
 
@@ -953,26 +1119,27 @@
 
 ### 回答
 
-> 已按工具证据整理如下：
-> - 天气：成都 多云，30°C（来源：amap）
-> - 路线：春熙路步行街 → 成都博物馆，public_transport，约 15 分钟 / 2.23 公里（来源：amap）
-> - 路线：春熙路步行街 → 成都武侯祠博物馆，public_transport，约 37 分钟 / 10.5 公里（来源：amap）
-> - 路线：春熙路步行街 → 四川博物院，public_transport，约 36 分钟 / 7.66 公里（来源：amap）
-> - 路线：春熙路步行街 → 成都杜甫草堂博物馆，public_transport，约 40 分钟 / 7.89 公里（来源：amap）
-> - 候选：成都博物馆（museum；评分 4.9；营业/开放时间 07/04-08/31 周二-周四, 周日 09:00-18:30开放 最晚进入18:00；07/04-08/31 周五-周六 09:00-20:30开放 最晚进入20:00；07/04-08/31 周一 全天不开放；01/01-07/03 周一 全天不开放；09/01-12/31 周一 全天不开放；01/01-07/03 周二-周四, 周日 09:00-17:00开放 最晚进入16:30；09/01-12/31 周二-周四, 周日 09:00-17:00开放 最晚进入16:30；01/01-07/03 周五-周六 09:00-20:30开放 最晚进入20:00；09/01-12/31 周五-周六 09:00-20:30开放 最晚进入20:00；劳动节,端午节,中秋节,国庆节 09:00-20:30开放 最晚进入20:00；地址 小河街1号；来源 amap）
-> - 候选：春熙路步行街（shopping；评分 4.9；营业/开放时间 周一至周日 00:00-24:00；地址 春熙路街道；来源 amap）
-> - 候选：成都动物园（scenic；评分 4.8；营业/开放时间 4月至11月 周一至周日 08:00-16:30；1月至3月,12月 周一至周日 08:30-16:30；地址 昭觉寺南路234号(动物园地铁站A口步行460米)；来源 amap）
-> - 候选：成都大熊猫繁育研究基地（family；评分 4.8；营业/开放时间 07:30-18:00；来源 seed）
+> Artifact：candidate_comparison
+> - subject：{'destination_city': '成都', 'target_anchor': '春熙路', 'accessibility_mode': 'anchored'}
+> - candidates：[{'name': '都江堰景区'}, {'name': '宽窄巷子景区'}, {'name': '青城山景区'}, {'name': '人民公园'}]
+> - comparison_dimensions：['overall_fit']
+> - recommendation：{'candidate': '都江堰景区', 'decision': '基于 1 个完整可比维度有限推荐 都江堰景区', 'dimensions_used': ['overall_fit'], 'comparable_metrics': ['rating'], 'basis': [{'dimension': 'overall_fit', 'candidate': '都江堰景区', 'metric': 'rating', 'value': 4.8, 'source_artifact_id': 'candidates_8696024a', 'source_artifact_ids': ['candidates_8696024a']}], 'source_artifact_ids': ['candidates_8696024a']}
+> - evidence：[{'candidate': '都江堰景区', 'dimension': 'overall_fit', 'source_artifact_id': 'candidates_8696024a', 'source_kind': 'candidates', 'source_agent': 'attraction', 'source_task_id': 'attraction-a3623107', 'facts': {'entities': [{'name': '都江堰景区', 'canonical_name': '都江堰景区', 'address': '都江堰市公园路', 'category': 'scenic', 'entity_type': 'attraction', 'tags': ['classic', 'sightseeing'], 'rating': 4.8, 'popularity': 1.0, 'price_level': 'unknown', 'source': 'amap'}]}}, {'candidate': '宽窄巷子景区', 'dimension': 'overall_fit', 'source_artifact_id': 'candidates_8696024a', 'source_kind': 'candidates', 'source_agent': 'attraction', 'source_task_id': 'attraction-a3623107', 'facts': {'entities': [{'name': '宽窄巷子景区', 'canonical_name': '宽窄巷子景区', 'address': '青羊区少城街道金河路口宽窄巷子', 'category': 'shopping', 'entity_type': 'district', 'tags': ['shopping', 'citywalk'], 'rating': 4.8, 'popularity': 0.94, 'price_level': 'unknown', 'source': 'amap'}]}}, {'candidate': '青城山景区', 'dimension': 'overall_fit', 'source_artifact_id': 'candidates_8696024a', 'source_kind': 'candidates', 'source_agent': 'attraction', 'source_task_id': 'attraction-a3623107', 'facts': {'entities': [{'name': '青城山景区', 'canonical_name': '青城山景区', 'address': '都江堰市青城山镇青城山路168号', 'category': 'scenic', 'entity_type': 'attraction', 'tags': ['classic', 'sightseeing'], 'rating': 4.7, 'popularity': 0.91, 'price_level': 'unknown', 'source': 'amap'}]}}, {'candidate': '人民公园', 'dimension': 'overall_fit', 'source_artifact_id': 'candidates_8696024a', 'source_kind': 'candidates', 'source_agent': 'attraction', 'source_task_id': 'attraction-a3623107', 'facts': {'entities': [{'name': '人民公园', 'canonical_name': '人民公园', 'address': '青羊区小南街8号(人民公园地铁站B口步行250米)', 'category': 'scenic', 'entity_type': 'attraction', 'tags': ['classic', 'sightseeing'], 'rating': 4.8, 'popularity': 0.88, 'price_level': 'unknown', 'source': 'amap'}]}}]
+> - limitations：[]
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`candidate_comparison`
+- Actual artifact：`candidate_comparison`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-**未评分**：没有生成可供行程 Judge 评分的完整计划。
+- 状态：**N/A**
+- 说明：不适用：该任务不要求行程 Judge。
 
 ## dev_030 · 子Agent循环终止
 
@@ -982,27 +1149,33 @@
 
 ### 回答
 
-**第 1 天｜文化体验**
-- 09:30–11:30　豫园（文化体验）
-- 14:30–16:15　外滩（景点）
-  - 交通：从上一站乘公共交通，约 0.7 公里，约 5 分钟
+**第 1 天｜城市经典体验**
+- 09:00–11:30　上海豫园（景点）
+- 13:00–14:30　上海新天地（街区/购物）
+  - 交通：从上一站乘公共交通，约 1.89 公里，约 18 分钟
+- 15:15–17:00　外滩（景点）
+  - 交通：从上一站乘公共交通，约 2.22 公里，约 19 分钟
 
 
 ### 评分
 
 - Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
-- Harness 主要问题：第1天没有有证据支持的用餐安排。
 
 **LLM-as-Judge**
 
-- 总分：**91/100**
+- 总分：**90/100**
 - 结论：**通过**
-- 分项：时间安排 19｜路线 18｜约束满足 20｜个性化 12｜完整性 8｜丰富度 9｜清晰度 5
-- 主要问题：
-- 回答 明确指出“第 1 天没有有证据支持的用餐安排”，且行程中 11:30 至 14:30 存在 3 小时空白未规划具体活动。
-- 每日行程[0].stops[1].route_from_previous.source 为 haversine_recovery_estimate，而 工具结果中的routes 中已有具体的 amap 路线数据可用。
+- Rubric：`full_itinerary`
+- 分项：时间安排 19｜路线 15｜约束满足 20｜个性化 13｜完整性 9｜丰富度 9｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- itinerary.days[0].stops[].route_from_previous.source 为 'haversine_recovery_estimate'，且 tool_facts.routes 中的 POI ID（如 amap_B0FFG95VSV）与行程站点 POI ID（如 amap_B00155MF55）不匹配，缺乏具体路段的工具核验证据。
 
 ## lh_12_001 · 打岔后的早期预算召回
 
@@ -1034,50 +1207,23 @@
 
 ### 回答
 
-**第 1 天｜自然风光与本地美食**
-- 09:30–11:00　杭州植物园（景点）
-- 11:30–12:30　鱼笑面食(嘉绿名苑东区店)（餐饮）
-  - 交通：从上一站乘公共交通，约 2.92 公里，约 10 分钟
-- 14:30–16:00　中国湿地博物馆（博物馆）
-  - 交通：从上一站乘公共交通，约 3.14 公里，约 10 分钟
-
-**第 2 天｜城市经典体验**
-- 09:30–12:00　杭州宋城（景点）
-
-**第 3 天｜文化体验**
-- 09:30–11:00　西湖博览会博物馆（博物馆）
-- 11:30–12:30　崬陽小館·始于2001(马塍路店)（餐饮）
-  - 交通：从上一站乘公共交通，约 1.95 公里，约 6 分钟
-
-**第 4 天｜文化体验**
-- 10:00–12:00　浙江省博物馆-精品馆（博物馆）
-- 14:30–16:30　浙江省博物馆(孤山馆区)-艺术展品(打卡点)（景点）
-  - 交通：从上一站乘公共交通，约 0.06 公里，约 5 分钟
-
-**第 5 天｜城市经典体验**
-- 09:30–12:00　西湖（景点）
-
-
-**住宿**：未选定
-
-**预算**：预计 ¥2770.0，预算上限 ¥4500.0，预计不超预算
+> 当前方案尚不可交付，仅供审阅。未解决：最后一天行程结束于跨湖桥遗址博物馆，缺少从该地点到返程地点杭州东站的可信显式路线证据，无法证明能在17:00截止时间前到达。现有路线为haversine估算，未提供公共交通具体班次或步行距离，硬可行性未得到证明。；第3天仅安排西湖一个景点（09:00-11:30），下午14:00-18:00为固定自由活动时间，上午至下午之间有大段空档，行程较为稀疏，可考虑补充附近景点或适当调整节奏。；行程中博物馆类景点占比过高（5天中4天以博物馆为主），体验可能偏单一，可考虑适当增加自然风光或城市体验类景点以丰富行程。。
+>
+> 当前候选未通过最终校验，ArtifactStore 中没有可交付的 current 行程。
 
 ### 评分
 
 - Harness strict：**失败**
-- 硬约束检查：**失败**
-- 行程检查：**失败**
-- Harness 主要问题：第2天只有1个安排，行程明显不完整。；第2天只有1个非餐饮活动，多日行程的下午时段明显不完整。；第2天没有有证据支持的用餐安排。；第3天只有1个非餐饮活动，多日行程的下午时段明显不完整。；第4天没有有证据支持的用餐安排。；第5天只有1个安排，行程明显不完整。；第5天只有1个非餐饮活动，多日行程的下午时段明显不完整。；第5天没有有证据支持的用餐安排。
+- Expected artifact：`full_itinerary`
+- Actual artifact：`missing`
+- Artifact type match：**失败**
+- 硬约束检查：**通过**
+- 行程检查：**不适用**
 
 **LLM-as-Judge**
 
-- 总分：**29/100**
-- 结论：**未通过**
-- 分项：时间安排 5｜路线 5｜约束满足 5｜个性化 6｜完整性 1｜丰富度 3｜清晰度 4
-- 主要问题：
-- User requires '西湖东侧' accommodation. 工具结果中的hotels is empty []. 住宿方案.status is 'evidence_unavailable'. No hotel evidence provided to satisfy hard constraint.
-- 回答 explicitly states 'Current plan is not deliverable'. Day 2 and Day 5 have only 1 stop each. Multiple days missing meal arrangements (Day 2, 4, 5).
-- Constraint requires arrival at Hangzhou East Station before 17:00 on last day. Day 5 行程 ends at West Lake at 12:00 with no scheduled transport to station. automated_evaluator flags return_deadline constraint tree missing.
+- 状态：**未运行**
+- 说明：未运行：缺少预期行程产物
 
 ## lh_12_002 · 多次撤销与重新指定
 
@@ -1110,34 +1256,52 @@
 ### 回答
 
 **第 1 天｜文化体验**
-- 09:30–11:00　上海自然博物馆（博物馆）
-- 14:30–16:15　外滩（景点）
-  - 交通：从上一站乘公共交通，约 4.66 公里，约 38 分钟
+- 09:00–10:30　上海自然博物馆（博物馆）
+- 11:30–12:30　转角老弄堂餐厅(淮海路店)（餐饮）
+  - 交通：从上一站乘公共交通，约 1.54 公里，约 17 分钟
+- 14:30–16:00　上海市历史博物馆（博物馆）
+  - 交通：从上一站乘公共交通，约 1.26 公里，约 16 分钟
 
-**第 2 天｜本地美食**
-- 18:00–20:00　1886德国汽车餐厅(陆家嘴滨江店)（餐饮）
+**第 2 天｜文化体验**
+- 09:30–11:00　上海博物馆(人民广场馆)（博物馆）
+- 12:00–13:00　光明邨大酒家(淮海中路总店)（餐饮）
+  - 交通：从上一站乘公共交通，约 1.14 公里，约 16 分钟
+
+**第 3 天｜自然风光与本地美食**
+- 09:00–10:45　外滩（景点）
+- 11:30–12:30　外滩家宴·上海菜(外滩豫园店)（餐饮）
+  - 交通：从上一站乘walk，约 0.36 公里，约 13 分钟
+
+**第 4 天｜文化体验**
+- 10:00–11:30　上海博物馆(东馆)（博物馆）
+- 12:30–13:30　外滩家宴·上海菜(外滩·南京路店)（餐饮）
+  - 交通：从上一站乘公共交通，约 5.16 公里，约 29 分钟
 
 
-**住宿**：一间森林酒店(上海人民广场店)，威海路62号
+**住宿**：白玉兰酒店(上海人民广场店)，黄浦区北京东路813号附近
 
-**预算**：预计 ¥3240.0，预算上限 ¥6500.0，预计不超预算
+**预算**：预计 ¥3870.0，预算上限 ¥6500.0，预计不超预算
 
 ### 评分
 
-- Harness strict：**失败**
-- 硬约束检查：**失败**
-- 行程检查：**失败**
-- Harness 主要问题：第1天没有有证据支持的用餐安排。；第2天只有1个安排，行程明显不完整。；第2天只有0个非餐饮活动，多日行程的下午时段明显不完整。；行程没有包含必去地点：陆家嘴。
+- Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
+- 硬约束检查：**通过**
+- 行程检查：**通过**
+- 可选改进：第3天只有1个非餐饮活动，多日行程的下午时段明显不完整。；第4天只有1个非餐饮活动，多日行程的下午时段明显不完整。；行程重复安排同一餐饮品牌：外滩家宴·上海菜(外滩豫园店) / 外滩家宴·上海菜(外滩·南京路店)。
 
 **LLM-as-Judge**
 
-- 总分：**39/100**
-- 结论：**未通过**
-- 分项：时间安排 4｜路线 10｜约束满足 6｜个性化 8｜完整性 2｜丰富度 5｜清晰度 4
-- 主要问题：
-- 用户明确要求「上海四天」且 用户要求中的duration_days 为 4，但 行程 仅规划 2 天，最终记录中的days 亦错误显示为 2 天，缺失 50% 行程。
-- 4 天行程通常需 3-4 晚住宿，但 住宿方案.nights 仅为 1 晚，与行程天数严重不符。
-- 第二天下午时段完全空白，仅安排 18:00 晚餐；第一天未安排任何用餐，回答 自述「行程明显不完整」。
+- 总分：**79/100**
+- 结论：**通过**
+- Rubric：`full_itinerary`
+- 分项：时间安排 13｜路线 18｜约束满足 19｜个性化 11｜完整性 6｜丰富度 7｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- 第 3 天只有 1 个非餐饮活动（外滩），下午时段明显不完整；第 4 天只有 1 个非餐饮活动（上海博物馆东馆），下午时段明显不完整。final_answer 中明确标注'需复核'。
 
 ## lh_5_001 · 预算与老人约束逐步补充
 
@@ -1155,47 +1319,48 @@
 
 ### 回答
 
-**第 1 天｜自然风光与本地美食**
-- 09:30–11:00　中国京杭大运河博物馆（博物馆）
-- 11:45–13:45　西湖风景区-荷花区（景点）
-  - 交通：从上一站乘公共交通，约 7.66 公里，约 26 分钟
-- 14:15–15:15　绿茶餐厅(三潭印月·西湖总店)（餐饮）
-  - 交通：从上一站乘公共交通，约 0.88 公里，约 5 分钟
+**第 1 天｜城市经典体验**
+- 09:00–11:30　杭州西湖风景名胜区（景点）
+- 13:00–15:30　灵隐寺（景点）
+  - 交通：从上一站乘公共交通，约 2.78 公里，约 21 分钟
+- 18:00–19:30　五柳巷历史街区（景点）
+  - 交通：从上一站乘公共交通，约 7.23 公里，约 36 分钟
 
-**第 2 天｜文化体验**
-- 09:30–11:00　西湖博物馆（博物馆）
-- 11:30–12:30　吴记餐厅·杭帮菜·私房菜(西湖湖滨店)（餐饮）
-  - 交通：从上一站乘公共交通，约 1.6 公里，约 5 分钟
-- 14:30–16:30　京杭大运河杭州段（文化体验）
-  - 交通：从上一站乘公共交通，约 6.16 公里，约 21 分钟
+**第 2 天｜城市经典体验**
+- 09:30–11:15　拱宸桥（景点）
+- 14:30–16:00　小河历史文化街区（街区/购物）
+  - 交通：从上一站乘公共交通，约 1.17 公里，约 16 分钟
 
-**第 3 天｜自然风光与本地美食**
-- 09:30–12:00　西湖（景点）
-- 12:30–13:30　新白鹿餐厅(湖滨88店)（餐饮）
-  - 交通：从上一站乘公共交通，约 1.33 公里，约 5 分钟
-- 14:30–16:00　湖滨步行街（街区/购物）
-  - 交通：从上一站乘公共交通，约 0.14 公里，约 5 分钟
+**第 3 天｜城市经典体验**
+- 09:30–11:30　跨湖桥景区（景点）
+- 14:30–16:15　鼓楼（景点）
+  - 交通：从上一站乘公共交通，约 11.82 公里，约 51 分钟
 
 
-**住宿**：未选定
+**住宿**：杭州漳州忆江南客栈(虎跑路分店)，西湖区虎跑路40号杭州动物园内(东侧)
 
-**预算**：预计 ¥1550.0，预算上限 ¥3000.0，预计不超预算
+**预算**：预计 ¥1620.0，预算上限 ¥3000.0，预计不超预算
 
 ### 评分
 
-- Harness strict：**失败**
+- Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
 - 行程检查：**通过**
+- 可选改进：行程中 `scenic` 类型占比过高，体验可能偏单一。
 
 **LLM-as-Judge**
 
-- 总分：**70/100**
-- 结论：**未通过**
-- 分项：时间安排 15｜路线 14｜约束满足 12｜个性化 9｜完整性 6｜丰富度 9｜清晰度 5
-- 主要问题：
-- 住宿方案.status 为 'evidence_unavailable'，未确认候选酒店是否符合 '西湖东侧' 硬约束，尽管 工具结果中的hotels 中有潜在合规候选（如桔子杭州西湖湖滨解放路酒店）。
-- mobility_plan 中 known_walking_km 均为 0.0，依赖 'taxi_fallback' 策略，未实际计算每日步行距离是否满足 <=6km 硬约束。
-- 行程在运河（北）与西湖（中/南）之间往返（Day1 运河->西湖，Day2 西湖->运河），增加 72 岁老人长途交通负担。
+- 总分：**80/100**
+- 结论：**通过**
+- Rubric：`full_itinerary`
+- 分项：时间安排 18｜路线 15｜约束满足 16｜个性化 12｜完整性 8｜丰富度 6｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- mobility_plan.known_walking_km 为 0.0，存在 unknown_walking_legs，虽设有 taxi_fallback 策略，但无法确证每日步行总量满足 6km 硬约束，对 72 岁老人存在体力风险。
 
 ## lh_8_001 · 多次预算调整与必去保留
 
@@ -1219,54 +1384,55 @@
 
 ### 回答
 
-**第 1 天｜文化体验**
-- 09:30–11:15　美华沙滩（景点）
-- 11:45–13:15　鼓浪屿钢琴博物馆（博物馆）
-  - 交通：从上一站乘公共交通，约 0.8 公里，约 5 分钟
+**第 1 天｜城市经典体验**
+- 09:00–11:30　鼓浪屿风景名胜区（景点）
+- 14:30–16:15　鳌冠湾梦幻黄金海岸沙滩（景点）
+  - 交通：从上一站乘公共交通，约 9.23 公里，约 43 分钟
 
-**第 2 天｜自然风光与本地美食**
+**第 2 天｜文化体验**
 - 09:30–11:00　海湾公园（景点）
-- 11:30–12:30　好食来大排档(32年美食航标店)（餐饮）
-  - 交通：从上一站乘公共交通，约 1.95 公里，约 15 分钟
 - 14:30–16:00　厦门市博物馆（博物馆）
-  - 交通：从上一站乘公共交通，约 4.91 公里，约 28 分钟
+  - 交通：从上一站乘公共交通，约 3.88 公里，约 25 分钟
 
-**第 3 天｜本地美食**
-- 09:30–11:00　中山路小吃街（街区/购物）
-- 11:30–12:30　八市阿杰五香（餐饮）
-  - 交通：从上一站乘公共交通，约 0.66 公里，约 5 分钟
-- 14:30–16:00　中山路步行街（街区/购物）
-  - 交通：从上一站乘公共交通，约 0.63 公里，约 5 分钟
+**第 3 天｜城市经典体验**
+- 09:30–11:15　五缘湾音乐岛（景点）
+- 14:30–16:15　五缘湾沙滩（景点）
+  - 交通：从上一站乘公共交通，约 0.87 公里，约 15 分钟
 
 **第 4 天｜城市经典体验**
-- 09:30–12:00　万石山国家重点风景名胜区（景点）
-- 19:15–21:00　观海园沙滩（景点）
-  - 交通：从上一站乘公共交通，约 2.96 公里，约 10 分钟
+- 09:30–11:15　黄厝海滩妈祖铜像（景点）
+- 14:30–16:15　会展中心沙滩（景点）
+  - 交通：从上一站乘公共交通，约 1.63 公里，约 17 分钟
 
 
-**住宿**：未选定
+**住宿**：厦门SkyFun·天悦海景酒店(中山路轮渡码头店)，思明区鹭江街道鹭江道96号之2号钻石海岸B栋3楼
 
-**预算**：预计 ¥4410.0，预算上限 ¥4800.0，预计不超预算
+**预算**：预计 ¥3705.0，预算上限 ¥4800.0，预计不超预算
 
 ### 评分
 
-- Harness strict：**失败**
+- Harness strict：**通过**
+- Expected artifact：`full_itinerary`
+- Actual artifact：`full_itinerary`
+- Artifact type match：**通过**
 - 硬约束检查：**通过**
-- 行程检查：**失败**
-- Harness 主要问题：第1天没有有证据支持的用餐安排。；第4天没有有证据支持的用餐安排。
+- 行程检查：**通过**
+- 可选改进：行程中 `scenic` 类型占比过高，体验可能偏单一。
 
 **LLM-as-Judge**
 
-- 总分：**57/100**
-- 结论：**未通过**
-- 分项：时间安排 12｜路线 16｜约束满足 5｜个性化 8｜完整性 3｜丰富度 8｜清晰度 5
-- 主要问题：
-- 每日行程[1].stops[1] 安排'好食来大排档'，回答 文本明确承认'与用户明确的不吃海鲜饮食限制冲突'且'未解决'。
-- 行程.住宿方案.status 为'evidence_unavailable'，required 为 true，但未从 工具结果中的hotels 中选定具体酒店，导致住宿约束无法落实。
-- 每日行程[0] 和 每日行程[3] 的 stops 中无用餐安排，回答 承认'第 1 天和第 4 天没有有证据支持的用餐安排'。
+- 总分：**83/100**
+- 结论：**通过**
+- Rubric：`full_itinerary`
+- 分项：时间安排 18｜路线 19｜约束满足 15｜个性化 11｜完整性 8｜丰富度 7｜清晰度 5
+- 主要失败原因（error/critical）：
+- 无
+- 可选改进（warning）：
+- 行程预算计划声明总高值 4366.5 元未超上限 4800 元，但 tool_facts.budget 显示总高值 5071.5 元，存在超支风险，数据不一致。
 
 ## 说明
 
 - Harness 不是百分制，因此仅展示 strict、硬约束检查和行程检查。
-- Judge 分数满分 100；未评分不等于通过。
+- Judge 分数仅在同一 Rubric 内汇总；Full 与 Partial 百分制不直接混合平均。
+- not_applicable 表示任务本来不需要行程 Judge；not_run 表示缺少预期产物或系统失败；missing/error 表示 Judge 自身未完成。
 - 行程、路线、住宿和预算来自冻结运行快照，不代表实时可预订状态。

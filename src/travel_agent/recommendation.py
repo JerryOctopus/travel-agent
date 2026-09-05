@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from travel_agent.critic import poi_matches_interest, requested_interests
+from travel_agent.poi_evidence import canonical_entity_match_evidence, poi_avoid_match
 from travel_agent.schemas import POI, ScoredPOI, TravelProfile
 
 
@@ -101,8 +102,11 @@ def _budget_fit(poi: POI, profile: TravelProfile) -> float:
 
 
 def _constraint_boost(poi: POI, profile: TravelProfile) -> float:
-    if profile.avoid and any(term in poi.name for term in profile.avoid):
+    if poi_avoid_match(poi, profile) is not None:
         return 0.0
-    if profile.must_visit and any(term in poi.name for term in profile.must_visit):
+    if profile.must_visit and any(
+        canonical_entity_match_evidence(poi, term) is not None
+        for term in profile.must_visit
+    ):
         return 1.0
     return 0.5

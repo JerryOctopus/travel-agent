@@ -36,6 +36,26 @@ def test_plannable_entity_dedupe_prefers_exact_required_venue() -> None:
     assert [poi.name for poi in result] == ["三星堆博物馆"]
 
 
+def test_plannable_entity_dedupe_prefers_formal_parent_over_numbered_pit() -> None:
+    profile = TravelProfile(destination="测试城", must_visit=["青铜遗址"])
+    parent = POI(
+        **{
+            **_poi("古王朝青铜遗址博物馆", "museum").__dict__,
+            "source_poi_id": "provider-parent",
+        }
+    )
+    child = POI(
+        **{
+            **_poi("古王朝青铜遗址一号坑", "museum").__dict__,
+            "parent_poi_id": "provider-parent",
+        }
+    )
+
+    result = toolkit._dedupe_plannable_entities([child, parent], profile)
+
+    assert [poi.name for poi in result] == ["古王朝青铜遗址博物馆"]
+
+
 def test_unavailable_and_infrastructure_pois_are_not_plannable() -> None:
     assert toolkit._is_unavailable_or_infrastructure_poi(
         _poi("西湖风景区(暂停开放)", "scenic")
@@ -45,6 +65,12 @@ def test_unavailable_and_infrastructure_pois_are_not_plannable() -> None:
     )
     assert toolkit._is_unavailable_or_infrastructure_poi(
         _poi("兵马俑直通车乘车点", "scenic")
+    )
+    assert toolkit._is_unavailable_or_infrastructure_poi(
+        _poi("历史景区连接线", "scenic")
+    )
+    assert toolkit._is_unavailable_or_infrastructure_poi(
+        _poi("历史景区文创店", "scenic")
     )
     assert toolkit._is_unavailable_or_infrastructure_poi(
         _poi("广州塔旅游文化发展有限公司", "scenic")
@@ -63,6 +89,18 @@ def test_poi_closed_on_requested_weekday_is_not_plannable() -> None:
 
     assert toolkit._is_unavailable_or_infrastructure_poi(museum, monday)
     assert not toolkit._is_unavailable_or_infrastructure_poi(museum, tuesday)
+
+
+def test_poi_using_quan_tian_guan_bi_wording_is_not_plannable() -> None:
+    museum = POI(
+        **{
+            **_poi("自然博物馆", "museum").__dict__,
+            "opening_hours": "1月至9月 周一 全天关闭；周二至周日 09:00-16:30",
+        }
+    )
+    monday = TravelProfile(destination="天津", constraint_state={"weekday": "周一"})
+
+    assert toolkit._is_unavailable_or_infrastructure_poi(museum, monday)
 
 
 def test_poi_outside_explicit_opening_season_is_not_plannable() -> None:
@@ -110,6 +148,36 @@ def test_cross_city_candidate_requires_explicit_venue_constraint() -> None:
 
     assert toolkit._poi_city_allowed_for_plan(required, profile)
     assert not toolkit._poi_city_allowed_for_plan(optional, profile)
+
+
+def test_cross_city_fixed_event_venue_is_allowed_without_becoming_must_visit() -> None:
+    venue = POI(
+        poi_id="event-venue",
+        name="三星文化博物馆",
+        city="邻城市",
+        category="museum",
+        lat=31.0,
+        lng=104.2,
+        rating=4.9,
+        popularity=1.0,
+        tags=["history"],
+        estimated_duration_min=120,
+        price_level="mid",
+    )
+    profile = TravelProfile(
+        destination="主城",
+        must_visit=[],
+        constraint_state={
+            "fixed_events": [{
+                "day": 1,
+                "start": "14:00",
+                "end": "16:00",
+                "location": "三星文化博物馆",
+            }],
+        },
+    )
+
+    assert toolkit._poi_city_allowed_for_plan(venue, profile)
 
 
 def test_restaurant_hotel_budget_tools() -> None:

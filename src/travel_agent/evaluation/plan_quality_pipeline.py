@@ -20,8 +20,10 @@ from travel_agent.evaluation.plan_quality_judge import (
     SCHEMA_VERSION,
     PlanQualityJudge,
     aggregate_judge_results,
+    preflight_judge,
 )
 from travel_agent.settings import JudgeSettings
+from travel_agent.evaluation.artifact_contract import aggregate_artifact_metrics
 
 
 QUALITY_REPORT_NAME = "quality_report.md"
@@ -90,6 +92,14 @@ def apply_independent_judge(
         cases = load_run_cases(root)
     summary = _load_summary(root)
     tested_model = str((summary.get("artifacts") or {}).get("model") or "")
+    if judge is None:
+        preflight = preflight_judge(settings)
+        if not preflight.get("ok"):
+            raise RuntimeError(
+                "independent Judge preflight failed: "
+                f"provider={preflight.get('provider')} model={preflight.get('model')} "
+                f"detail={preflight.get('detail')}"
+            )
     evaluator = judge or PlanQualityJudge(settings, root / "judge_cache")
     results = []
     for path, case_output in cases:
@@ -107,6 +117,7 @@ def apply_independent_judge(
             _write_json_atomic(path, case_output)
         results.append(result)
     judge_summary = aggregate_judge_results(results)
+    artifact_summary = aggregate_artifact_metrics([case for _, case in cases])
     independence_warning = bool(tested_model and tested_model == settings.model)
     judge_summary.update(
         {
@@ -121,6 +132,7 @@ def apply_independent_judge(
             "judge_reasonable_rate": judge_summary["judge_reasonable_rate"],
             "judge_completion_rate": judge_summary["completion_rate"],
             "plan_quality_judge": judge_summary,
+            "artifact_evaluation": artifact_summary,
         }
     )
     summary.setdefault("artifacts", {}).update(
@@ -131,6 +143,9 @@ def apply_independent_judge(
             "judge_prompt_version": PROMPT_VERSION,
             "judge_schema_version": SCHEMA_VERSION,
             "judge_cache_dir": str(root / "judge_cache"),
+            "judge_preflight": (
+                preflight if judge is None else {"ok": True, "injected": True}
+            ),
         }
     )
     _save_summary(root, summary)
@@ -279,7 +294,11 @@ def build_quality_report(summary: dict[str, Any]) -> str:
         "",
         f"- judge: `{judge.get('provider')}` / `{judge.get('model')}`",
         f"- completion rate: {judge.get('completion_rate')}",
-        f"- average score: {judge.get('judge_average_score')}",
+        f"- full-itinerary average score: {judge.get('judge_average_score')}",
+        f"- average by rubric (not pooled): {judge.get('judge_average_by_rubric') or {}}",
+        f"- not applicable: {judge.get('not_applicable_count')}",
+        f"- not run: {judge.get('not_run_count')}",
+        f"- missing/error: {judge.get('missing_count')}/{judge.get('error_count')}",
         f"- reasonable rate: {judge.get('judge_reasonable_rate')}",
         f"- experimental: {judge.get('experimental', True)}",
         f"- independence warning: {judge.get('independence_warning')}",

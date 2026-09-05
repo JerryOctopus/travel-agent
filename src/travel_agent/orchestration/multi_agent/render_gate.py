@@ -50,15 +50,46 @@ def render_plan_outcome(
         "map_payload": None,
         "gate_status": "skipped",
         "reason": "",
+        "delivery_status": "no_deliverable",
+        "artifact_id": None,
+        "route_evidence_status": "unavailable",
+        "partial_safe": False,
     }
-    if not plan_artifact_id:
-        outcome["reason"] = "本轮未产生完整 TravelPlan，跳过渲染"
-        return outcome
     if delivery_status not in _RENDERABLE_STATUSES:
         outcome["reason"] = f"交付状态 {delivery_status} 不允许渲染"
         return outcome
 
-    mark_incomplete = delivery_status == STATUS_INCOMPLETE
+    from travel_agent.delivery_contract import (
+        DELIVERABLE_CURRENT,
+        PARTIAL_CURRENT_WITH_LIMITATIONS,
+        resolve_delivery_snapshot,
+    )
+
+    snapshot = resolve_delivery_snapshot(
+        ctx, attempted_artifact_id=plan_artifact_id
+    )
+    outcome.update({
+        "delivery_status": snapshot.status,
+        "artifact_id": snapshot.artifact_id,
+        "route_evidence_status": snapshot.route_evidence_status,
+    })
+    if snapshot.status not in {
+        DELIVERABLE_CURRENT, PARTIAL_CURRENT_WITH_LIMITATIONS
+    } or not snapshot.artifact_id:
+        outcome["reason"] = "最终 ArtifactStore 中没有可渲染的 current 行程"
+        return outcome
+
+    plan_artifact_id = snapshot.artifact_id
+    selected_payload = ctx.store.get(plan_artifact_id) or {}
+    from travel_agent.plan_invariants import validate_plan_artifact
+
+    outcome["partial_safe"] = bool(
+        snapshot.status == PARTIAL_CURRENT_WITH_LIMITATIONS
+        and (selected_payload.get("critic") or {}).get("passed") is True
+        and validate_plan_artifact(selected_payload, ctx.profile).get("passed") is True
+    )
+
+    mark_incomplete = snapshot.status == PARTIAL_CURRENT_WITH_LIMITATIONS
     itinerary_result = toolkit.gated_render_itinerary(
         ctx,
         plan_artifact_id,
@@ -70,11 +101,15 @@ def render_plan_outcome(
         outcome["gate_status"] = "rejected"
         return outcome
 
-    map_result = toolkit.gated_render_map(
-        ctx,
-        plan_artifact_id,
-        mark_incomplete=mark_incomplete,
-        allowed_agents=allowed_agents,
+    map_result = (
+        toolkit.gated_render_map(
+            ctx,
+            plan_artifact_id,
+            mark_incomplete=mark_incomplete,
+            allowed_agents=allowed_agents,
+        )
+        if snapshot.map_available
+        else {"isError": True, "summary": "路线证据不可用，地图渲染已跳过"}
     )
     outcome.update(
         {

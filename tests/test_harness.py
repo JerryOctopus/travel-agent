@@ -64,6 +64,21 @@ def test_harness_runs_multi_turn_case_with_history(offline_settings):
     assert result.final_profile["destination"] == "北京"
     assert result.final_profile["days"] == 2
     assert "itinerary" in result.final_artifacts
+    itinerary = result.final_artifacts["itinerary"]
+    assert itinerary["artifact_status"] == "current"
+    assert itinerary["critic"]["passed"] is True
+    assert not any(
+        issue["severity"] == "error" for issue in itinerary["critic"]["issues"]
+    )
+    assert itinerary["validation_result"]["passed"] is True
+    assert itinerary["validation_result"]["status"] == "passed"
+    assert result.final_profile["must_visit"] == []
+    constraint_state = result.final_profile["constraint_state"]
+    assert "must_visit" not in constraint_state
+    assert all(
+        event["field"] != "must_visit"
+        for event in constraint_state["_constraint_events"]
+    )
 
 
 def test_harness_loads_existing_eval_cases():

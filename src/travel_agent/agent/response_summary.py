@@ -36,19 +36,51 @@ def looks_like_hallucinated_itinerary(text: str) -> bool:
     return False
 
 
-def build_plan_reply_text(ctx: SessionContext) -> str:
+def build_plan_reply_text(ctx: SessionContext, plan_artifact_id: str | None = None) -> str:
     """从 artifact 生成简短摘要；逐日时刻表由右侧卡片展示。"""
-    payload = ctx.store.latest("itinerary")
+    from travel_agent.delivery_contract import (
+        DELIVERABLE_CURRENT,
+        PARTIAL_CURRENT_WITH_LIMITATIONS,
+        resolve_delivery_snapshot,
+    )
+
+    delivery = resolve_delivery_snapshot(ctx, attempted_artifact_id=plan_artifact_id)
+    payload = ctx.store.get(delivery.artifact_id) if delivery.artifact_id else None
     if not payload:
-        return "行程已生成，请查看右侧卡片与地图。"
+        return "当前没有通过最终校验并处于 current 状态的可交付行程。"
 
     itinerary = payload.get("itinerary", {})
     critic = payload.get("critic", {})
     profile = ctx.profile
 
+    record = ctx.store.get_record(delivery.artifact_id) if delivery.artifact_id else None
+    artifact_status = str(
+        (record or {}).get("artifact_status") or payload.get("artifact_status") or ""
+    )
+    from travel_agent.plan_invariants import validate_plan_artifact
+
+    current_validation = validate_plan_artifact(payload, ctx.profile)
+    validation_passed = artifact_status == "current" and current_validation.get("passed") is True
+    critic_passed = (payload.get("critic") or {}).get("passed") is True
+    deliverable = validation_passed and critic_passed and not payload.get("unresolved_changes")
     lines: list[str] = []
     title = itinerary.get("summary") or f"{profile.destination or ''}{profile.days or ''}天行程"
-    lines.append(f"{title} 已排好。每日安排、地图路线请查看右侧面板。")
+    if delivery.status == DELIVERABLE_CURRENT and deliverable:
+        route_suffix = (
+            "每日安排和已核验地图路线请查看右侧面板。"
+            if delivery.route_evidence_status == "provider_verified"
+            else "每日安排请查看右侧面板；路线为估算结果，未声明地图已核验。"
+            if delivery.route_evidence_status == "estimated"
+            else "每日安排请查看右侧面板；当前没有可用路线证据，不提供地图路线声明。"
+        )
+        lines.append(f"{title} 已排好。{route_suffix}")
+    elif delivery.status == PARTIAL_CURRENT_WITH_LIMITATIONS:
+        lines.append(
+            f"{title} 是当前可查看的部分草案，仍有明确限制，尚不可交付为完整计划；"
+            "草案可在右侧面板查看。"
+        )
+    else:
+        lines.append("当前没有可交付行程。")
 
     meta: list[str] = []
     if profile.destination:
@@ -80,6 +112,32 @@ def build_plan_reply_text(ctx: SessionContext) -> str:
         lines.append("行程概览：")
         lines.extend(day_lines)
 
+    state = profile.constraint_state or {}
+    explicit_meals = bool(profile.food_preference or "food" in profile.interests or state.get("dietary"))
+    has_meal_stop = any(
+        str(stop.get("category") or "") == "food"
+        for day in itinerary.get("days", [])
+        for stop in (day.get("stops") or [])
+    )
+    scheduled_meals = [
+        item
+        for item in ((payload.get("meal_strategy") or {}).get("scheduled_meals") or [])
+        if isinstance(item, dict) and item.get("start_time")
+    ]
+    if scheduled_meals:
+        meal_windows = []
+        for item in scheduled_meals:
+            day_index = item.get("day_index")
+            start = str(item.get("start_time") or "")
+            end = str(item.get("end_time") or "")
+            label = str(item.get("name") or "用餐时段").split("（", 1)[0]
+            window = f"{start}–{end}" if end else start
+            prefix = f"第{day_index}天 " if day_index else ""
+            meal_windows.append(f"{prefix}{window} {label}")
+        lines.append("用餐：" + "；".join(meal_windows) + "。")
+    elif not explicit_meals and not has_meal_stop:
+        lines.append("用餐：每天约 12:00–13:00 预留午餐时间，可在当日活动区域就近自行安排。")
+
     orig = payload.get("original_issue_count", 0)
     final = payload.get("final_issue_count", 0)
     passed = critic.get("passed", True)
@@ -90,14 +148,14 @@ def build_plan_reply_text(ctx: SessionContext) -> str:
     )
     notes = [
         str(note)
-        for note in (payload.get("revision_notes") or [])
+        for note in (payload.get("applied_changes") or payload.get("revision_notes") or [])
         if not str(note).startswith("已携带 Reviewer")
     ]
     lines.append("")
-    if passed and final == 0 and not notes and not budget_exceeded:
+    if passed and validation_passed and final == 0 and not notes and not budget_exceeded:
         lines.append("约束检查已通过。")
     else:
-        status = "预算超限，尚不可交付" if budget_exceeded else ("已通过" if passed else "仍有可解释告警")
+        status = "预算超限，尚不可交付" if budget_exceeded else ("已通过" if passed and validation_passed else "尚不可交付")
         lines.append(f"约束检查：{orig} → {final} 项（{status}）。")
         if notes:
             lines.append("自动修正：" + "；".join(notes[:3]))
@@ -149,11 +207,14 @@ def build_plan_reply_text(ctx: SessionContext) -> str:
                 f"{event.get('start')}–{event.get('end')} {event.get('location')}。"
             )
             if event.get("recommended_departure") and event.get("recommended_return_arrival"):
-                text += (
-                    f"按已核验路线单程约 {event.get('transfer_duration_min')} 分钟，"
-                    f"建议约 {event.get('recommended_departure')} 出发，"
-                    f"返程约 {event.get('recommended_return_arrival')} 抵达城区。"
-                )
+                if event.get("route_evidence_status") == "provider_verified":
+                    text += (
+                        f"按地图工具核验路线单程约 {event.get('transfer_duration_min')} 分钟，"
+                        f"建议约 {event.get('recommended_departure')} 出发，"
+                        f"返程约 {event.get('recommended_return_arrival')} 抵达城区。"
+                    )
+                else:
+                    text += "当前路线未获 provider 核验，只能作为估算，不能据此保证准时到达。"
             lines.append(text)
 
     mobility_plan = payload.get("mobility_plan")
@@ -167,13 +228,15 @@ def build_plan_reply_text(ctx: SessionContext) -> str:
     if isinstance(candidate_verification, dict):
         results = candidate_verification.get("results") or []
         suitable = [item.get("requested_name") for item in results if item.get("status") == "suitable"]
-        excluded = [item.get("requested_name") for item in results if item.get("status") != "suitable"]
+        excluded = [item for item in results if item.get("status") != "suitable"]
         if suitable:
             lines.append("候选核验可安排：" + "、".join(str(item) for item in suitable) + "。")
         if excluded:
             lines.append(
-                "候选核验未排入：" + "、".join(str(item) for item in excluded)
-                + "（当天闭馆或未取得地点本体开放证据）。"
+                "候选核验未排入：" + "；".join(
+                    f"{item.get('requested_name')}（{item.get('reason') or '未核实'}）"
+                    for item in excluded
+                ) + "。"
             )
 
     return "\n".join(lines)

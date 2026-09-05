@@ -45,6 +45,15 @@ def poi_from_dict(data: dict[str, Any]) -> POI:
         ),
         parking_type=data.get("parking_type"),
         source=str(data.get("source", "seed")),
+        canonical_name=data.get("canonical_name") or str(data["name"]),
+        entity_type=str(data.get("entity_type") or "venue"),
+        parent_poi_id=data.get("parent_poi_id"),
+        source_poi_id=data.get("source_poi_id") or str(data["poi_id"]),
+        verification_status=str(data.get("verification_status") or "verified"),
+        verification_reason=data.get("verification_reason"),
+        aliases=list(data.get("aliases") or []),
+        parent_canonical_name=data.get("parent_canonical_name"),
+        coverage_relation=str(data.get("coverage_relation") or "none"),
     )
 
 
@@ -68,6 +77,12 @@ def poi_brief(poi: POI) -> dict[str, Any]:
         "average_cost": poi.average_cost,
         "parking_type": poi.parking_type,
         "source": poi.source,
+        "canonical_name": poi.canonical_name or poi.name,
+        "entity_type": poi.entity_type,
+        "parent_poi_id": poi.parent_poi_id,
+        "source_poi_id": poi.source_poi_id or poi.poi_id,
+        "verification_status": poi.verification_status,
+        "verification_reason": poi.verification_reason,
     }
 
 

@@ -140,7 +140,7 @@ def test_workflow_revises_to_include_must_visit_from_context() -> None:
         destination="北京",
         days=1,
         interests=["food"],
-        must_visit=["故宫"],
+        must_visit=["故宫博物院"],
         pace="relaxed",
     )
 

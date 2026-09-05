@@ -22,10 +22,47 @@ from travel_agent.evaluation.plan_quality_judge import (
     PlanQualityJudge,
     _judge_payload,
     parse_judge_output,
+    preflight_judge,
 )
 from travel_agent.evaluation.plan_quality_pipeline import apply_quality_rules
 from travel_agent.evaluation.plan_quality_pipeline import apply_independent_judge
 from travel_agent.settings import JudgeSettings
+
+
+def test_judge_preflight_uses_independent_configuration() -> None:
+    captured: list[list[dict[str, str]]] = []
+    settings = JudgeSettings(
+        provider="google",
+        api_key="judge-only-key",
+        model="gemini-3.6-flash",
+        temperature=0.0,
+        thinking_enabled=False,
+    )
+
+    result = preflight_judge(
+        settings,
+        invoke=lambda messages: (
+            captured.append(messages)
+            or SimpleNamespace(content="pong", response_metadata={}, usage_metadata={})
+        ),
+    )
+
+    assert result == {
+        "ok": True,
+        "provider": "google",
+        "model": "gemini-3.6-flash",
+        "base_url": settings.base_url,
+        "temperature": 0.0,
+        "thinking_enabled": False,
+    }
+    assert captured and captured[0][-1]["content"] == "Reply with pong."
+
+
+def test_judge_preflight_fails_closed_without_credential() -> None:
+    result = preflight_judge(JudgeSettings(api_key=None))
+
+    assert result["ok"] is False
+    assert "not configured" in result["detail"]
 
 
 def test_deterministic_plan_quality_accepts_grounded_feasible_plan() -> None:
@@ -135,6 +172,52 @@ def test_city_suffix_is_normalized_for_poi_and_itinerary_checks() -> None:
     assert result is not None
     assert result.city_and_coordinates_valid is True
     assert "poi_city_mismatch" not in {issue["code"] for issue in result.issues}
+
+
+def test_route_pace_warning_is_quality_not_hard_feasibility() -> None:
+    artifacts = _artifacts()
+    route = artifacts["itinerary"]["itinerary"]["days"][0]["stops"][1]["route_from_previous"]
+    route["duration_min"] = 65
+    artifacts["itinerary"]["itinerary"]["days"][0]["stops"][1]["start_time"] = "12:00"
+
+    result = evaluate_plan_quality(
+        {"expected_city": "杭州", "expected_days": 1},
+        {"destination": "杭州", "days": 1, "pace": "standard"},
+        artifacts,
+    )
+
+    assert result is not None
+    assert result.transfer_feasible is True
+    assert result.hard_feasibility_pass is True
+    assert result.rule_quality_pass is False
+    assert "route_duration_exceeded" in {issue["code"] for issue in result.issues}
+
+
+def test_must_visit_quality_uses_provider_alias_identity() -> None:
+    artifacts = _artifacts()
+    first = artifacts["itinerary"]["itinerary"]["days"][0]["stops"][0]["poi"]
+    first.update({
+        "source": "provider",
+        "canonical_name": "西湖风景名胜区",
+        "source_poi_id": "p1",
+        "verification_status": "verified",
+        "entity_type": "attraction",
+        "aliases": ["西湖"],
+    })
+
+    result = evaluate_plan_quality(
+        {
+            "expected_city": "杭州",
+            "expected_days": 1,
+            "hard_constraints": {"must_visit": ["西湖"]},
+        },
+        {"destination": "杭州", "days": 1},
+        artifacts,
+    )
+
+    assert result is not None
+    assert result.must_visit_coverage_rate == 1.0
+    assert result.hard_feasibility_pass is True
 
 
 def test_rule_quality_aggregation_uses_evidence_denominators() -> None:
@@ -263,13 +346,30 @@ def test_judge_honors_gemini_retry_after_on_429(tmp_path) -> None:
     assert sleeps == [44.914]
 
 
-def test_judge_without_itinerary_is_not_applicable(tmp_path) -> None:
+def test_judge_invocation_failure_is_error_not_not_run_or_missing(tmp_path) -> None:
+    judge = PlanQualityJudge(
+        JudgeSettings(api_key="test", requests_per_second=0),
+        tmp_path,
+        invoke=lambda messages: (_ for _ in ()).throw(RuntimeError("provider unavailable")),
+        sleeper=lambda seconds: None,
+    )
+
+    result = judge.evaluate(_case_output())
+
+    assert result["status"] == "error"
+    assert result["attempt_count"] == 2
+    assert len(result["errors"]) == 2
+
+
+def test_judge_without_expected_itinerary_is_not_run(tmp_path) -> None:
     judge = PlanQualityJudge(
         JudgeSettings(api_key="test", requests_per_second=0),
         tmp_path,
         invoke=lambda messages: "{}",
     )
-    assert judge.evaluate({"final_itinerary": None})["status"] == "not_applicable"
+    result = judge.evaluate({"case": {"turns": ["规划测试城两日游"]}, "final_itinerary": None})
+    assert result["status"] == "not_run"
+    assert result["reason"] == "missing_expected_artifact"
 
 
 def test_independent_judge_payload_excludes_internal_critic() -> None:
@@ -306,6 +406,38 @@ def test_independent_judge_payload_includes_bound_transport_evidence() -> None:
     payload = _judge_payload(case)
 
     assert payload["tool_facts"]["routes"][0]["destination_name"] == "上海虹桥"
+
+
+def test_independent_judge_payload_keeps_every_final_grounded_poi() -> None:
+    case = _case_output()
+    pois = [
+        {
+            "poi_id": f"poi-{index}",
+            "name": f"景点{index}",
+            "city": "杭州",
+            "category": "scenic",
+            "source": "amap",
+        }
+        for index in range(9)
+    ]
+    case["final_itinerary"]["itinerary"] = {
+        "city": "杭州",
+        "days": [{
+            "day_index": 1,
+            "stops": [
+                {"poi": poi, "start_time": "09:00", "duration_min": 30}
+                for poi in pois
+            ],
+        }],
+    }
+    case["final_artifacts"]["candidates"] = {"city": "杭州", "pois": pois}
+
+    payload = _judge_payload(case)
+
+    evidence_ids = {
+        item["poi_id"] for item in payload["tool_facts"]["candidates"]["pois"]
+    }
+    assert evidence_ids == {poi["poi_id"] for poi in pois}
 
 
 def test_independent_judge_payload_includes_structured_return_plan() -> None:

@@ -253,9 +253,10 @@ def test_critic_reports_route_too_long() -> None:
     result = critique_itinerary(itinerary, profile)
     codes = {issue.code for issue in result.issues}
 
-    assert result.passed is False
+    assert result.passed is True
     assert "route_too_long" in codes
     assert "daily_route_too_long" in codes
+    assert all(issue.severity == "warning" for issue in result.issues if issue.code in codes)
 
 
 def test_critic_rejects_food_without_required_halal_evidence() -> None:
@@ -362,9 +363,9 @@ def test_commercial_amenity_cannot_satisfy_must_visit() -> None:
     assert not poi_matches_must_visit(
         _poi("兵马俑枢纽", "scenic", ["sightseeing"]), "兵马俑"
     )
-    assert poi_matches_must_visit(
-        _poi("秦始皇兵马俑博物馆", "museum", ["history"]), "兵马俑"
-    )
+    confirmed_alias = _poi("秦始皇兵马俑博物馆", "museum", ["history"])
+    confirmed_alias = POI(**{**confirmed_alias.__dict__, "aliases": ["兵马俑"]})
+    assert poi_matches_must_visit(confirmed_alias, "兵马俑")
 
 
 def test_multiday_day_with_only_one_activity_and_meal_is_sparse() -> None:
@@ -388,6 +389,35 @@ def test_multiday_day_with_only_one_activity_and_meal_is_sparse() -> None:
     result = critique_itinerary(itinerary, profile)
 
     assert sum(issue.code == "daily_activity_sparse" for issue in result.issues) == 3
+
+
+def test_generic_plan_without_specific_restaurant_is_not_an_error() -> None:
+    profile = TravelProfile(destination="天津", days=1)
+    itinerary = Itinerary(
+        city="天津",
+        summary="天津一日",
+        days=[ItineraryDay(
+            day_index=1,
+            theme="citywalk",
+            stops=[
+                ItineraryStop(_poi("五大道", "scenic", []), "09:30", 120, ""),
+                ItineraryStop(_poi("意式风情区", "scenic", []), "14:00", 120, ""),
+            ],
+        )],
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    assert result.passed is True
+    assert "daily_meal_missing" not in {issue.code for issue in result.issues}
+
+
+def test_ticket_center_cannot_satisfy_museum_identity() -> None:
+    from travel_agent.critic import poi_matches_must_visit
+
+    assert not poi_matches_must_visit(
+        _poi("天津博物馆-票务中心", "scenic", ["sightseeing"]), "天津博物馆"
+    )
 
 
 def _poi(name: str, category: str, tags: list[str]) -> POI:
