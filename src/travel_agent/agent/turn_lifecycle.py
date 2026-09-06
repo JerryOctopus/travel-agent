@@ -10,7 +10,7 @@ from typing import Any
 from travel_agent.agent import toolkit
 from travel_agent.agent.intent import MessageKind, conversation_reply_text
 from travel_agent.agent.preferences import turn_expresses_preferences, user_skips_preference_prompt
-from travel_agent.agent.session import SessionContext
+from travel_agent.agent.session import RequestControl, SessionContext
 from travel_agent.agent.turn_analysis import (
     REQUIRED_SLOTS,
     DeliveryIntent,
@@ -27,6 +27,7 @@ from travel_agent.orchestration.multi_agent.schemas import (
     new_task_id,
 )
 from travel_agent.profile_patch import patches_to_payload
+from travel_agent.providers import ProviderRateLimitError
 
 
 @dataclass(frozen=True)
@@ -725,6 +726,9 @@ def run_turn_lifecycle(
     from travel_agent.orchestration.multi_agent import MultiAgentEngine
 
     request_id = new_request_id()
+    owns_request_control = ctx.request_control is None
+    if owns_request_control:
+        ctx.request_control = RequestControl(request_id)
     ctx.runtime_settings = settings
     llm_settings = settings.llm
     orchestration_settings = getattr(settings, "orchestration", None)
@@ -754,7 +758,7 @@ def run_turn_lifecycle(
 
     request_trace = AgentTraceLog(request_id)
     trace_token = set_current_trace(request_trace)
-    reply: Any
+    reply: Any = None
     prepared: PreparedTurn | None = None
     try:
         with turn_meter_scope(meter):
@@ -781,6 +785,11 @@ def run_turn_lifecycle(
                         turn_inputs=prepared.turn_inputs,
                     )
                     reply = _reply_from_outcome(ctx, outcome)
+                except ProviderRateLimitError:
+                    # Never convert a configured-tool quota failure into an
+                    # offline fallback: that fallback may call the same exhausted
+                    # provider and can hide the environment failure from eval.
+                    raise
                 except TurnBudgetExhausted as exc:
                     reply = AgentReply(
                         text="本轮调用预算已耗尽，未继续发起新的模型调用。",
@@ -843,6 +852,8 @@ def run_turn_lifecycle(
                 request_trace.flush_to_store(ctx.store)
         finally:
             reset_current_trace(trace_token)
+            if owns_request_control:
+                ctx.request_control = None
     if (
         prepared is not None
         and prepared.analysis.delivery_intent == DeliveryIntent.LIGHTWEIGHT_ADVICE

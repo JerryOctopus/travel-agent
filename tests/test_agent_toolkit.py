@@ -5,6 +5,8 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from travel_agent.agent import toolkit
 from travel_agent.agent.serde import poi_brief, poi_to_dict
 from travel_agent.agent.session import build_session, session_tool_lock
@@ -150,7 +152,7 @@ def test_full_tool_pipeline():
     assert len(map_payload["markers"]) > 0
 
 
-def test_search_poi_does_not_hide_rate_limit_from_supplemental_city_query(monkeypatch):
+def test_search_poi_propagates_provider_quota_from_supplemental_city_query(monkeypatch):
     ctx = _session()
     toolkit.update_travel_profile(ctx, destination="杭州", days=2)
     calls = 0
@@ -166,10 +168,8 @@ def test_search_poi_does_not_hide_rate_limit_from_supplemental_city_query(monkey
 
     monkeypatch.setattr(ctx.provider, "search_pois", search_pois)
 
-    result = toolkit.search_poi(ctx, interests=["nature"], max_results=30)
-
-    assert result["isError"] is True
-    assert result["error_code"] == "RATE_LIMITED"
+    with pytest.raises(ProviderRateLimitError, match="10044"):
+        toolkit.search_poi(ctx, interests=["nature"], max_results=30)
 
 
 def test_search_poi_does_not_repeat_city_supply_after_full_provider_page(monkeypatch):

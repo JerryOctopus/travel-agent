@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -17,6 +18,7 @@ from scripts.eval_product_multi_model import (
     load_pending_case_outputs,
     parse_models,
     pick_api_key,
+    provider_tool_quota_error,
     provider_reported_models,
     relay_mode_enabled,
     recorded_model_identity,
@@ -116,6 +118,33 @@ def test_provider_reported_model_identity_is_recorded_separately() -> None:
     assert provider_reported_models(result) == [
         "provider-resolved-a", "provider-resolved-b",
     ]
+
+
+def test_provider_tool_quota_error_detects_amap_abort() -> None:
+    result = _result(["attraction", "transport", "planner"])
+    result = replace(
+        result,
+        turns=[
+            replace(
+                result.turns[0],
+                error=(
+                    "ProviderRateLimitError: AMap rate limit: "
+                    "USER_DAILY_QUERY_OVER_LIMIT (10044)"
+                ),
+            )
+        ],
+    )
+
+    assert "10044" in provider_tool_quota_error(result)
+
+
+def test_provider_tool_quota_error_ignores_model_quota() -> None:
+    result = _result(["attraction", "transport", "planner"])
+    result.turns[0].model_calls.append(
+        {"status": "error", "error": "insufficient balance"}
+    )
+
+    assert provider_tool_quota_error(result) is None
 
 
 def test_local_model_token_cap_is_opt_in(monkeypatch) -> None:

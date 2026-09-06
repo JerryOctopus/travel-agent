@@ -359,6 +359,26 @@ def provider_reported_models(result) -> list[str]:
     })
 
 
+def provider_tool_quota_error(result) -> str | None:
+    """Return an explicit configured-tool quota failure, excluding LLM quota errors."""
+    messages = [str(item) for item in (result.errors or []) if item]
+    for turn in result.turns:
+        messages.extend(
+            str(item)
+            for item in (turn.error, turn.raw_failure)
+            if item
+        )
+    markers = (
+        "providerratelimiterror",
+        "amap rate limit",
+        "user_daily_query_over_limit",
+    )
+    return next(
+        (message for message in messages if any(marker in message.lower() for marker in markers)),
+        None,
+    )
+
+
 def load_state(state_path: Path) -> dict[str, Any]:
     if state_path.exists():
         return json.loads(state_path.read_text(encoding="utf-8"))
@@ -738,8 +758,10 @@ def main() -> None:
         state["rows"] = rows
         save_state(state_path, state)
 
+    fatal_tool_quota_error: str | None = None
+
     def try_models_for_case(case) -> bool:
-        nonlocal current_model_index, attempts_total
+        nonlocal current_model_index, attempts_total, fatal_tool_quota_error
         local_switches = 0
         case_key = case.case_id
         last_reason: str | None = None
@@ -789,8 +811,9 @@ def main() -> None:
 
             state["attempts_by_case"][case_key] = state["attempts_by_case"].get(case_key, 0) + 1
 
+            fatal_tool_quota_error = provider_tool_quota_error(result)
             errors = [item for item in row.get("model_call_errors", [])]
-            if errors:
+            if errors and fatal_tool_quota_error is None:
                 all_error = " ".join(str(item) for item in errors).lower()
                 if is_quota_error(all_error):
                     print(f"[quota] {case.case_id} hits quota on {model_key}, switch next.")
@@ -849,6 +872,11 @@ def main() -> None:
             append_case_output(output)
             row["runtime_model"] = model
             rows.append(row)
+            if fatal_tool_quota_error is not None:
+                state["rows"] = rows
+                state["fatal_tool_quota_error"] = fatal_tool_quota_error
+                save_state(state_path, state)
+                return True
             completed_cases.add(case_key)
             state["completed_case_ids"] = sorted(completed_cases)
             state["rows"] = rows
@@ -911,6 +939,14 @@ def main() -> None:
             )
             print(f"[stop] {stop_reason}")
             break
+        if fatal_tool_quota_error is not None:
+            stopped_early = True
+            stop_reason = (
+                "configured tool provider quota exhausted after "
+                f"{len(completed_cases)} completed cases: {fatal_tool_quota_error}"
+            )
+            print(f"[stop] {stop_reason}")
+            break
 
     summary = aggregate_product_rows(rows, remediation_complete=args.remediation_complete)
     relay_enabled = relay_mode_enabled(state["models"])
@@ -924,6 +960,7 @@ def main() -> None:
     summary["model_attempts_by_case"] = state.get("attempts_by_case", {})
     summary["model_switch_log"] = state.get("model_switch_log", [])
     summary["model_switch_count"] = len(state.get("model_switch_log", []))
+    summary["environment_abort_reason"] = fatal_tool_quota_error
 
     recorded_provider, recorded_model = recorded_model_identity(state["models"])
     suite_result = HarnessSuiteResult(
@@ -988,6 +1025,7 @@ def main() -> None:
                 "attempts_total": attempts_total,
                 "current_model_index": current_model_index,
             },
+            "environment_abort_reason": fatal_tool_quota_error,
             "_case_outputs": case_outputs,
         },
         benchmarks=[],

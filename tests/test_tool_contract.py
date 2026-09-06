@@ -21,6 +21,7 @@ from travel_agent.agent.tool_contract import (
     normalize_tool_arguments,
     tool_execution_policy,
 )
+from travel_agent.providers import ProviderRateLimitError
 
 
 def test_invalid_city_is_rejected_before_provider(monkeypatch) -> None:
@@ -125,6 +126,21 @@ def test_rate_limit_exception_has_stable_retryable_code() -> None:
     result = limited(ctx, city="杭州")
     assert result["error_code"] == "RATE_LIMITED"
     assert result["retryable"] is True
+
+
+def test_provider_quota_cancels_active_request_and_is_not_normalized() -> None:
+    ctx = build_session(session_id="contract-provider-quota", persist=False)
+    ctx.request_control = RequestControl("request-provider-quota")
+
+    @contracted_tool("search_hotel")
+    def limited(_ctx, city=None):
+        raise ProviderRateLimitError(
+            "AMap rate limit: USER_DAILY_QUERY_OVER_LIMIT (10044)"
+        )
+
+    with pytest.raises(ProviderRateLimitError, match="10044"):
+        limited(ctx, city="杭州")
+    assert ctx.request_control.cancelled is True
 
 
 def test_success_envelope_remains_backward_compatible() -> None:

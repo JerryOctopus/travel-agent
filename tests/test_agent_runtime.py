@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+import pytest
+
 from travel_agent.agent.runtime import (
     _build_chat_model,
     _reply_from_outcome,
@@ -15,6 +19,7 @@ from travel_agent.orchestration.multi_agent.schemas import (
     ReviewResult,
     SubagentResult,
 )
+from travel_agent.providers import ProviderRateLimitError
 from travel_agent.settings import LLMSettings, Settings
 
 
@@ -64,6 +69,49 @@ def test_direct_deepseek_v4_flash_explicitly_disables_thinking(monkeypatch) -> N
 
     assert captured["temperature"] == 0.2
     assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_provider_quota_bypasses_offline_fallback_and_releases_owned_control(
+    monkeypatch,
+    offline_settings,
+) -> None:
+    ctx = build_session(session_id="provider-quota-lifecycle", persist=False)
+    settings = replace(
+        offline_settings,
+        llm=LLMSettings(
+            provider="deepseek",
+            api_key="test-key",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-v4-flash",
+        ),
+    )
+
+    def provider_quota(_engine, local_ctx, *_args, **_kwargs):
+        assert local_ctx.request_control is not None
+        local_ctx.request_control.cancel()
+        raise ProviderRateLimitError(
+            "AMap rate limit: USER_DAILY_QUERY_OVER_LIMIT (10044)"
+        )
+
+    def forbidden_fallback(*_args, **_kwargs):
+        raise AssertionError("provider quota must not enter offline fallback")
+
+    monkeypatch.setattr(
+        "travel_agent.orchestration.multi_agent.MultiAgentEngine.run_turn",
+        provider_quota,
+    )
+    monkeypatch.setattr(
+        "travel_agent.agent.turn_lifecycle._run_offline_fallback",
+        forbidden_fallback,
+    )
+
+    with pytest.raises(ProviderRateLimitError, match="10044"):
+        run_production_turn(
+            "帮我规划杭州两天行程，喜欢自然",
+            ctx=ctx,
+            settings=settings,
+        )
+    assert ctx.request_control is None
 
 
 def test_direct_deepseek_v4_flash_thinking_mode_sets_effort(monkeypatch) -> None:

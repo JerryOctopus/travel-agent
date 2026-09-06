@@ -420,6 +420,7 @@ def contracted_tool(tool_name: str) -> Callable[[F], F]:
         @wraps(fn)
         def wrapped(ctx: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
             from travel_agent.agent.session import RequestCancelledError, session_tool_lock
+            from travel_agent.providers import ProviderRateLimitError
 
             control = getattr(ctx, "request_control", None)
             if control is not None:
@@ -449,6 +450,13 @@ def contracted_tool(tool_name: str) -> Callable[[F], F]:
                         control.check_active()
                     value = fn(*bound.args, **bound.kwargs)
                 except RequestCancelledError:
+                    raise
+                except ProviderRateLimitError:
+                    # A live provider quota is an evaluation-environment failure,
+                    # not a recoverable tool result. Cancel sibling work that
+                    # shares this request and let the runner stop the full suite.
+                    if control is not None:
+                        control.cancel()
                     raise
                 except Exception as exc:  # noqa: BLE001 - normalize tool/provider failures
                     return _exception_envelope(tool_name, exc)
