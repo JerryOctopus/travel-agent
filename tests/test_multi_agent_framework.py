@@ -753,6 +753,79 @@ def test_reviewer_downgrades_soft_route_limit_and_budget_risk_band():
     assert {issue.severity for issue in review.issues} == {"noncritical"}
 
 
+def test_reviewer_downgrades_implicit_pace_route_issue_with_hard_transport_rules():
+    ctx = ReviewContext(
+        request_id="req_implicit_pace",
+        plan={
+            "critic": {
+                "passed": True,
+                "issues": [{"code": "route_too_long", "severity": "warning"}],
+            },
+            "validation_result": {"passed": True, "checks_run": []},
+        },
+        profile_brief={
+            "pace": "standard",
+            "constraint_state": {
+                "public_transport_required": True,
+                "max_single_walk_min": 20,
+            },
+        },
+    )
+
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "route_duration_exceeds_pace",
+                "severity": "recoverable",
+                "description": "公共交通通勤耗时62分钟，超过standard节奏建议上限60分钟。",
+                "evidence": ["itinerary.days[0].stops[1].route_from_previous.duration_min = 62"],
+                "repair_target": "planner",
+                "repair_instruction": "调整顺序。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_keeps_explicit_pace_route_issue_recoverable():
+    ctx = ReviewContext(
+        request_id="req_explicit_pace",
+        plan={
+            "critic": {
+                "passed": True,
+                "issues": [{"code": "route_too_long", "severity": "warning"}],
+            },
+            "validation_result": {"passed": True, "checks_run": []},
+        },
+        profile_brief={
+            "pace": "relaxed",
+            "constraint_state": {"pace": "relaxed"},
+        },
+    )
+
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "route_duration_exceeds_pace",
+                "severity": "recoverable",
+                "description": "通勤耗时56分钟，超过relaxed节奏建议上限45分钟。",
+                "evidence": ["itinerary.days[1].stops[1].route_from_previous.duration_min = 56"],
+                "repair_target": "planner",
+                "repair_instruction": "调整顺序。",
+            }],
+        },
+    )
+
+    assert review.verdict == "rework"
+    assert review.issues[0].severity == "recoverable"
+
+
 def test_reviewer_does_not_treat_default_transport_as_user_taxi_prohibition():
     ctx = ReviewContext(
         request_id="req_default_transport_fallback",

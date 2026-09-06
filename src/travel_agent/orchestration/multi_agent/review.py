@@ -851,10 +851,22 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             if isinstance(item, dict)
             and str(item.get("severity") or "warning").lower() == "warning"
         }
-        soft_route_pace_claim = (
+        issue_type_lower = str(issue.issue_type or "").casefold()
+        route_pace_claim = bool(
             "route_too_long" in combined_lower
+            or ("route" in issue_type_lower and "pace" in issue_type_lower)
+            or any(
+                marker in combined_lower
+                for marker in (
+                    "节奏建议上限", "pace suggested limit", "pace limit",
+                )
+            )
+        )
+        soft_route_pace_claim = bool(
+            route_pace_claim
             and "route_too_long" in critic_warnings
-            and not hard_route_state
+            and state.get("pace") in (None, "")
+            and not hard_timed_route_claim
         )
         soft_route_evidence_gap = (
             (
