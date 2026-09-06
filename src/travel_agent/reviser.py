@@ -139,6 +139,10 @@ def _repair_long_routes(
     """
     single_limit = {"relaxed": 45, "standard": 60, "intensive": 75}[profile.pace]
     daily_limit = {"relaxed": 75, "standard": 110, "intensive": 150}[profile.pace]
+    explicit_relaxed_pace = (
+        profile.pace == "relaxed"
+        and (profile.constraint_state or {}).get("pace") == "relaxed"
+    )
     optional_terms = [
         str(item)
         for item in ((profile.constraint_state or {}).get("optional_remove") or [])
@@ -290,16 +294,23 @@ def _repair_long_routes(
         # A literal walking cap is a hard constraint.  Replacing one remote
         # optional stop with another can remain over the cap after the route
         # provider recomputes the path, so reduce load before optimizing variety.
-        if (walking_exceeded or fixed_endpoint_route) and len(stops) > 1:
+        if (
+            walking_exceeded
+            or fixed_endpoint_route
+            or (explicit_relaxed_pace and bool(bad))
+        ) and len(stops) > 1:
             stops.pop(culprit_index)
             if walking_exceeded:
                 notes.append(
                     f"为满足每日步行上限，删减可选地点 `{culprit.poi.name}`。"
                 )
             else:
-                notes.append(
-                    f"为保障固定时段活动，删减长通勤端点 `{culprit.poi.name}`。"
+                reason = (
+                    "为满足显式轻松节奏"
+                    if explicit_relaxed_pace and not fixed_endpoint_route
+                    else "为保障固定时段活动"
                 )
+                notes.append(f"{reason}，删减长通勤端点 `{culprit.poi.name}`。")
         elif replacement is not None:
             stops[culprit_index] = _stop_from_scored(
                 replacement, culprit.start_time
@@ -492,6 +503,11 @@ def _fill_sparse_activity_days(
         if (
             day.day_index in fixed_days
             or activity_count >= 2
+            or (
+                activity_count >= 1
+                and profile.pace == "relaxed"
+                and (profile.constraint_state or {}).get("pace") == "relaxed"
+            )
         ):
             days.append(day)
             continue

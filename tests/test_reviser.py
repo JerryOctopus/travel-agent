@@ -139,6 +139,65 @@ def test_reviser_replaces_optional_endpoint_of_overlong_route() -> None:
     assert any("超长通勤" in note for note in notes)
 
 
+def test_explicit_relaxed_pace_drops_unverified_replacement_and_keeps_free_time() -> None:
+    def poi(poi_id: str, name: str, lng: float) -> POI:
+        return POI(
+            poi_id=poi_id,
+            name=name,
+            city="测试城",
+            category="scenic",
+            lat=30.0,
+            lng=lng,
+            rating=4.6,
+            popularity=0.8,
+            tags=["nature"],
+            estimated_duration_min=90,
+            price_level="mid",
+        )
+
+    required = poi("required", "核心景点", 120.0)
+    remote = poi("remote", "可选景点", 120.1)
+    straight_line_nearby = poi("nearby", "直线距离近的候选", 120.01)
+    itinerary = Itinerary(
+        city="测试城",
+        summary="test",
+        days=[
+            ItineraryDay(
+                day_index=1,
+                theme="test",
+                stops=[
+                    ItineraryStop(required, "09:30", 90, ""),
+                    ItineraryStop(
+                        remote,
+                        "14:30",
+                        90,
+                        "",
+                        RouteInfo("required", "remote", 8, 65, "public_transport"),
+                    ),
+                ],
+            )
+        ],
+    )
+    profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        pace="relaxed",
+        must_visit=["核心景点"],
+        constraint_state={"pace": "relaxed", "must_visit": ["核心景点"]},
+    )
+
+    revised, result, notes = revise_itinerary(
+        itinerary,
+        [ScoredPOI(straight_line_nearby, 1.0, [])],
+        profile,
+        critique_itinerary(itinerary, profile),
+    )
+
+    assert [stop.poi.poi_id for stop in revised.days[0].stops] == ["required"]
+    assert "route_too_long" not in {issue.code for issue in result.issues}
+    assert any("显式轻松节奏" in note for note in notes)
+
+
 def test_long_route_repair_prefers_reusing_nearby_meal_over_dropping_activity() -> None:
     activity = POI("activity", "城内博物馆", "测试城", "museum", 30.0, 120.0, 4.5, 0.8, ["history"], 90, "mid")
     remote_meal = POI("remote-meal", "远郊合规餐厅", "测试城", "food", 30.0, 120.8, 4.5, 0.8, ["food", "halal"], 60, "mid")
