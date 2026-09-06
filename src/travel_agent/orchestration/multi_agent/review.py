@@ -718,6 +718,19 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
         and origin_route_bound
         and return_route_bound
     )
+    raw_transport_modes = state.get("transport_modes") or []
+    if isinstance(raw_transport_modes, str):
+        raw_transport_modes = [raw_transport_modes]
+    allowed_transport_modes = {
+        str(mode).strip().casefold()
+        for mode in raw_transport_modes
+        if str(mode).strip()
+    }
+    validation_checks = {
+        str(check).strip()
+        for check in (plan.get("validation_result") or {}).get("checks_run") or []
+        if str(check).strip()
+    }
     hard_mobility_evidence_required = bool(
         state.get("wheelchair_user")
         or state.get("accessibility_priority")
@@ -878,6 +891,20 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             and (plan.get("critic") or {}).get("passed") is True
             and (plan.get("validation_result") or {}).get("passed") is True
         )
+        explicitly_allowed_taxi_claim = bool(
+            "taxi" in allowed_transport_modes
+            and state.get("taxi_backup") is True
+            and any(
+                marker in combined_lower
+                for marker in ("taxi", "出租车", "打车")
+            )
+            and any(
+                marker in str(issue.issue_type or "").casefold()
+                for marker in ("transport", "route")
+            )
+            and (plan.get("critic") or {}).get("passed") is True
+            and (plan.get("validation_result") or {}).get("passed") is True
+        )
         bounded_mobility_evidence_gap = bool(
             bounded_taxi_fallback
             and not state.get("wheelchair_user")
@@ -926,6 +953,27 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
                 )
             )
         )
+        verified_return_feasibility_advisory = bool(
+            verified_return_anchor
+            and "return" in str(issue.issue_type or "").casefold()
+            and "feasibility" in str(issue.issue_type or "").casefold()
+            and any(
+                marker in combined_lower
+                for marker in (
+                    "满足", "可在截止前", "截止前到", "before the deadline",
+                    "meets the deadline", "within the deadline",
+                )
+            )
+            and not any(
+                marker in combined_lower
+                for marker in (
+                    "无法满足", "不能满足", "超过截止", "晚于截止",
+                    "misses the deadline", "after the deadline",
+                )
+            )
+            and (plan.get("critic") or {}).get("passed") is True
+            and (plan.get("validation_result") or {}).get("passed") is True
+        )
         soft_schedule_rhythm_advisory = bool(
             (
                 any(
@@ -965,6 +1013,26 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
                     "no route evidence",
                 )
             )
+        )
+        missing_hours_quality_advisory = bool(
+            any(
+                marker in str(issue.issue_type or "").casefold()
+                for marker in ("attraction_quality", "poi_quality", "venue_quality")
+            )
+            and any(
+                marker in combined_lower
+                for marker in ("opening_hours", "opening hours", "开放时间", "开放状态")
+            )
+            and "applicable_opening_hours" in validation_checks
+            and not any(
+                marker in combined_lower
+                for marker in (
+                    "明确闭馆", "确认闭馆", "当天闭馆", "不开放",
+                    "known closed", "is closed", "closed on",
+                )
+            )
+            and (plan.get("critic") or {}).get("passed") is True
+            and (plan.get("validation_result") or {}).get("passed") is True
         )
         soft_interest_gap = (
             "interest" in str(issue.issue_type or "").casefold()
@@ -1047,11 +1115,14 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             or soft_route_pace_claim
             or soft_route_evidence_gap
             or default_transport_fallback_claim
+            or explicitly_allowed_taxi_claim
             or bounded_mobility_evidence_gap
             or nonrequired_internal_accessibility_claim
             or deterministic_schedule_advisory
+            or verified_return_feasibility_advisory
             or soft_schedule_rhythm_advisory
             or false_missing_route_claim
+            or missing_hours_quality_advisory
             or soft_interest_gap
             or soft_preference_gap
             or uncertain_budget_band_only

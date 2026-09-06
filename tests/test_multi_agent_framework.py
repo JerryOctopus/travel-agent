@@ -1352,6 +1352,197 @@ def test_reviewer_defers_to_verified_return_anchor_for_return_schedule_claim():
     assert review.issues[0].severity == "noncritical"
 
 
+def test_reviewer_defers_to_verified_return_anchor_for_route_feasibility_wording():
+    ctx = ReviewContext(
+        request_id="req_verified_return_route_feasibility",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+            "required_route_anchors": {
+                "last_stop_to_return_location": {
+                    "evidence_status": "provider_verified",
+                    "recommended_latest_departure": "2027-06-01T17:36+08:00",
+                    "route": {"hard_feasibility_proven": True, "duration_min": 54},
+                },
+            },
+        },
+        profile_brief={
+            "constraint_state": {
+                "return_location": "南站",
+                "return_deadline": "2027-06-01T19:00+08:00",
+            }
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "return_route_feasibility",
+                "severity": "recoverable",
+                "description": "16:30离开可在截止前到站，但仍需确认96分钟缓冲是否足够。",
+                "evidence": [
+                    "required_route_anchors.last_stop_to_return_location.recommended_latest_departure="
+                    "2027-06-01T17:36+08:00"
+                ],
+                "repair_target": "planner",
+                "repair_instruction": "再次确认返程缓冲。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_accepts_taxi_when_explicit_transport_set_and_backup_allow_it():
+    ctx = ReviewContext(
+        request_id="req_explicit_taxi_backup",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+        },
+        profile_brief={
+            "constraint_state": {
+                "public_transport_required": True,
+                "transport_modes": ["public_transport", "taxi"],
+                "taxi_backup": True,
+            }
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "transport_mode_conflict",
+                "severity": "recoverable",
+                "description": "两段使用 taxi，缺少对应公共交通路线证据。",
+                "evidence": [
+                    "active_constraints.transport_modes=['public_transport','taxi']; "
+                    "active_constraints.taxi_backup=true"
+                ],
+                "repair_target": "transport",
+                "repair_instruction": "全部替换为公共交通。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_keeps_taxi_conflict_when_public_transport_is_the_only_allowed_mode():
+    ctx = ReviewContext(
+        request_id="req_public_transport_only",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+        },
+        profile_brief={
+            "constraint_state": {
+                "public_transport_required": True,
+                "transport_modes": ["public_transport"],
+                "taxi_backup": False,
+            }
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "transport_mode_conflict",
+                "severity": "recoverable",
+                "description": "路线使用 taxi，违反仅公共交通的明确约束。",
+                "evidence": ["active_constraints.transport_modes=['public_transport']"],
+                "repair_target": "transport",
+                "repair_instruction": "改为公共交通。",
+            }],
+        },
+    )
+
+    assert review.verdict == "rework"
+    assert review.issues[0].severity == "recoverable"
+
+
+def test_reviewer_treats_missing_hours_on_verified_optional_poi_as_advisory():
+    ctx = ReviewContext(
+        request_id="req_verified_optional_missing_hours",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": [{
+                "poi": {
+                    "poi_id": "verified-optional",
+                    "name": "城市旧址",
+                    "source": "amap",
+                    "verification_status": "verified",
+                    "entity_type": "attraction",
+                }
+            }]}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {
+                "passed": True,
+                "issues": [],
+                "checks_run": ["applicable_opening_hours"],
+            },
+        },
+        profile_brief={"constraint_state": {}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "attraction_quality_concern",
+                "severity": "recoverable",
+                "description": "该候选缺少 opening_hours，需核实游览价值和开放状态。",
+                "evidence": ["itinerary.days[0].stops[0].poi.opening_hours is missing"],
+                "repair_target": "attraction",
+                "repair_instruction": "替换景点。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_keeps_known_closure_conflict_recoverable():
+    ctx = ReviewContext(
+        request_id="req_known_closure",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": False, "issues": [{"code": "poi_closed"}]},
+            "validation_result": {
+                "passed": False,
+                "issues": [{"code": "applicable_opening_hours"}],
+                "checks_run": ["applicable_opening_hours"],
+            },
+        },
+        profile_brief={"constraint_state": {}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "attraction_quality_concern",
+                "severity": "recoverable",
+                "description": "该场馆在行程日期明确闭馆，开放状态冲突。",
+                "evidence": ["validation_result.issues[0].code=applicable_opening_hours"],
+                "repair_target": "attraction",
+                "repair_instruction": "替换为开放场馆。",
+            }],
+        },
+    )
+
+    assert review.verdict == "rework"
+    assert review.issues[0].severity == "recoverable"
+
+
 def test_reviewer_defers_to_validated_route_bindings_for_schedule_gap_claim() -> None:
     ctx = ReviewContext(
         request_id="req_validated_route_bindings",
