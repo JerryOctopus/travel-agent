@@ -17,7 +17,7 @@ import copy
 import math
 import re
 from datetime import date, datetime, time, timedelta
-from typing import Any
+from typing import Any, Callable
 
 from travel_agent.agent.render import (
     build_itinerary_cards,
@@ -1683,6 +1683,7 @@ def plan_and_critique(
         ctx.provider if route_estimator is None else route_estimator,
     )
     audit_assembled_terminal("post_fixed_close_terminal_poi_id")
+    _persist_final_itinerary_routes(ctx, itinerary_dict, domain_inputs, records)
     required_route_anchors, anchor_issues = _build_required_route_anchors(
         ctx.profile, itinerary_dict, domain_inputs
     )
@@ -2073,13 +2074,37 @@ def _build_meal_strategy(
                 ):
                     verified_dietary_restaurants.append(raw)
 
+    def available_restaurants(start: str, end: str) -> list[dict[str, Any]]:
+        known_open = [
+            restaurant
+            for restaurant in verified_dietary_restaurants
+            if _restaurant_open_for_window(
+                restaurant.get("opening_hours"), start, end
+            ) is True
+        ]
+        if known_open:
+            return known_open
+        has_known_hours = any(
+            _restaurant_open_for_window(
+                restaurant.get("opening_hours"), start, end
+            ) is not None
+            for restaurant in verified_dietary_restaurants
+        )
+        if has_known_hours:
+            return []
+        return verified_dietary_restaurants
+
+    def meal_window_available(start: str, end: str) -> bool:
+        return not verified_dietary_restaurants or bool(
+            available_restaurants(start, end)
+        )
+
     def grounded_reservation(
         *, day_index: int, period: str, start: str, end: str
     ) -> dict[str, Any]:
-        if verified_dietary_restaurants:
-            restaurant = verified_dietary_restaurants[
-                (max(1, day_index) - 1) % len(verified_dietary_restaurants)
-            ]
+        grounded = available_restaurants(start, end)
+        if grounded:
+            restaurant = grounded[(max(1, day_index) - 1) % len(grounded)]
             return {
                 "day_index": day_index,
                 "period": period,
@@ -2163,7 +2188,9 @@ def _build_meal_strategy(
 
         if not meal_periods:
             meal_window = _available_meal_reservation(
-                day, latest_end_min=latest_end_min
+                day,
+                latest_end_min=latest_end_min,
+                window_available=meal_window_available,
             )
             if meal_window is None:
                 unscheduled_meal_days.append({
@@ -2184,7 +2211,11 @@ def _build_meal_strategy(
         # already scheduled dinner. Reserve a separately evidenced lunch even
         # when another food stop exists that day.
         if dietary_constraints and "lunch" not in meal_periods:
-            lunch = _available_meal_reservation(day, latest_end_min=latest_end_min)
+            lunch = _available_meal_reservation(
+                day,
+                latest_end_min=latest_end_min,
+                window_available=meal_window_available,
+            )
             if lunch is not None and lunch[0] < "15:00":
                 meal_start, meal_end = lunch
                 meal_periods.add("lunch")
@@ -2224,6 +2255,7 @@ def _build_meal_strategy(
                     if int(day.get("day_index") or 0) in fixed_event_return_by_day
                     else None
                 ),
+                window_available=meal_window_available,
             )
             if dinner is not None:
                 meal_start, meal_end = dinner
@@ -2294,8 +2326,6 @@ def _build_free_time_plan(
             not in {"food", "restaurant", "cafe", "meal"}
             for stop in stops
         )
-        if activity_count >= 2:
-            continue
         occupied: list[tuple[int, int]] = []
         for stop in stops:
             start = minutes(stop.get("start_time"))
@@ -2338,14 +2368,24 @@ def _build_free_time_plan(
                 merged[-1][1] = max(merged[-1][1], end)
             else:
                 merged.append([start, end])
-        gaps: list[tuple[int, int]] = []
-        cursor = service_start
-        for start, end in merged:
-            if start > cursor:
-                gaps.append((cursor, start))
-            cursor = max(cursor, end)
-        if cursor < service_end:
-            gaps.append((cursor, service_end))
+        if activity_count >= 2:
+            # On a substantive day only explain a real gap between scheduled
+            # items.  Leading/trailing white space is not presented as a
+            # deliberate reservation merely to make the day look fuller.
+            gaps = [
+                (left[1], right[0])
+                for left, right in zip(merged, merged[1:])
+                if right[0] > left[1]
+            ]
+        else:
+            gaps = []
+            cursor = service_start
+            for start, end in merged:
+                if start > cursor:
+                    gaps.append((cursor, start))
+                cursor = max(cursor, end)
+            if cursor < service_end:
+                gaps.append((cursor, service_end))
         gap = max(gaps, key=lambda item: item[1] - item[0], default=None)
         if gap is None or gap[1] - gap[0] < 120:
             continue
@@ -2370,7 +2410,10 @@ def _build_free_time_plan(
 
 
 def _available_meal_reservation(
-    day: dict[str, Any], *, latest_end_min: int | None = None
+    day: dict[str, Any],
+    *,
+    latest_end_min: int | None = None,
+    window_available: Callable[[str, str], bool] | None = None,
 ) -> tuple[str, str] | None:
     """Choose a meal window that also preserves inbound transfer time."""
     occupied = _meal_occupied_intervals(day)
@@ -2378,8 +2421,12 @@ def _available_meal_reservation(
     if latest_end_min is not None:
         latest_lunch_start = min(15 * 60, latest_end_min - 60)
     for candidate in range(11 * 60 + 30, latest_lunch_start + 1, 15):
-        if _meal_window_fits(candidate, occupied):
-            return _offset_clock("00:00", candidate) or "12:00", _offset_clock("00:00", candidate + 60) or "13:00"
+        start = _offset_clock("00:00", candidate) or "12:00"
+        end = _offset_clock("00:00", candidate + 60) or "13:00"
+        if _meal_window_fits(candidate, occupied) and (
+            window_available is None or window_available(start, end)
+        ):
+            return start, end
     # A stop ending at 11:00 and a following inbound transfer beginning just
     # before 12:45 leaves a valid 11:15 lunch, even though the canonical search
     # starts at 11:30.  Use this bounded early slot before declaring lunch
@@ -2388,13 +2435,18 @@ def _available_meal_reservation(
     if (
         early_lunch <= latest_lunch_start
         and _meal_window_fits(early_lunch, occupied)
+        and (window_available is None or window_available("11:15", "12:15"))
     ):
         return "11:15", "12:15"
     for candidate in range(17 * 60 + 30, 20 * 60 + 1, 15):
         if latest_end_min is not None and candidate + 60 > latest_end_min:
             continue
-        if _meal_window_fits(candidate, occupied):
-            return _offset_clock("00:00", candidate) or "18:00", _offset_clock("00:00", candidate + 60) or "19:00"
+        start = _offset_clock("00:00", candidate) or "18:00"
+        end = _offset_clock("00:00", candidate + 60) or "19:00"
+        if _meal_window_fits(candidate, occupied) and (
+            window_available is None or window_available(start, end)
+        ):
+            return start, end
     return None
 
 
@@ -2403,6 +2455,7 @@ def _available_dinner_reservation(
     *,
     latest_end_min: int | None = None,
     earliest_start_min: int | None = None,
+    window_available: Callable[[str, str], bool] | None = None,
 ) -> tuple[str, str] | None:
     """Choose a non-overlapping dinner window within the usable day."""
     occupied = _meal_occupied_intervals(day)
@@ -2413,11 +2466,12 @@ def _available_dinner_reservation(
     if earliest_start_min is not None:
         first_start = max(first_start, ((earliest_start_min + 14) // 15) * 15)
     for candidate in range(first_start, latest_start + 1, 15):
-        if _meal_window_fits(candidate, occupied):
-            return (
-                _offset_clock("00:00", candidate) or "18:00",
-                _offset_clock("00:00", candidate + 60) or "19:00",
-            )
+        start = _offset_clock("00:00", candidate) or "18:00"
+        end = _offset_clock("00:00", candidate + 60) or "19:00"
+        if _meal_window_fits(candidate, occupied) and (
+            window_available is None or window_available(start, end)
+        ):
+            return start, end
     # A long inbound transfer to an explicitly late activity can consume the
     # normal dinner slots.  In that case offer an earlier meal, while keeping
     # 16:30 as the default whenever it is feasible.
@@ -2426,12 +2480,36 @@ def _available_dinner_reservation(
             continue
         if latest_end_min is not None and candidate + 60 > latest_end_min:
             continue
-        if _meal_window_fits(candidate, occupied):
-            return (
-                _offset_clock("00:00", candidate) or "15:30",
-                _offset_clock("00:00", candidate + 60) or "16:30",
-            )
+        start = _offset_clock("00:00", candidate) or "15:30"
+        end = _offset_clock("00:00", candidate + 60) or "16:30"
+        if _meal_window_fits(candidate, occupied) and (
+            window_available is None or window_available(start, end)
+        ):
+            return start, end
     return None
+
+
+def _restaurant_open_for_window(
+    opening_hours: object, start: str, end: str
+) -> bool | None:
+    """Return whether a meal window is covered by provider-stated hours."""
+    text = str(opening_hours or "").strip()
+    intervals = re.findall(
+        r"([01]?\d|2[0-3]):([0-5]\d)\s*(?:-|–|—|~|至)\s*"
+        r"([01]?\d|2[0-3]):([0-5]\d)",
+        text,
+    )
+    if not intervals:
+        return None
+    start_min = _clock_to_minute(start)
+    end_min = _clock_to_minute(end)
+    if start_min is None or end_min is None:
+        return False
+    return any(
+        int(open_hour) * 60 + int(open_minute) <= start_min
+        and end_min <= int(close_hour) * 60 + int(close_minute)
+        for open_hour, open_minute, close_hour, close_minute in intervals
+    )
 
 
 def _meal_occupied_intervals(day: dict[str, Any]) -> list[tuple[int, int]]:
@@ -2805,6 +2883,92 @@ def _same_city(left: object, right: object) -> bool:
 
     left_key, right_key = key(left), key(right)
     return bool(left_key and right_key and left_key == right_key)
+
+
+def _persist_final_itinerary_routes(
+    ctx: SessionContext,
+    itinerary: dict[str, Any],
+    domain_inputs: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> list[str]:
+    """Persist provider-bound adjacent legs from the final itinerary.
+
+    Rebinding happens after the Planner's input artifacts are collected.  The
+    final legs therefore need explicit lineage so downstream review receives
+    the same evidence that the delivered itinerary actually uses.
+    """
+    existing = {
+        (
+            str(payload.get("origin_poi_id") or ""),
+            str(payload.get("destination_poi_id") or ""),
+            str(payload.get("mode") or ""),
+        )
+        for entry in domain_inputs.get("transport") or []
+        if isinstance(entry, dict)
+        for payload in [entry.get("payload", entry)]
+        if isinstance(payload, dict)
+        and canonical_route_evidence_status(payload) == "provider_verified"
+    }
+    persisted: list[str] = []
+    for day in itinerary.get("days") or []:
+        if not isinstance(day, dict):
+            continue
+        previous_poi: dict[str, Any] | None = None
+        for stop in day.get("stops") or []:
+            if not isinstance(stop, dict):
+                continue
+            poi = stop.get("poi") if isinstance(stop.get("poi"), dict) else {}
+            route = (
+                stop.get("route_from_previous")
+                if isinstance(stop.get("route_from_previous"), dict)
+                else None
+            )
+            if previous_poi and route:
+                payload = {
+                    "origin_poi_id": str(
+                        route.get("origin_poi_id") or previous_poi.get("poi_id") or ""
+                    ),
+                    "destination_poi_id": str(
+                        route.get("destination_poi_id") or poi.get("poi_id") or ""
+                    ),
+                    "origin_name": previous_poi.get("name"),
+                    "destination_name": poi.get("name"),
+                    "distance_km": route.get("distance_km"),
+                    "duration_min": route.get("duration_min"),
+                    "mode": route.get("mode"),
+                    "walking_distance_km": route.get("walking_distance_km"),
+                    "source": route.get("source"),
+                    "evidence_status": canonical_route_evidence_status(route),
+                    "day_index": day.get("day_index"),
+                    "route_role": "final_itinerary_adjacent_leg",
+                }
+                key = (
+                    payload["origin_poi_id"],
+                    payload["destination_poi_id"],
+                    str(payload.get("mode") or ""),
+                )
+                if (
+                    payload["origin_poi_id"]
+                    and payload["destination_poi_id"]
+                    and payload["evidence_status"] == "provider_verified"
+                    and key not in existing
+                ):
+                    artifact_id = ctx.store.put("routes", payload)
+                    entry = {
+                        "artifact_id": artifact_id,
+                        "payload": payload,
+                        "post_plan_final_leg": True,
+                    }
+                    domain_inputs.setdefault("transport", []).append(entry)
+                    records.append({
+                        "artifact_id": artifact_id,
+                        "kind": "routes",
+                        "payload": payload,
+                    })
+                    persisted.append(artifact_id)
+                    existing.add(key)
+            previous_poi = poi
+    return persisted
 
 
 def _estimate_hard_route(

@@ -1618,6 +1618,71 @@ def test_sparse_day_exposes_truthful_reserved_free_time_window() -> None:
     }]
 
 
+def test_multi_activity_day_exposes_large_internal_free_time_window() -> None:
+    profile = TravelProfile(destination="合成城", days=1)
+    itinerary = {"days": [{
+        "day_index": 1,
+        "stops": [
+            {
+                "start_time": "09:30",
+                "duration_min": 90,
+                "poi": {"category": "museum", "name": "上午活动"},
+            },
+            {
+                "start_time": "17:30",
+                "duration_min": 90,
+                "poi": {"category": "scenic", "name": "傍晚活动"},
+            },
+        ],
+    }]}
+    meal_strategy = {
+        "scheduled_meals": [
+            {"day_index": 1, "start_time": "11:30", "end_time": "12:30"},
+        ]
+    }
+
+    plan = toolkit._build_free_time_plan(profile, itinerary, meal_strategy, None)
+
+    assert plan["status"] == "explicitly_reserved"
+    assert plan["windows"][0]["start_time"] == "12:30"
+    assert plan["windows"][0]["end_time"] == "17:30"
+
+
+def test_final_provider_routes_are_persisted_in_artifact_lineage() -> None:
+    ctx = _session()
+    itinerary = {"days": [{
+        "day_index": 1,
+        "stops": [
+            {"poi": {"poi_id": "poi-a", "name": "甲景点"}},
+            {
+                "poi": {"poi_id": "poi-b", "name": "乙景点"},
+                "route_from_previous": {
+                    "origin_poi_id": "poi-a",
+                    "destination_poi_id": "poi-b",
+                    "distance_km": 2.5,
+                    "duration_min": 30,
+                    "mode": "public_transport",
+                    "source": "amap",
+                    "evidence_status": "provider_verified",
+                },
+            },
+        ],
+    }]}
+    domain_inputs: dict[str, object] = {}
+    records: list[dict[str, object]] = []
+
+    artifact_ids = toolkit._persist_final_itinerary_routes(
+        ctx, itinerary, domain_inputs, records
+    )
+
+    assert len(artifact_ids) == 1
+    assert records[0]["artifact_id"] == artifact_ids[0]
+    assert domain_inputs["transport"][0]["payload"]["route_role"] == (
+        "final_itinerary_adjacent_leg"
+    )
+    assert ctx.store.get(artifact_ids[0])["destination_name"] == "乙景点"
+
+
 def test_meal_reservation_leaves_transfer_buffer_before_and_after_activities() -> None:
     profile = TravelProfile(
         destination="测试城",
@@ -1884,6 +1949,54 @@ def test_dietary_strategy_adds_grounded_lunch_when_only_dinner_is_scheduled() ->
     assert lunch["poi_id"] == "lunch"
     assert lunch["source"] == "amap"
     assert lunch["is_reservation_only"] is True
+
+
+def test_grounded_dietary_dinner_respects_verified_restaurant_hours() -> None:
+    profile = TravelProfile(
+        destination="合成城",
+        days=1,
+        constraint_state={"dietary": ["仅清真餐厅"], "activity_end_deadline": "21:00"},
+    )
+    itinerary = {"days": [{"day_index": 1, "stops": [
+        {
+            "start_time": "09:00",
+            "duration_min": 120,
+            "poi": {"category": "museum", "name": "上午活动"},
+        },
+        {
+            "start_time": "19:00",
+            "duration_min": 60,
+            "poi": {"category": "scenic", "name": "晚间活动"},
+        },
+    ]}]}
+    domain_inputs = {"restaurants": [{
+        "artifact_id": "restaurants-1",
+        "payload": {"status": "verified", "restaurants": [{
+            "poi_id": "halal-1",
+            "name": "清真餐厅",
+            "city": "合成城",
+            "category": "food",
+            "lat": 30.0,
+            "lng": 120.0,
+            "rating": 4.5,
+            "popularity": 0.8,
+            "tags": ["halal"],
+            "estimated_duration_min": 60,
+            "price_level": "mid",
+            "opening_hours": "11:00-14:30,17:00-21:30",
+            "source": "amap",
+            "verification_status": "verified",
+        }]},
+    }]}
+
+    strategy = toolkit._build_meal_strategy(profile, itinerary, domain_inputs)
+
+    dinner = next(
+        meal for meal in strategy["scheduled_meals"] if meal["period"] == "dinner"
+    )
+    assert dinner["name"] == "清真餐厅"
+    assert dinner["start_time"] == "17:00"
+    assert dinner["end_time"] == "18:00"
 
 
 def test_early_dinner_is_reserved_before_long_evening_activity() -> None:

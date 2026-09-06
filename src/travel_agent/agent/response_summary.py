@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from travel_agent.agent.session import SessionContext
+from travel_agent.poi_evidence import canonical_identity_key
 from travel_agent.workflow_rules import format_interests_display, format_pace_display
 
 _HALLUCINATION_SIGNALS = (
@@ -289,7 +290,16 @@ def _candidate_name_matches(requested: object, actual: object) -> bool:
 
     left = normalize(requested)
     right = normalize(actual)
-    return bool(left and right and (left in right or right in left))
+    if left and right and (left in right or right in left):
+        return True
+    museum_marker = re.compile(r"(?:博物馆|博物院|纪念馆|美术馆|展览馆)")
+    if not (museum_marker.search(left) and museum_marker.search(right)):
+        return False
+    left_key = canonical_identity_key(left, entity_type="museum")
+    right_key = canonical_identity_key(right, entity_type="museum")
+    left_key = re.sub(r"(?:特别行政区|自治区|省|市)$", "", left_key)
+    right_key = re.sub(r"(?:特别行政区|自治区|省|市)$", "", right_key)
+    return bool(left_key and right_key and left_key == right_key)
 
 
 def fallback_no_artifact_message() -> str:

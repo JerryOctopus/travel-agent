@@ -556,6 +556,25 @@ def _compact_tool_facts(
                 referenced_names=referenced_names,
                 final_answer=final_answer,
             )
+    attraction_entries = domain_inputs.get("attractions") or []
+    attraction_items: list[dict[str, Any]] = []
+    attraction_city = None
+    for entry in attraction_entries:
+        payload = entry.get("payload", entry) if isinstance(entry, dict) else {}
+        if not isinstance(payload, dict):
+            continue
+        attraction_city = attraction_city or payload.get("city")
+        for key in ("pois", "items", "candidates"):
+            for item in payload.get(key) or []:
+                if isinstance(item, dict):
+                    attraction_items.append(item.get("poi", item))
+    if attraction_items:
+        facts["candidates"] = _compact_evidence_collection(
+            {"city": attraction_city, "pois": attraction_items},
+            referenced_ids=referenced_ids,
+            referenced_names=referenced_names,
+            final_answer=final_answer,
+        )
     transport = domain_inputs.get("transport") or []
     if transport:
         facts["routes"] = [
@@ -578,7 +597,11 @@ def _compact_evidence_collection(
     )
     if list_key is None:
         return _pick_fields(value, ("city", "query", "source", "summary"))
-    items = [item for item in value[list_key] if isinstance(item, dict)]
+    items = [
+        item.get("poi", item)
+        for item in value[list_key]
+        if isinstance(item, dict) and isinstance(item.get("poi", item), dict)
+    ]
     referenced = [
         item
         for item in items

@@ -482,6 +482,48 @@ def test_rebind_uses_verified_taxi_when_transit_exceeds_pace_limit() -> None:
     assert route.evidence_status == "provider_verified"
 
 
+def test_rebind_does_not_switch_to_taxi_when_public_transport_is_required() -> None:
+    a, b = _poi("a", "甲馆"), _poi("b", "乙馆")
+    itinerary = Itinerary("测试城", [ItineraryDay(1, "", [
+        ItineraryStop(a, "09:30", 60, ""),
+        ItineraryStop(b, "12:00", 60, ""),
+    ])], "")
+
+    class Estimator:
+        calls: list[str] = []
+
+        def estimate_route(self, origin, destination, mode):
+            self.calls.append(mode)
+            return normalize_route_evidence(RouteInfo(
+                origin_poi_id=origin.poi_id,
+                destination_poi_id=destination.poi_id,
+                distance_km=15.0,
+                duration_min=68 if mode == "public_transport" else 24,
+                mode=mode,
+                source="amap",
+            ))
+
+    estimator = Estimator()
+    rebound = rebind_itinerary_routes(
+        itinerary,
+        TravelProfile(
+            destination="测试城",
+            days=1,
+            pace="standard",
+            constraint_state={
+                "public_transport_required": True,
+                "transport_modes": ["public_transport"],
+            },
+        ),
+        estimator,
+    )
+
+    route = rebound.days[0].stops[1].route_from_previous
+    assert estimator.calls == ["public_transport"]
+    assert route is not None
+    assert route.mode == "public_transport"
+
+
 @pytest.mark.parametrize("context", ["fixed_appointment", "return_deadline", "accessibility", "intercity"])
 def test_haversine_route_cannot_prove_hard_feasibility(context) -> None:
     estimate = _route("a", "b", source="haversine_recovery_estimate")

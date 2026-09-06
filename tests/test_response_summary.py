@@ -271,6 +271,32 @@ def test_candidate_verification_distinguishes_scheduled_from_unscheduled() -> No
     assert "候选核验可安排：甲、乙" not in text
 
 
+def test_candidate_verification_matches_generic_museum_name_variant() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile = TravelProfile(destination="测试城", days=1)
+    ctx.store.put(
+        "itinerary",
+        {
+            "itinerary": {
+                "summary": "测试城一日游",
+                "days": [{
+                    "day_index": 1,
+                    "stops": [{"poi": {"name": "测试省博物馆"}}],
+                }],
+            },
+            "critic": {"passed": True, "issues": []},
+            "candidate_verification": {
+                "results": [{"requested_name": "测试博物院", "status": "suitable"}]
+            },
+        },
+    )
+
+    text = build_plan_reply_text(ctx)
+
+    assert "候选核验已排入：测试博物院" in text
+    assert "未排入：测试博物院" not in text
+
+
 def test_plan_reply_explains_reserved_sparse_day_window() -> None:
     ctx = build_session(persist=False)
     ctx.profile = TravelProfile(destination="测试城", days=2)

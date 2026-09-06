@@ -1099,8 +1099,23 @@ def _estimate_stop_route(
         and route.mode == "public_transport"
         and route.duration_min > pace_limit
     )
+    raw_transport_modes = state.get("transport_modes") or []
+    if isinstance(raw_transport_modes, str):
+        raw_transport_modes = [raw_transport_modes]
+    explicit_taxi_backup = bool(
+        state.get("taxi_backup") is True
+        or str(state.get("fallback_transport") or "").lower() in {"taxi", "drive"}
+        or any(
+            str(mode).lower() in {"taxi", "drive"}
+            for mode in raw_transport_modes
+        )
+    )
+    taxi_fallback_allowed = bool(
+        not state.get("public_transport_required") or explicit_taxi_backup
+    )
     if (
         profile.transport_mode not in {"taxi", "drive"}
+        and taxi_fallback_allowed
         and (
             (
                 has_walking_cap

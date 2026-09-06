@@ -476,6 +476,74 @@ def test_independent_judge_payload_keeps_every_final_grounded_poi() -> None:
     assert evidence_ids == {poi["poi_id"] for poi in pois}
 
 
+def test_independent_judge_payload_merges_bound_domain_attractions_and_routes() -> None:
+    case = _case_output()
+    final_pois = [
+        {
+            "poi_id": "poi-a",
+            "name": "甲景点",
+            "city": "杭州",
+            "category": "scenic",
+            "source": "amap",
+        },
+        {
+            "poi_id": "poi-b",
+            "name": "乙景点",
+            "city": "杭州",
+            "category": "scenic",
+            "source": "amap",
+        },
+    ]
+    case["final_itinerary"]["itinerary"] = {
+        "city": "杭州",
+        "days": [{
+            "day_index": 1,
+            "stops": [
+                {"poi": final_pois[0], "start_time": "09:00", "duration_min": 60},
+                {
+                    "poi": final_pois[1],
+                    "start_time": "11:00",
+                    "duration_min": 60,
+                    "route_from_previous": {
+                        "origin_poi_id": "poi-a",
+                        "destination_poi_id": "poi-b",
+                        "duration_min": 30,
+                        "distance_km": 2.5,
+                        "mode": "public_transport",
+                        "source": "amap",
+                    },
+                },
+            ],
+        }],
+    }
+    case["final_itinerary"]["domain_inputs"] = {
+        "attractions": [{"payload": {"city": "杭州", "pois": final_pois}}],
+        "transport": [{"payload": {
+            "origin_poi_id": "poi-a",
+            "destination_poi_id": "poi-b",
+            "duration_min": 30,
+            "distance_km": 2.5,
+            "mode": "public_transport",
+            "source": "amap",
+            "evidence_status": "provider_verified",
+        }}],
+    }
+    case["final_artifacts"]["candidates"] = {
+        "city": "杭州",
+        "pois": [{"poi_id": "unrelated", "name": "旧候选", "source": "amap"}],
+    }
+
+    payload = _judge_payload(case)
+
+    evidence_ids = {
+        item["poi_id"] for item in payload["tool_facts"]["candidates"]["pois"]
+    }
+    assert evidence_ids == {"poi-a", "poi-b"}
+    assert payload["tool_facts"]["routes"] == [
+        case["final_itinerary"]["domain_inputs"]["transport"][0]["payload"]
+    ]
+
+
 def test_independent_judge_payload_includes_structured_return_plan() -> None:
     case = _case_output()
     case["final_itinerary"]["return_plan"] = {
