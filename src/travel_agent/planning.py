@@ -1088,13 +1088,29 @@ def _estimate_stop_route(
         and route.mode == "public_transport"
         and route.walking_distance_km is None
     )
+    pace_limit = {
+        "relaxed": 45,
+        "standard": 60,
+        "intensive": 75,
+    }[profile.pace]
+    transit_exceeds_pace = bool(
+        route_is_bound
+        and route is not None
+        and route.mode == "public_transport"
+        and route.duration_min > pace_limit
+    )
     if (
-        has_walking_cap
-        and profile.transport_mode not in {"taxi", "drive"}
+        profile.transport_mode not in {"taxi", "drive"}
         and (
-            not route_is_bound
-            or canonical_route_evidence_status(route) != "provider_verified"
-            or transit_walk_is_unknown
+            (
+                has_walking_cap
+                and (
+                    not route_is_bound
+                    or canonical_route_evidence_status(route) != "provider_verified"
+                    or transit_walk_is_unknown
+                )
+            )
+            or transit_exceeds_pace
         )
     ):
         try:
@@ -1104,6 +1120,14 @@ def _estimate_stop_route(
             if (
                 route_supports_endpoints(taxi_route, origin.poi_id, destination.poi_id)
                 and canonical_route_evidence_status(taxi_route) == "provider_verified"
+                and (
+                    not transit_exceeds_pace
+                    or (
+                        taxi_route.duration_min <= pace_limit
+                        and route is not None
+                        and taxi_route.duration_min < route.duration_min
+                    )
+                )
             ):
                 return taxi_route
         except Exception:
@@ -1144,12 +1168,22 @@ def rebind_itinerary_routes(
         for stop in day.stops:
             previous = stops[-1].poi if stops else None
             existing = stop.route_from_previous
+            existing_exceeds_pace = bool(
+                existing is not None
+                and existing.mode == "public_transport"
+                and existing.duration_min > {
+                    "relaxed": 45,
+                    "standard": 60,
+                    "intensive": 75,
+                }[profile.pace]
+            )
             route = (
                 normalize_route_evidence(existing)
                 if previous is not None
                 and existing is not None
                 and route_supports_endpoints(existing, previous.poi_id, stop.poi.poi_id)
                 and canonical_route_evidence_status(existing) == "provider_verified"
+                and not existing_exceeds_pace
                 else _estimate_stop_route(previous, stop.poi, profile, route_estimator)
             )
             stops.append(replace(stop, route_from_previous=route))

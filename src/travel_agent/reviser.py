@@ -576,6 +576,12 @@ def _fill_missing_meal_days(
             for item, distance in day_candidates
             if not anchors or distance <= meal_fill_radius_km
         ]
+        if not viable and "food" in requested_interests(profile):
+            # An explicit daily food request is incomplete without a grounded
+            # venue. Keep the nearest verified option even when it is outside
+            # the clustering radius; final route rebinding can select a
+            # provider-verified faster mode or reject the candidate honestly.
+            viable = day_candidates
         if not viable:
             # A meal-completeness repair must not undo a prior long-route
             # repair. The renderer can truthfully reserve an unspecific meal

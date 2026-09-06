@@ -688,6 +688,42 @@ def test_meal_repair_can_reuse_grounded_restaurant_across_trip_days() -> None:
     assert any("补全第2天用餐" in note for note in notes)
 
 
+def test_explicit_food_plan_prefers_distant_grounded_meal_to_missing_day() -> None:
+    activity = POI(
+        "activity", "远郊景点", "合成城", "scenic",
+        30.0, 120.0, 4.5, 0.8, [], 90, "mid",
+    )
+    meal = POI(
+        "meal", "有证据清真餐厅", "合成城", "food",
+        30.0, 120.3, 4.5, 0.8, ["food", "清真"], 60, "mid",
+    )
+    itinerary = Itinerary(
+        city="合成城",
+        summary="test",
+        days=[ItineraryDay(1, "test", [
+            ItineraryStop(activity, "09:30", 90, ""),
+        ])],
+    )
+    profile = TravelProfile(
+        destination="合成城",
+        days=1,
+        interests=["food"],
+        food_preference=["清真"],
+        constraint_state={"dietary": ["仅清真餐厅"]},
+    )
+
+    revised, notes = _fill_missing_meal_days(
+        itinerary,
+        [ScoredPOI(meal, 0.8, [])],
+        profile,
+    )
+
+    assert [stop.poi.poi_id for stop in revised.days[0].stops] == [
+        "activity", "meal",
+    ]
+    assert any("补全第1天用餐" in note for note in notes)
+
+
 def test_reviser_schedules_evening_only_restaurant_after_opening() -> None:
     activity = POI("activity", "上午景点", "合成城", "scenic", 30.0, 120.0, 4.5, 0.8, [], 90, "mid")
     meal = POI(

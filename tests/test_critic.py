@@ -372,6 +372,34 @@ def test_accessibility_priority_fails_when_evidence_is_missing() -> None:
     assert "accessibility_evidence_missing" in {issue.code for issue in result.issues}
 
 
+def test_terrain_avoidance_accepts_verified_nonwalking_route_without_claiming_accessibility() -> None:
+    first = _poi("城市广场", "scenic", [])
+    second = _poi("城市展馆", "museum", [])
+    itinerary = Itinerary("测试城", [ItineraryDay(1, "", [
+        ItineraryStop(first, "09:30", 60, ""),
+        ItineraryStop(
+            second,
+            "11:00",
+            60,
+            "",
+            RouteInfo(
+                first.poi_id, second.poi_id, 3.0, 15, "taxi",
+                source="amap", evidence_status="provider_verified",
+            ),
+        ),
+    ])], "")
+    profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        constraint_state={"avoid": ["连续爬坡", "长楼梯"]},
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    codes = {issue.code for issue in result.issues}
+    assert "accessibility_evidence_missing" not in codes
+
+
 def test_explicit_stairs_and_hills_avoidance_fails_closed_without_access_evidence() -> None:
     profile = TravelProfile(
         destination="测试城",

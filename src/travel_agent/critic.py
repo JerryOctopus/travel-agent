@@ -528,11 +528,7 @@ def _check_structured_constraints(
             "hill", "slope", "stairs", "steps",
         )
     )
-    if (
-        state.get("accessibility_priority")
-        or state.get("wheelchair_user")
-        or terrain_access_required
-    ):
+    if state.get("accessibility_priority") or state.get("wheelchair_user"):
         evidenced = any(
             any(
                 marker in " ".join(
@@ -550,6 +546,30 @@ def _check_structured_constraints(
                     message=(
                         "当前工具证据不足以确认无台阶/低坡度可达；请在出发前向场馆和交通运营方"
                         "核实无障碍入口、电梯及路面情况，无法确认时替换候选。"
+                    ),
+                    severity="error",
+                )
+            )
+    if terrain_access_required:
+        routes = [
+            stop.route_from_previous
+            for day in itinerary.days
+            for stop in day.stops[1:]
+        ]
+        unsafe_routes = [
+            route
+            for route in routes
+            if route is None
+            or route.mode == "walk"
+            or not route_can_prove_hard_feasibility(route, "accessibility")
+        ]
+        if not routes or unsafe_routes:
+            issues.append(
+                CriticIssue(
+                    code="accessibility_evidence_missing",
+                    message=(
+                        "避免连续爬坡或长楼梯的约束需要有证据的非步行接驳；"
+                        "当前至少一段路线仍无法证明。"
                     ),
                     severity="error",
                 )
