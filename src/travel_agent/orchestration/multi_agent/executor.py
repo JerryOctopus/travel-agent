@@ -1555,9 +1555,9 @@ def _enforce_planner_postcondition(
 
 
 def _planner_route_estimator(ctx: Any, artifact_ids: list[str]) -> Any:
-    """Build a no-network estimator from bound route evidence plus local geometry."""
-    from travel_agent.providers import LocalToolProvider
-    from travel_agent.route_evidence import normalize_route_evidence
+    """Prefer bound evidence, then fetch the exact final pair from the provider."""
+    from travel_agent.providers import LocalToolProvider, ProviderRateLimitError
+    from travel_agent.route_evidence import normalize_route_evidence, route_supports_endpoints
     from travel_agent.schemas import RouteInfo
 
     cached: dict[tuple[str, str, str], RouteInfo] = {}
@@ -1588,12 +1588,26 @@ def _planner_route_estimator(ctx: Any, artifact_ids: list[str]) -> Any:
             cached[(route.origin_poi_id, route.destination_poi_id, route.mode)] = route
 
     local = LocalToolProvider(list(getattr(ctx, "pois_by_id", {}).values()))
+    live = getattr(ctx, "provider", None)
 
     class BoundRouteEstimator:
         def estimate_route(self, origin, destination, mode="public_transport"):
             key = (origin.poi_id, destination.poi_id, mode)
             if key in cached:
                 return cached[key]
+            if live is not None:
+                try:
+                    exact = normalize_route_evidence(
+                        live.estimate_route(origin, destination, mode)
+                    )
+                except ProviderRateLimitError:
+                    raise
+                except Exception:
+                    exact = None
+                if exact is not None and route_supports_endpoints(
+                    exact, origin.poi_id, destination.poi_id
+                ):
+                    return exact
             fallback = local.estimate_route(origin, destination, mode)
             return normalize_route_evidence(RouteInfo(
                 origin_poi_id=fallback.origin_poi_id,

@@ -30,7 +30,7 @@ from travel_agent.agent.session import build_session, reset_task_meta, set_curre
 from travel_agent.agent import toolkit
 from travel_agent.agent.turn_analysis import DeliveryIntent, TaskType
 from travel_agent.orchestration.meter import TurnMeter, turn_meter_scope
-from travel_agent.providers import LocalToolProvider
+from travel_agent.providers import LocalToolProvider, ProviderRateLimitError
 from travel_agent.schemas import POI, TravelProfile
 from travel_agent.orchestration.multi_agent import (
     SubagentRunner,
@@ -2448,6 +2448,68 @@ def test_planner_route_estimator_binds_task_local_provider_route() -> None:
     assert route.duration_min == 42
     assert route.source == "amap"
     assert route.evidence_status == "provider_verified"
+
+
+def test_planner_route_estimator_fetches_exact_missing_pair_from_provider() -> None:
+    ctx = build_session(session_id="sess_planner_exact_route", persist=False)
+    origin = POI(
+        "origin", "上午景点", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, [], 90, "mid",
+    )
+    destination = POI(
+        "destination", "下午景点", "测试城", "museum", 30.01, 120.01,
+        4.5, 0.8, [], 90, "mid",
+    )
+    calls = 0
+
+    class ExactProvider:
+        def estimate_route(self, left, right, mode):
+            nonlocal calls
+            calls += 1
+            return toolkit.RouteInfo(
+                origin_poi_id=left.poi_id,
+                destination_poi_id=right.poi_id,
+                distance_km=1.8,
+                duration_min=16,
+                mode=mode,
+                source="amap",
+                evidence_status="provider_verified",
+            )
+
+    ctx.provider = ExactProvider()
+    ctx.remember_pois([origin, destination])
+
+    estimator = _planner_route_estimator(ctx, [])
+    route = estimator.estimate_route(origin, destination, "public_transport")
+
+    assert calls == 1
+    assert route.source == "amap"
+    assert route.evidence_status == "provider_verified"
+
+
+def test_planner_route_estimator_never_hides_provider_quota() -> None:
+    ctx = build_session(session_id="sess_planner_route_quota", persist=False)
+    origin = POI(
+        "origin", "上午景点", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, [], 90, "mid",
+    )
+    destination = replace(origin, poi_id="destination", name="下午景点")
+    calls = 0
+
+    class LimitedProvider:
+        def estimate_route(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise ProviderRateLimitError(
+                "AMap rate limit: USER_DAILY_QUERY_OVER_LIMIT (10044)"
+            )
+
+    ctx.provider = LimitedProvider()
+    estimator = _planner_route_estimator(ctx, [])
+
+    with pytest.raises(ProviderRateLimitError, match="10044"):
+        estimator.estimate_route(origin, destination, "public_transport")
+    assert calls == 1
 
 
 def test_transport_postcondition_builds_adjacent_chain_for_ordinary_full_plan() -> None:
