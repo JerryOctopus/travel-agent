@@ -95,7 +95,7 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
     }
     artifacts = {
         "dataset_version": "travel-agent-eval-production-v1.1",
-        "dataset_sha256": "ff47dfa5d429baae1a173095fef8d1626f59ae32424407e4b38bf649c71de477",
+        "dataset_sha256": "6460b21b8a7c95a5b989fb17472e2dc67c52af16d2a81c2f1290efcf221d91f3",
         "evaluator_version": "product-v1.1+dev34-artifact-contract-v3",
         "code_fingerprint": "code",
         "prompt_fingerprint": "prompt",
@@ -106,9 +106,21 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
         "artifact_contract_fingerprint": "7478fe592648c408fad4b4600e0619c2298120bb1f82a221fbd097ba3a4b180c",
         "model_execution_mode": "fixed_single_model",
         "model_provider": "deepseek",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "model_temperature": 0.2,
         "model_thinking_enabled": False,
+        "provider_reported_models": ["DeepSeek-V4-Flash-0731"],
+        "model_preflight": [
+            {
+                "ok": True,
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "provider_reported_model": "DeepSeek-V4-Flash-0731",
+                "base_url": "https://api.deepseek.com/v1",
+                "temperature": 0.2,
+                "thinking_enabled": False,
+            }
+        ],
         "tool_provider_mode": "configured",
         "hybrid_flags": {"enabled": False},
         "relay_summary": {"attempts_total": 34, "current_model_index": 0},
@@ -157,7 +169,7 @@ def test_dev34_acceptance_rejects_partial_or_nonformal_run(tmp_path) -> None:
                 "metrics": {"sample_size": 1, "execution_count": 1},
                 "artifacts": {
                     "model_provider": "deepseek",
-                    "model": "deepseek-chat",
+                    "model": "deepseek-v4-flash",
                     "model_temperature": 0.2,
                     "model_thinking_enabled": False,
                     "tool_provider_mode": "local",
@@ -195,6 +207,22 @@ def test_dev34_consecutive_contract_requires_two_distinct_runs(tmp_path) -> None
 
     assert result["passed"] is False
     assert "two distinct fresh run directories are required" in result["failures"]
+
+
+def test_dev34_consecutive_contract_rejects_provider_model_drift(tmp_path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_passing_deterministic_run(first, with_judge=True)
+    _write_passing_deterministic_run(second, with_judge=True)
+    summary_path = second / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["artifacts"]["provider_reported_models"] = ["unexpected-model"]
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = evaluate_consecutive_dev34_runs(first, second)
+
+    assert result["passed"] is False
+    assert "run fingerprints differ; candidate was not unchanged" in result["failures"]
 
 
 def test_dev34_acceptance_requires_exact_case_to_artifact_mapping(tmp_path) -> None:
@@ -304,3 +332,28 @@ def test_dev34_acceptance_requires_independent_fixed_judge_per_complete_itinerar
     assert result["passed"] is False
     assert any("Judge result identity" in item for item in result["failures"])
     assert "Judge preflight must record temperature 0" in result["failures"]
+
+
+def test_dev34_release_gate_uses_80_75_15_judge_thresholds(tmp_path) -> None:
+    run_dir = tmp_path / "judge-thresholds"
+    _write_passing_deterministic_run(run_dir, with_judge=True)
+    full_paths = [
+        path for path in sorted((run_dir / "cases").glob("*.json"))
+        if _expected_type(path.name.split("__")[0]) == "full_itinerary"
+    ]
+    for index, path in enumerate(full_paths):
+        case = json.loads(path.read_text(encoding="utf-8"))
+        judge = case["evaluation"]["independent_judge"]
+        judge["total_score"] = 79
+        if index < 6:
+            judge["reasonable"] = False
+        if index < 4:
+            judge["critical_issues"] = [{"severity": "critical", "code": "test"}]
+        path.write_text(json.dumps(case), encoding="utf-8")
+
+    result = evaluate_dev34_run(run_dir, require_judge=True)
+
+    assert result["passed"] is False
+    assert any("below 80" in item for item in result["failures"])
+    assert any("below 0.75" in item for item in result["failures"])
+    assert any("exceeds 0.15" in item for item in result["failures"])

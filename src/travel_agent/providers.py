@@ -43,6 +43,17 @@ class TravelToolProvider(Protocol):
     ) -> list[POI]:
         ...
 
+    def search_pois_nearby(
+        self,
+        city: str,
+        anchor: POI,
+        query_tags: list[str] | None = None,
+        category: str | None = None,
+        radius_m: int = 5000,
+        max_results: int = 20,
+    ) -> list[POI]:
+        ...
+
     def get_weather(self, city: str) -> WeatherInfo:
         ...
 
@@ -102,6 +113,29 @@ class LocalToolProvider:
         from travel_agent.weather import get_weather
 
         return get_weather(city)
+
+    def search_pois_nearby(
+        self,
+        city: str,
+        anchor: POI,
+        query_tags: list[str] | None = None,
+        category: str | None = None,
+        radius_m: int = 5000,
+        max_results: int = 20,
+    ) -> list[POI]:
+        candidates = self.search_pois(
+            city=city,
+            query_tags=query_tags,
+            category=category,
+            max_results=max(len(self.pois), max_results),
+        )
+        nearby: list[tuple[float, POI]] = []
+        for poi in candidates:
+            distance_km, _ = estimate_route_minutes(anchor, poi, "walk")
+            if distance_km * 1000 <= max(0, int(radius_m)):
+                nearby.append((distance_km, poi))
+        nearby.sort(key=lambda item: item[0])
+        return [poi for _, poi in nearby[:max_results]]
 
     def estimate_route(
         self,
@@ -180,16 +214,21 @@ class AmapToolProvider:
             while len(_AMAP_ROUTE_CACHE) > _AMAP_ROUTE_CACHE_MAX_ENTRIES:
                 _AMAP_ROUTE_CACHE.popitem(last=False)
 
-    def _get_cached_place_json(self, params: dict[str, str]) -> dict:
+    def _get_cached_place_json(
+        self,
+        params: dict[str, str],
+        path: str = "/v5/place/text",
+    ) -> dict:
         # Instance-level monkeypatches are test/injection hooks and must remain
         # fully observable rather than being shadowed by process cache state.
         if "_get_json" in self.__dict__:
-            return self._get_json("/v5/place/text", params)
+            return self._get_json(path, params)
         safe_params = tuple(sorted((key, value) for key, value in params.items() if key != "key"))
         cache_key = (
             hashlib.sha256(self.api_key.encode()).hexdigest()[:16],
             self.base_url.rstrip("/"),
             id(type(self)._get_json),
+            path,
             safe_params,
         )
         now = time.monotonic()
@@ -200,7 +239,7 @@ class AmapToolProvider:
                 return copy.deepcopy(cached[1])
             if cached is not None:
                 _AMAP_PLACE_CACHE.pop(cache_key, None)
-            payload = self._get_json("/v5/place/text", params)
+            payload = self._get_json(path, params)
             # Never cache provider failures, especially quota/rate limits.
             if str(payload.get("status")) == "1":
                 _AMAP_PLACE_CACHE[cache_key] = (now, copy.deepcopy(payload))
@@ -250,6 +289,52 @@ class AmapToolProvider:
         # Provider taxonomy is evidence; a keyword hit in the wrong taxonomy
         # (for example an office building returned for a food query) must not
         # become a restaurant/hotel/activity candidate.
+        if normalized_category:
+            results = [
+                item for item in results if item.category == normalized_category
+            ]
+        return results
+
+    def search_pois_nearby(
+        self,
+        city: str,
+        anchor: POI,
+        query_tags: list[str] | None = None,
+        category: str | None = None,
+        radius_m: int = 5000,
+        max_results: int = 20,
+    ) -> list[POI]:
+        """Search provider-classified POIs around an evidenced anchor."""
+        normalized_category = _normalize_amap_search_category(category)
+        terms = [str(term).strip() for term in (query_tags or []) if str(term).strip()]
+        params = {
+            "key": self.api_key,
+            "location": f"{anchor.lng:.6f},{anchor.lat:.6f}",
+            "radius": str(min(50000, max(1, int(radius_m)))),
+            "sortrule": "distance",
+            "region": city,
+            "city_limit": "true",
+            "page_size": str(min(25, max(1, int(max_results)))),
+            "page_num": "1",
+            "show_fields": "business",
+        }
+        if terms:
+            # Place Search 2.0 around accepts one free-text keyword.  Keep the
+            # hard taxonomy in ``types`` and use the joined phrase only as a
+            # relevance hint.
+            params["keywords"] = " ".join(terms)[:80]
+        type_code = _AMAP_CATEGORY_TYPE_CODE.get(normalized_category or "")
+        if type_code:
+            params["types"] = type_code
+        payload = self._get_cached_place_json(params, path="/v5/place/around")
+        _raise_for_provider_limit(payload)
+        if payload.get("status") != "1":
+            return []
+        results = [
+            _amap_poi_to_schema(item, city=city, rank=index)
+            for index, item in enumerate(payload.get("pois") or [])
+            if item.get("location")
+        ]
         if normalized_category:
             results = [
                 item for item in results if item.category == normalized_category
@@ -408,6 +493,35 @@ class FallbackToolProvider:
         if weather and weather.condition != "unknown":
             return weather
         return self.fallback.get_weather(city)
+
+    def search_pois_nearby(
+        self,
+        city: str,
+        anchor: POI,
+        query_tags: list[str] | None = None,
+        category: str | None = None,
+        radius_m: int = 5000,
+        max_results: int = 20,
+    ) -> list[POI]:
+        args = {
+            "city": city,
+            "anchor": anchor,
+            "query_tags": query_tags,
+            "category": category,
+            "radius_m": radius_m,
+            "max_results": max_results,
+        }
+        try:
+            nearby_search = getattr(self.primary, "search_pois_nearby", None)
+            results = nearby_search(**args) if callable(nearby_search) else []
+        except ProviderRateLimitError:
+            raise
+        except Exception:
+            results = []
+        if results:
+            return results
+        fallback_search = getattr(self.fallback, "search_pois_nearby", None)
+        return fallback_search(**args) if callable(fallback_search) else []
 
     def estimate_route(
         self,

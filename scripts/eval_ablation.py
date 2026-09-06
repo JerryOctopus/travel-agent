@@ -571,6 +571,12 @@ def main() -> None:
     args = build_parser().parse_args()
     settings = load_settings()
 
+    if not args.stability_merge and (args.product_split != "dev" or args.cases_file):
+        raise SystemExit(
+            "当前发布周期禁止消融/legacy runner 读取冻结数据；"
+            "Core、Challenge、Shadow 必须使用 --official-frozen manifest runner。"
+        )
+
     if args.stability_merge:
         run_dirs = [Path(item.strip()) for item in args.merge_runs.split(",") if item.strip()]
         if len(run_dirs) != 3:

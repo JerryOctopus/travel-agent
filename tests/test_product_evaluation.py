@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
 from uuid import uuid4
@@ -25,11 +26,11 @@ from travel_agent.harness.faults import FaultInjectingProvider
 from travel_agent.harness.live_tools import _redact_snapshot
 from travel_agent.harness.product import (
     DEFAULT_PRODUCT_CASES,
+    DEFAULT_PRODUCT_DEV_CASES,
     aggregate_product_rows,
     attribute_failures,
     decide_fine_tuning,
     validate_absolute_return_deadline_evidence,
-    validate_product_dataset,
     wilson_interval,
     _configuration_fingerprint,
     _execution_case,
@@ -42,20 +43,16 @@ from travel_agent.harness.validators import validate_case_result
 
 
 def test_production_v1_dataset_has_192_cases_with_frozen_split_discipline() -> None:
-    cases = load_cases_json(DEFAULT_PRODUCT_CASES)
-
-    validation = validate_product_dataset(cases)
-
-    assert validation.valid is True, validation.errors
-    assert validation.split_counts == {
-        "dev": 34,
-        "core_frozen": 94,
-        "challenge_frozen": 34,
-        "shadow_frozen": 30,
+    expected = {
+        "dev.jsonl": (34, "6460b21b8a7c95a5b989fb17472e2dc67c52af16d2a81c2f1290efcf221d91f3"),
+        "core_frozen.jsonl": (94, "86e7636e722936612788b578664e34bfaa40fb8fac4b03890ab06b0f30705178"),
+        "challenge_frozen.jsonl": (34, "f7fccae88d0d6d91929163cb1828a31ed51345be69e7b9e0ba67bf6ea88e4c78"),
+        "shadow_frozen.jsonl": (30, "d9b4be53bb2259f690ce080415b5315b2510c54cb1d1f6a9fb50f480bd66d63f"),
     }
-    assert len(validation.subset_counts) >= 15
-    assert all(case.gold_outcome for case in cases)
-    assert validation.frozen_warnings == []
+    for name, (count, digest) in expected.items():
+        path = DEFAULT_PRODUCT_CASES.parent / name
+        assert sum(bool(line.strip()) for line in path.read_bytes().splitlines()) == count
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
 
 
 def test_formal_run_fingerprints_config_without_hashing_secrets(offline_settings) -> None:
@@ -168,8 +165,8 @@ def test_frozen_ungrounded_absolute_return_deadline_is_report_only() -> None:
 
 
 def test_production_dataset_loader_parses_external_schema() -> None:
-    cases = load_cases_json(DEFAULT_PRODUCT_CASES)
-    case = next(item for item in cases if item.split == "dev")
+    cases = load_cases_json(DEFAULT_PRODUCT_DEV_CASES)
+    case = cases[0]
 
     assert case.turns and all(turn.strip() for turn in case.turns)
     assert case.gold_constraints_tree
@@ -185,7 +182,7 @@ def test_shadow_split_is_rejected_for_multi_variant_comparison(monkeypatch) -> N
         "sys.argv",
         ["eval_ablation.py", "--variants", "v0,v3", "--product-split", "shadow_frozen"],
     )
-    with pytest.raises(SystemExit, match="影子集"):
+    with pytest.raises(SystemExit, match="当前发布周期"):
         ablation.main()
 
 
@@ -197,8 +194,7 @@ def test_single_variant_is_allowed_on_shadow_split(monkeypatch, offline_settings
         ["eval_ablation.py", "--variants", "v3", "--product-split", "shadow_frozen"],
     )
     monkeypatch.setattr(ablation, "load_settings", lambda: offline_settings)
-    # 单 variant 不触发影子禁令；离线 rule provider 会拦在 LLM 检查。
-    with pytest.raises(RuntimeError, match="真实 LLM"):
+    with pytest.raises(SystemExit, match="当前发布周期"):
         ablation.main()
 
 

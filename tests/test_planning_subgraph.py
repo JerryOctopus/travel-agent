@@ -4,6 +4,8 @@ from pathlib import Path
 
 from travel_agent.planning import (
     _daily_opening_window,
+    _last_admission_for_trip_day,
+    _opening_window_for_trip_day,
     apply_structured_schedule_constraints,
     build_simple_itinerary,
 )
@@ -149,8 +151,107 @@ def test_candidate_selection_prefers_meal_near_hard_must_visit():
 def test_daily_opening_window_parses_explicit_hours_only():
     assert _daily_opening_window("周一至周日 09:00-16:30") == (540, 990)
     assert _daily_opening_window("3–10月:06:45–17:30(17:00停止入园)") == (405, 1050)
+    assert _daily_opening_window("周一至周日 16:00-04:00") == (960, 1680)
     assert _daily_opening_window("00:00-24:00") is None
     assert _daily_opening_window("all_day") is None
+
+
+def test_trip_day_opening_window_uses_matching_weekday_segment() -> None:
+    cafe = POI(
+        "cafe", "分时营业咖啡馆", "测试城", "food", 30.0, 120.0,
+        4.5, 0.8, ["coffee"], 60, "mid",
+        opening_hours="周三至周五 12:00-20:00；周六至周日 18:00-22:00",
+    )
+    profile = TravelProfile(destination="测试城", days=2, start_date="2026-11-07")
+
+    assert _opening_window_for_trip_day(cafe, profile, 1) == (18 * 60, 22 * 60)
+    assert _opening_window_for_trip_day(cafe, profile, 2) == (18 * 60, 22 * 60)
+
+
+def test_structured_schedule_never_uses_another_weekdays_opening_window() -> None:
+    cafe = POI(
+        "cafe", "分时营业咖啡馆", "测试城", "food", 30.0, 120.0,
+        4.5, 0.8, ["coffee"], 60, "mid",
+        opening_hours="周三至周五 12:00-20:00；周六至周日 18:00-22:00",
+    )
+    profile = TravelProfile(destination="测试城", days=1, start_date="2026-11-07")
+    days = [ItineraryDay(1, "test", [ItineraryStop(cafe, "12:00", 60, "")])]
+
+    scheduled = apply_structured_schedule_constraints(days, [], profile, None)
+
+    assert scheduled[0].stops[0].start_time == "18:00"
+
+
+def test_trip_day_opening_window_uses_matching_calendar_range() -> None:
+    venue = POI(
+        "seasonal", "分季节场馆", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, [], 90, "mid",
+        opening_hours=(
+            "07-01至09-06 周一至周日 09:30-20:30；"
+            "09-07至12-31 周一至周日 09:30-18:30"
+        ),
+    )
+    profile = TravelProfile(destination="测试城", days=1, start_date="2026-11-07")
+
+    assert _opening_window_for_trip_day(venue, profile, 1) == (9 * 60 + 30, 18 * 60 + 30)
+
+
+def test_parenthesized_weekday_after_effective_date_is_not_a_weekday_selector() -> None:
+    venue = POI(
+        "effective-date", "生效日期场馆", "测试城", "museum", 30.0, 120.0,
+        4.5, 0.8, [], 90, "mid",
+        opening_hours="9月1日(周二)起09:00-17:00(16:30停止入馆)",
+    )
+    profile = TravelProfile(destination="测试城", days=1, start_date="2026-09-16")
+
+    assert _opening_window_for_trip_day(venue, profile, 1) == (9 * 60, 17 * 60)
+
+
+def test_trip_day_last_admission_is_parsed_separately_from_closing_time() -> None:
+    venue = POI(
+        "entry-cutoff", "晚间停止入场场馆", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, [], 90, "mid",
+        opening_hours="周一至周日 08:00-20:00开放 最晚进入17:30",
+    )
+    profile = TravelProfile(destination="测试城", days=1, start_date="2026-10-15")
+
+    assert _last_admission_for_trip_day(venue, profile, 1) == 17 * 60 + 30
+
+
+def test_structured_schedule_retimes_stop_before_last_admission() -> None:
+    venue = POI(
+        "entry-cutoff", "晚间停止入场场馆", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, [], 90, "mid",
+        opening_hours="周一至周日 08:00-20:00开放 最晚进入17:30",
+    )
+    profile = TravelProfile(destination="测试城", days=1, start_date="2026-10-15")
+    days = [ItineraryDay(1, "test", [ItineraryStop(venue, "18:00", 90, "")])]
+
+    scheduled = apply_structured_schedule_constraints(days, [], profile, None)
+
+    assert scheduled[0].stops[0].start_time == "17:30"
+
+
+def test_date_and_weekday_prefixed_clause_is_used_for_scheduling() -> None:
+    venue = POI(
+        "dated", "周末场馆", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, [], 150, "mid",
+        opening_hours=(
+            "04/15-10/15 周一, 周三-周日 09:00-18:00开放；"
+            "04/15-10/15 周二 全天不开放"
+        ),
+    )
+    profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        start_date="2026-08-22",
+        constraint_state={"activity_end_target": "20:30"},
+    )
+    days = [ItineraryDay(1, "test", [ItineraryStop(venue, "18:00", 150, "")])]
+
+    scheduled = apply_structured_schedule_constraints(days, [], profile, None)
+
+    assert scheduled[0].stops == []
 
 
 def test_structured_schedule_sorts_by_known_opening_time_before_retiming() -> None:

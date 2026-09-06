@@ -612,6 +612,53 @@ def search_poi(
             )
             and not _is_unavailable_or_infrastructure_poi(poi, ctx.profile)
         ]
+    # Multi-day plans need enough independently verified activity entities to
+    # populate every day.  A preference query plus a generic city page can be
+    # taxonomically narrow, so broaden by provider category only when the
+    # verified supply is still sparse.  This remains generic and the added
+    # entities pass the same evidence and infrastructure filters.
+    days = int(ctx.profile.days or 1)
+    activity_supply_target = min(max_results, max(4, days * 2))
+    distinct_activities = [
+        poi for poi in _dedupe_plannable_entities(candidates, ctx.profile)
+        if poi.category not in {"food", "hotel", "transport"}
+    ]
+    activity_categories = {poi.category for poi in distinct_activities}
+    if (
+        category is None
+        and days >= 3
+        and (
+            len(distinct_activities) < activity_supply_target
+            or len(activity_categories) < 2
+        )
+    ):
+        diversified: list[POI] = []
+        for supply_category in ("scenic", "museum"):
+            try:
+                supplied = ctx.provider.search_pois(
+                    city=target_city,
+                    query_tags=None,
+                    category=supply_category,
+                    max_results=max_results,
+                )
+            except ProviderRateLimitError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                failures.append(
+                    f"category_supply_{supply_category}:{type(exc).__name__}"
+                )
+                continue
+            normalized = [normalize_poi_entity(poi, ctx.profile) for poi in supplied]
+            verified, supply_rejected = partition_verified_candidates(
+                normalized, ctx.profile
+            )
+            rejected.extend(supply_rejected)
+            diversified.extend(
+                poi for poi in verified
+                if poi.category not in {"food", "hotel", "transport"}
+                and not _is_unavailable_or_infrastructure_poi(poi, ctx.profile)
+            )
+        candidates = _merge_pois(candidates, diversified)[:max_results]
     fault_events = _consume_provider_faults(ctx, "search_pois")
     if fault_events:
         failures.append("检索服务返回异常，已重试并补全候选")
@@ -809,19 +856,6 @@ def search_restaurant(
         return _err("缺少目的地城市，无法检索餐厅。")
     tags = [cuisine] if cuisine else list(ctx.profile.food_preference or [])
     provider_tags = [tag for tag in tags if tag]
-    if area:
-        provider_tags.extend([str(area), "餐厅"])
-    restaurants = ctx.provider.search_pois(
-        city=target_city,
-        query_tags=provider_tags,
-        category="food",
-        max_results=max_results * 2,
-    )
-    restaurants = [
-        poi
-        for poi in (normalize_poi_entity(item, ctx.profile) for item in restaurants)
-        if poi.category == "food" and poi.entity_type == "restaurant"
-    ]
     dietary = [
         str(item).strip().lower()
         for item in ((ctx.profile.constraint_state or {}).get("dietary") or [])
@@ -832,6 +866,62 @@ def search_restaurant(
         for item in dietary
         for marker in ("清真", "halal")
     )
+    nearby_restaurants: list[POI] = []
+    if area:
+        nearby_search = getattr(ctx.provider, "search_pois_nearby", None)
+        if callable(nearby_search):
+            anchors = ctx.provider.search_pois(
+                city=target_city,
+                query_tags=[str(area)],
+                category=None,
+                max_results=5,
+            )
+            normalized_area = normalize_entity_name(area)
+            anchor = next(
+                (
+                    poi
+                    for poi in anchors
+                    if normalized_area
+                    and normalized_area in normalize_entity_name(poi.name)
+                ),
+                anchors[0] if anchors else None,
+            )
+            if anchor is not None:
+                ctx.remember_pois([anchor])
+                nearby_terms = (
+                    ["清真餐厅"]
+                    if halal_required
+                    else [str(cuisine or "餐厅")]
+                )
+                nearby_restaurants = nearby_search(
+                    city=target_city,
+                    anchor=anchor,
+                    query_tags=nearby_terms,
+                    category="food",
+                    radius_m=8000,
+                    max_results=max_results * 2,
+                )
+    if area:
+        provider_tags.extend([str(area), "餐厅"])
+    text_restaurants = ctx.provider.search_pois(
+        city=target_city,
+        query_tags=provider_tags,
+        category="food",
+        max_results=max_results * 2,
+    )
+    restaurants = []
+    seen_restaurant_ids: set[str] = set()
+    for poi in [*nearby_restaurants, *text_restaurants]:
+        if poi.poi_id in seen_restaurant_ids:
+            continue
+        seen_restaurant_ids.add(poi.poi_id)
+        restaurants.append(poi)
+    restaurants = [
+        poi
+        for poi in (normalize_poi_entity(item, ctx.profile) for item in restaurants)
+        if poi.category == "food" and poi.entity_type == "restaurant"
+    ]
+    nearby_ids = {poi.poi_id for poi in nearby_restaurants}
     if halal_required:
         restaurants = [
             poi
@@ -885,7 +975,13 @@ def search_restaurant(
         if per_person_limit is not None and poi.average_cost is not None:
             if poi.average_cost > float(per_person_limit):
                 continue
-        if area and area not in poi.name and area not in (poi.address or "") and area not in " ".join(poi.tags):
+        if (
+            area
+            and poi.poi_id not in nearby_ids
+            and area not in poi.name
+            and area not in (poi.address or "")
+            and area not in " ".join(poi.tags)
+        ):
             continue
         filtered.append(poi)
     # ``area`` is a search preference, not automatically a user-level hard
@@ -957,13 +1053,26 @@ def search_hotel(
         )
     ):
         target_budget = "low"
+    initial_query_tags = (
+        [target_area]
+        if requested_area
+        else ["市中心", "核心商圈"]
+    )
     poi_hotels = ctx.provider.search_pois(
         city=target_city,
-        query_tags=[target_area] if requested_area else None,
+        query_tags=initial_query_tags,
         category="hotel",
         max_results=max_results * 2,
     )
-    area_query_evidenced = bool(requested_area and poi_hotels)
+    area_query_evidenced = bool(poi_hotels)
+    if not poi_hotels and not requested_area:
+        poi_hotels = ctx.provider.search_pois(
+            city=target_city,
+            query_tags=None,
+            category="hotel",
+            max_results=max_results * 2,
+        )
+        area_query_evidenced = False
     if not poi_hotels:
         # Some live providers apply their type code before tokenization and
         # return an empty set for "area + hotel" even though an untyped text
@@ -981,7 +1090,7 @@ def search_hotel(
             if poi.category == "hotel" and poi.verification_status == "verified"
         ]
         area_query_evidenced = bool(requested_area and poi_hotels)
-    area_evidenced = not requested_area
+    area_evidenced = bool(not requested_area and area_query_evidenced)
     if requested_area:
         area_term = re.sub(r"(?:附近|核心|周边|商圈)$", "", str(requested_area)).strip()
         matching_hotels = [
@@ -996,8 +1105,29 @@ def search_hotel(
             if directional is not None:
                 matching_hotels = directional
                 area_query_evidenced = bool(directional)
+                if not matching_hotels:
+                    # The explicit text query returned hotels on the wrong
+                    # side of a verified landmark. Broaden the hotel supply and
+                    # apply the coordinate predicate again; never treat query
+                    # relevance alone as proof of a directional area.
+                    broad_hotels = ctx.provider.search_pois(
+                        city=target_city,
+                        query_tags=None,
+                        category="hotel",
+                        max_results=max_results * 2,
+                    )
+                    rechecked = _filter_directional_area_pois(
+                        ctx.provider,
+                        target_city,
+                        str(requested_area),
+                        broad_hotels,
+                    )
+                    matching_hotels = rechecked or []
+                    area_query_evidenced = bool(matching_hotels)
             if not matching_hotels:
-                if area_query_evidenced:
+                if directional is not None:
+                    matching_hotels = []
+                elif area_query_evidenced:
                     # A provider result returned by the explicit area query is
                     # itself bounded area relevance evidence; hotel names and
                     # street addresses need not repeat phrases such as “东侧”.
@@ -1036,6 +1166,19 @@ def search_hotel(
         hotels = _mock_hotels(target_city, target_area, target_budget)
     if min_rating is not None:
         hotels = [hotel for hotel in hotels if hotel["rating"] >= float(min_rating)]
+    nightly_limit = state.get("hotel_budget_per_night_cny")
+    nightly_limit_value: float | None = None
+    if nightly_limit is not None:
+        try:
+            nightly_limit_value = float(nightly_limit)
+        except (TypeError, ValueError):
+            nightly_limit_value = None
+        if nightly_limit_value is not None:
+            hotels = [
+                hotel
+                for hotel in hotels
+                if float(hotel.get("price_per_night") or float("inf")) <= nightly_limit_value
+            ]
     hotels = hotels[:max_results]
     artifact_id = ctx.store.put(
         "hotels",
@@ -1051,6 +1194,7 @@ def search_hotel(
         artifact_id=artifact_id,
         count=len(hotels),
         hotels=hotels,
+        hotel_budget_per_night_cny=nightly_limit_value,
     )
 
 
@@ -1885,7 +2029,71 @@ def _build_meal_strategy(
 ) -> dict[str, Any]:
     """Expose dining semantics as a first-class Reviewer input."""
     state = profile.constraint_state or {}
+    raw_dietary = state.get("dietary") or []
+    dietary_constraints = (
+        [str(raw_dietary)]
+        if isinstance(raw_dietary, str)
+        else [str(item) for item in raw_dietary]
+    )
+    restaurant_evidence = [
+        {
+            "artifact_id": item.get("artifact_id"),
+            "status": (item.get("payload") or {}).get("status"),
+            "restaurants": (item.get("payload") or {}).get("restaurants"),
+        }
+        for item in (domain_inputs.get("restaurants") or [])
+        if isinstance(item, dict)
+    ]
+    verified_dietary_restaurants: list[dict[str, Any]] = []
+    if dietary_constraints:
+        from travel_agent.critic import poi_complies_with_dietary
+
+        for evidence in restaurant_evidence:
+            for raw in evidence.get("restaurants") or []:
+                if not isinstance(raw, dict):
+                    continue
+                try:
+                    poi = poi_from_dict(raw)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if (
+                    poi.verification_status == "verified"
+                    and poi.source
+                    and poi_complies_with_dietary(poi, profile)
+                ):
+                    verified_dietary_restaurants.append(raw)
+
+    def grounded_reservation(
+        *, day_index: int, period: str, start: str, end: str
+    ) -> dict[str, Any]:
+        if verified_dietary_restaurants:
+            restaurant = verified_dietary_restaurants[
+                (max(1, day_index) - 1) % len(verified_dietary_restaurants)
+            ]
+            return {
+                "day_index": day_index,
+                "period": period,
+                "name": restaurant.get("name"),
+                "poi_id": restaurant.get("poi_id"),
+                "start_time": start,
+                "end_time": end,
+                "source": restaurant.get("source"),
+                "verification_status": restaurant.get("verification_status"),
+                "is_reservation_only": True,
+            }
+        label = "晚餐" if period == "dinner" else "午餐"
+        return {
+            "day_index": day_index,
+            "period": period,
+            "name": f"{label}时段（当日活动区域就近自行安排）",
+            "start_time": start,
+            "end_time": end,
+            "source": "deterministic_schedule_reservation",
+            "is_reservation_only": True,
+        }
+
     scheduled: list[dict[str, Any]] = []
+    unscheduled_meal_days: list[dict[str, Any]] = []
     for day in itinerary.get("days") or []:
         meal_periods: set[str] = set()
         for stop in day.get("stops") or []:
@@ -1903,7 +2111,9 @@ def _build_meal_strategy(
                 meal_periods.add(period)
                 scheduled.append({
                     "day_index": day.get("day_index"),
+                    "period": period,
                     "name": poi.get("name"),
+                    "poi_id": poi.get("poi_id"),
                     "start_time": stop.get("start_time"),
                     "source": poi.get("source"),
                 })
@@ -1925,20 +2135,44 @@ def _build_meal_strategy(
                 continue
             latest_end_min = parsed if latest_end_min is None else min(latest_end_min, parsed)
 
-        if "lunch" not in meal_periods:
-            meal_start, meal_end = _available_meal_reservation(
+        if not meal_periods:
+            meal_window = _available_meal_reservation(
                 day, latest_end_min=latest_end_min
             )
-            meal_label = "晚餐" if meal_start >= "17:00" else "午餐"
-            meal_periods.add("dinner" if meal_label == "晚餐" else "lunch")
-            scheduled.append({
-                "day_index": day.get("day_index"),
-                "name": f"{meal_label}时段（当日活动区域就近自行安排）",
-                "start_time": meal_start,
-                "end_time": meal_end,
-                "source": "deterministic_schedule_reservation",
-                "is_reservation_only": True,
-            })
+            if meal_window is None:
+                unscheduled_meal_days.append({
+                    "day_index": day.get("day_index"),
+                    "reason": "no_non_overlapping_meal_window",
+                })
+            else:
+                meal_start, meal_end = meal_window
+                period = "dinner" if meal_start >= "17:00" else "lunch"
+                meal_periods.add(period)
+                scheduled.append(grounded_reservation(
+                    day_index=int(day.get("day_index") or 0),
+                    period=period,
+                    start=meal_start,
+                    end=meal_end,
+                ))
+        # A dietary hard constraint applies to every meal, not merely to an
+        # already scheduled dinner. Reserve a separately evidenced lunch even
+        # when another food stop exists that day.
+        if dietary_constraints and "lunch" not in meal_periods:
+            lunch = _available_meal_reservation(day, latest_end_min=latest_end_min)
+            if lunch is not None and lunch[0] < "15:00":
+                meal_start, meal_end = lunch
+                meal_periods.add("lunch")
+                scheduled.append(grounded_reservation(
+                    day_index=int(day.get("day_index") or 0),
+                    period="lunch",
+                    start=meal_start,
+                    end=meal_end,
+                ))
+            else:
+                unscheduled_meal_days.append({
+                    "day_index": day.get("day_index"),
+                    "reason": "no_non_overlapping_dietary_lunch_window",
+                })
         occupied_end = max(
             (
                 _clock_to_minute(stop.get("start_time"))
@@ -1948,37 +2182,22 @@ def _build_meal_strategy(
             ),
             default=0,
         )
+        is_multi_day_plan = len(itinerary.get("days") or []) > 1
         dinner_needed = bool(
             (latest_end_min is not None and latest_end_min >= 19 * 60)
             or occupied_end >= 19 * 60
+            or (is_multi_day_plan and latest_end_min is None)
         )
         if dinner_needed and "dinner" not in meal_periods:
             dinner = _available_dinner_reservation(day, latest_end_min=latest_end_min)
             if dinner is not None:
                 meal_start, meal_end = dinner
-                scheduled.append({
-                    "day_index": day.get("day_index"),
-                    "name": "晚餐时段（当日活动区域就近自行安排）",
-                    "start_time": meal_start,
-                    "end_time": meal_end,
-                    "source": "deterministic_schedule_reservation",
-                    "is_reservation_only": True,
-                })
-    restaurant_evidence = [
-        {
-            "artifact_id": item.get("artifact_id"),
-            "status": (item.get("payload") or {}).get("status"),
-            "restaurants": (item.get("payload") or {}).get("restaurants"),
-        }
-        for item in (domain_inputs.get("restaurants") or [])
-        if isinstance(item, dict)
-    ]
-    raw_dietary = state.get("dietary") or []
-    dietary_constraints = (
-        [str(raw_dietary)]
-        if isinstance(raw_dietary, str)
-        else [str(item) for item in raw_dietary]
-    )
+                scheduled.append(grounded_reservation(
+                    day_index=int(day.get("day_index") or 0),
+                    period="dinner",
+                    start=meal_start,
+                    end=meal_end,
+                ))
     scheduled.sort(key=lambda item: (
         int(item.get("day_index") or 0), str(item.get("start_time") or "")
     ))
@@ -1997,6 +2216,7 @@ def _build_meal_strategy(
             else None
         ),
         "scheduled_meals": scheduled,
+        "unscheduled_meal_days": unscheduled_meal_days,
         "restaurant_evidence": restaurant_evidence,
         "concrete_restaurant_required": bool(
             state.get("specific_restaurant_required")
@@ -2007,40 +2227,38 @@ def _build_meal_strategy(
 
 def _available_meal_reservation(
     day: dict[str, Any], *, latest_end_min: int | None = None
-) -> tuple[str, str]:
-    """Choose a one-hour meal window that does not overlap scheduled stops."""
-    occupied: list[tuple[int, int]] = []
-    for stop in day.get("stops") or []:
-        try:
-            start = time.fromisoformat(str(stop.get("start_time")))
-            start_min = start.hour * 60 + start.minute
-            occupied.append((start_min, start_min + int(stop.get("duration_min") or 0)))
-        except (TypeError, ValueError):
-            continue
+) -> tuple[str, str] | None:
+    """Choose a meal window that also preserves inbound transfer time."""
+    occupied = _meal_occupied_intervals(day)
     latest_lunch_start = 14 * 60
     if latest_end_min is not None:
         latest_lunch_start = min(15 * 60, latest_end_min - 60)
     for candidate in range(11 * 60 + 30, latest_lunch_start + 1, 15):
         if _meal_window_fits(candidate, occupied):
             return _offset_clock("00:00", candidate) or "12:00", _offset_clock("00:00", candidate + 60) or "13:00"
+    # A stop ending at 11:00 and a following inbound transfer beginning just
+    # before 12:45 leaves a valid 11:15 lunch, even though the canonical search
+    # starts at 11:30.  Use this bounded early slot before declaring lunch
+    # unschedulable or falling through to dinner.
+    early_lunch = 11 * 60 + 15
+    if (
+        early_lunch <= latest_lunch_start
+        and _meal_window_fits(early_lunch, occupied)
+    ):
+        return "11:15", "12:15"
     for candidate in range(17 * 60 + 30, 20 * 60 + 1, 15):
         if latest_end_min is not None and candidate + 60 > latest_end_min:
             continue
         if _meal_window_fits(candidate, occupied):
             return _offset_clock("00:00", candidate) or "18:00", _offset_clock("00:00", candidate + 60) or "19:00"
-    return "12:00", "13:00"
+    return None
 
 
 def _available_dinner_reservation(
     day: dict[str, Any], *, latest_end_min: int | None = None
 ) -> tuple[str, str] | None:
     """Choose a non-overlapping dinner window within the usable day."""
-    occupied: list[tuple[int, int]] = []
-    for stop in day.get("stops") or []:
-        start_min = _clock_to_minute(stop.get("start_time"))
-        if start_min is None:
-            continue
-        occupied.append((start_min, start_min + int(stop.get("duration_min") or 0)))
+    occupied = _meal_occupied_intervals(day)
     latest_start = 20 * 60
     if latest_end_min is not None:
         latest_start = min(latest_start, latest_end_min - 60)
@@ -2050,7 +2268,39 @@ def _available_dinner_reservation(
                 _offset_clock("00:00", candidate) or "18:00",
                 _offset_clock("00:00", candidate + 60) or "19:00",
             )
+    # A long inbound transfer to an explicitly late activity can consume the
+    # normal dinner slots.  In that case offer an earlier meal, while keeping
+    # 16:30 as the default whenever it is feasible.
+    for candidate in range(15 * 60 + 30, 16 * 60 + 30, 15):
+        if latest_end_min is not None and candidate + 60 > latest_end_min:
+            continue
+        if _meal_window_fits(candidate, occupied):
+            return (
+                _offset_clock("00:00", candidate) or "15:30",
+                _offset_clock("00:00", candidate + 60) or "16:30",
+            )
     return None
+
+
+def _meal_occupied_intervals(day: dict[str, Any]) -> list[tuple[int, int]]:
+    """Return stop intervals extended by the route needed to reach each stop."""
+    occupied: list[tuple[int, int]] = []
+    for stop in day.get("stops") or []:
+        if not isinstance(stop, dict):
+            continue
+        start_min = _clock_to_minute(stop.get("start_time"))
+        if start_min is None:
+            continue
+        route = stop.get("route_from_previous") or {}
+        try:
+            inbound_min = max(0, int(route.get("duration_min") or 0))
+        except (TypeError, ValueError):
+            inbound_min = 0
+        occupied.append((
+            start_min - inbound_min,
+            start_min + int(stop.get("duration_min") or 0),
+        ))
+    return occupied
 
 
 def _meal_window_fits(
@@ -2520,6 +2770,20 @@ def _close_post_plan_origin_route(
             ctx.profile.transport_mode,
             allow_taxi_fallback=_same_city(endpoint.city, first_poi.city),
         )
+        if route is None or canonical_route_evidence_status(route) != "provider_verified":
+            live_route = _estimate_hard_route(
+                ctx.provider,
+                endpoint,
+                first_poi,
+                ctx.profile.transport_mode,
+                allow_taxi_fallback=_same_city(endpoint.city, first_poi.city),
+            )
+            if (
+                live_route is not None
+                and canonical_route_evidence_status(live_route)
+                == "provider_verified"
+            ):
+                route = live_route
         if route is None or not route_supports_endpoints(
             route, endpoint.poi_id, first_poi.poi_id
         ):
@@ -2700,6 +2964,27 @@ def _close_post_plan_return_route(
                 endpoint.city, ctx.profile.destination
             ),
         )
+        if route is None or canonical_route_evidence_status(route) != "provider_verified":
+            # The Planner normally receives a no-network estimator backed by
+            # Transport artifacts. A rebuild can change the actual final stop
+            # after those artifacts were produced. Close that new hard
+            # endpoint once through the configured provider rather than
+            # publishing a geometry estimate or reusing a stale route.
+            live_route = _estimate_hard_route(
+                ctx.provider,
+                final_poi,
+                endpoint,
+                ctx.profile.transport_mode,
+                allow_taxi_fallback=_same_city(
+                    endpoint.city, ctx.profile.destination
+                ),
+            )
+            if (
+                live_route is not None
+                and canonical_route_evidence_status(live_route)
+                == "provider_verified"
+            ):
+                route = live_route
         if route is None:
             route = RouteInfo(
                 origin_poi_id=final_poi.poi_id,
@@ -3382,17 +3667,42 @@ def _build_budget_plan(
     )
     selected_hotel = float(selected_hotel or 0.0)
     base_hotel_for_delta = float(base_hotel or 0.0)
-    base_low = float(estimate.get("total_low") or 0)
-    base_high = float(estimate.get("total_high") or 0)
-    delta = selected_hotel - base_hotel_for_delta
-    total_low = round(max(0.0, base_low + delta), 2)
-    total_high = round(max(total_low, base_high + delta), 2)
     state = profile.constraint_state or {}
     people = int(
         state.get("traveler_count")
         or profile.party_size
         or 1
     )
+    intercity = _intercity_transport_allowance(domain_inputs, people)
+    days = int(state.get("duration_days") or profile.days or 1)
+    mobility_sensitive = bool(
+        state.get("elderly")
+        or state.get("accessibility_priority")
+        or state.get("max_walking_km_per_day") is not None
+        or any(
+            marker in str(item).casefold()
+            for item in (
+                [state.get("avoid")]
+                if isinstance(state.get("avoid"), str)
+                else (state.get("avoid") or [])
+            )
+            for marker in ("爬坡", "楼梯", "台阶", "wheelchair", "stairs", "steps")
+        )
+    )
+    # The mobility plan requires point-to-point taxi fallback whenever public
+    # transport walking detail is unknown or exceeds the cap. Reserve a modest,
+    # explicit daily allowance so that safety advice and the budget cannot
+    # contradict one another.
+    mobility_fallback_transport = float(80 * days) if mobility_sensitive else 0.0
+    base_low = float(estimate.get("total_low") or 0)
+    base_high = float(estimate.get("total_high") or 0)
+    delta = selected_hotel - base_hotel_for_delta
+    total_low = round(max(
+        0.0, base_low + delta + intercity["low"] + mobility_fallback_transport
+    ), 2)
+    total_high = round(max(
+        total_low, base_high + delta + intercity["high"] + mobility_fallback_transport
+    ), 2)
     if state.get("budget_remaining_cny") is not None:
         limit = float(state["budget_remaining_cny"])
         limit_basis = "remaining_budget_excludes_prepaid"
@@ -3439,9 +3749,19 @@ def _build_budget_plan(
     contingency = _known_cost(estimate, "contingency")
     if contingency is None and estimate.get("total_high") is not None:
         contingency = 0.0
+    inner_city_transport = _known_cost(estimate, "inner_city_transport")
     breakdown = {
         "lodging": lodging_cost,
-        "transport": _known_cost(estimate, "inner_city_transport"),
+        "transport": (
+            round(
+                inner_city_transport
+                + intercity["expected"]
+                + mobility_fallback_transport,
+                2,
+            )
+            if inner_city_transport is not None
+            else None
+        ),
         "tickets": _known_cost(estimate, "tickets"),
         "meals": _known_cost(estimate, "meals"),
         "fixed_event_cost": fixed_event_cost,
@@ -3451,7 +3771,17 @@ def _build_budget_plan(
     known_breakdown = {key: value for key, value in breakdown.items() if value is not None}
     expected_total = round(sum(known_breakdown.values()), 2) if not unknown_items else None
     status = "estimate"
-    note = "估算不含未提供价格的城际票、实时房价波动及个人购物。"
+    note = (
+        "城际交通按已验证路线距离计入预算余量，属于非实时票价估算；"
+        "实时房价、实际票价及个人购物仍需复核。"
+        if intercity["expected"]
+        else "估算不含未提供价格的城际票、实时房价波动及个人购物。"
+    )
+    if mobility_fallback_transport:
+        note += (
+            f" 已为行动不便/步行上限约束预留每日80元、共"
+            f"{mobility_fallback_transport:.0f}元点到点出租车兜底。"
+        )
     if limit is not None and expected_total is not None and expected_total > limit and total_low <= limit:
         # The provider already supplies an estimate interval.  When the normal
         # scenario misses a hard cap but its grounded low scenario fits, expose
@@ -3462,7 +3792,12 @@ def _build_budget_plan(
         scale = min(1.0, variable_target / variable_total) if variable_total else 0.0
         for key in ("meals", "tickets", "transport"):
             if breakdown.get(key) is not None:
-                breakdown[key] = round(float(breakdown[key]) * scale, 2)
+                scalable = float(breakdown[key])
+                protected = mobility_fallback_transport if key == "transport" else 0.0
+                breakdown[key] = round(
+                    protected + max(0.0, scalable - protected) * scale,
+                    2,
+                )
         expected_total = round(sum(value for value in breakdown.values() if value is not None), 2)
         status = "budget_optimized_low_scenario"
         note = (
@@ -3476,12 +3811,21 @@ def _build_budget_plan(
         "status": status,
         "currency": "CNY",
         "people": people,
-        "days": int(state.get("duration_days") or profile.days or 1),
+        "days": days,
         "constraint_revision": active_version["revision"],
         "constraint_hash": active_version["constraint_hash"],
         "prepaid_cost": prepaid,
         "lodging": lodging_cost,
         "transport": breakdown["transport"],
+        "mobility_fallback_transport_cny": mobility_fallback_transport,
+        "intercity_transport_estimate_cny": intercity["expected"],
+        "intercity_transport_low_cny": intercity["low"],
+        "intercity_transport_high_cny": intercity["high"],
+        "intercity_estimate_method": (
+            "verified_distance_allowance_not_live_fare"
+            if intercity["expected"] else None
+        ),
+        "intercity_route_artifact_ids": intercity["artifact_ids"],
         "tickets": breakdown["tickets"],
         "meals": breakdown["meals"],
         "fixed_event_cost": breakdown["fixed_event_cost"],
@@ -3506,6 +3850,56 @@ def _build_budget_plan(
 def _known_cost(estimate: dict[str, Any], key: str) -> float | None:
     value = estimate.get(key)
     return float(value) if value is not None else None
+
+
+def _intercity_transport_allowance(
+    domain_inputs: dict[str, Any], people: int
+) -> dict[str, Any]:
+    """Estimate a transparent fare band from verified long-distance legs.
+
+    AMap supplies route distance and duration but not rail inventory or fare.
+    The budget therefore uses a labelled distance allowance, never presents it
+    as a quoted ticket price, and retains the source artifact ids for review.
+    """
+    legs: list[tuple[float, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in domain_inputs.get("transport") or []:
+        if not isinstance(entry, dict) or not (
+            entry.get("post_plan_origin_closure")
+            or entry.get("post_plan_endpoint_closure")
+        ):
+            continue
+        payload = entry.get("payload", entry)
+        if not isinstance(payload, dict):
+            continue
+        if canonical_route_evidence_status(payload) != "provider_verified":
+            continue
+        if str(payload.get("mode") or "") != "public_transport":
+            continue
+        try:
+            distance_km = float(payload.get("distance_km") or 0)
+        except (TypeError, ValueError):
+            continue
+        # Below this range the provider's normal inner-city allowance remains
+        # the better category and avoids double counting local transfers.
+        if distance_km < 50:
+            continue
+        key = (
+            str(payload.get("origin_poi_id") or ""),
+            str(payload.get("destination_poi_id") or ""),
+            str(payload.get("mode") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        legs.append((distance_km, str(entry.get("artifact_id") or "")))
+    multiplier = max(1, int(people or 1))
+    return {
+        "low": round(sum(max(20.0, km * 0.35) for km, _ in legs) * multiplier, 2),
+        "expected": round(sum(max(30.0, km * 0.50) for km, _ in legs) * multiplier, 2),
+        "high": round(sum(max(50.0, km * 0.75) for km, _ in legs) * multiplier, 2),
+        "artifact_ids": [artifact_id for _, artifact_id in legs if artifact_id],
+    }
 
 
 def _change_claim_matches(requested: str, applied: str) -> bool:
@@ -3629,19 +4023,24 @@ def _build_return_plan(
         for entry in transport
         if isinstance(entry, dict)
     ]
-    # Prefer a terminal transfer whose origin is actually scheduled.
-    scheduled_ids = {
-        str(stop.get("poi", {}).get("poi_id") or "")
-        for day in itinerary.get("days") or []
-        for stop in day.get("stops") or []
-        if isinstance(stop, dict)
-    }
+    # A return transfer must start at the actual final stop.  Merely requiring
+    # any scheduled origin can resurrect a stale route after shortlist pruning
+    # or reviewer revision.
+    scheduled_days = [
+        day for day in itinerary.get("days") or []
+        if isinstance(day, dict) and day.get("stops")
+    ]
+    final_stop_id = str(
+        ((scheduled_days[-1].get("stops") or [])[-1].get("poi") or {}).get("poi_id")
+        if scheduled_days else ""
+    )
     terminal_route = next(
         (
             route
             for route in routes
             if isinstance(route, dict)
-            and str(route.get("origin_poi_id") or "") in scheduled_ids
+            and final_stop_id
+            and str(route.get("origin_poi_id") or "") == final_stop_id
             and any(
                 marker in str(route.get("destination_name") or "")
                 for marker in ("站", "机场", "码头")
@@ -3659,6 +4058,18 @@ def _build_return_plan(
         ),
         None,
     )
+    same_city_return_route = next(
+        (
+            route
+            for route in routes
+            if isinstance(route, dict)
+            and final_stop_id
+            and str(route.get("origin_poi_id") or "") == final_stop_id
+            and destination in str(route.get("destination_name") or "")
+            and destination not in str(route.get("origin_name") or "")
+        ),
+        None,
+    )
     terminal_verified = bool(
         terminal_route
         and str(terminal_route.get("evidence_status") or evidence_status_for_source(terminal_route.get("source"))) in {
@@ -3671,6 +4082,13 @@ def _build_return_plan(
             "provider_verified", "deterministic_estimate"
         }
     )
+    same_city_return_verified = bool(
+        same_city_return_route
+        and str(
+            same_city_return_route.get("evidence_status")
+            or evidence_status_for_source(same_city_return_route.get("source"))
+        ) in {"provider_verified", "deterministic_estimate"}
+    )
     return {
         "required": True,
         "from_city": trip_city,
@@ -3679,8 +4097,8 @@ def _build_return_plan(
         "activity_cutoff": f"{cutoff_minutes // 60:02d}:{cutoff_minutes % 60:02d}",
         "mode": "public_transport",
         "terminal_transfer": (
-            return_route
-            if same_city_terminal and return_verified
+            same_city_return_route
+            if same_city_terminal and same_city_return_verified
             else terminal_route if terminal_verified else None
         ),
         "intercity_segment": None if same_city_terminal else {
@@ -3950,13 +4368,35 @@ def _apply_revision_directives(
         )
     itinerary = replace(result.itinerary, days=days) if days else result.itinerary
     critic_result = critique_itinerary(itinerary, ctx.profile)
+    reviewer_revision_notes: list[str] = []
+    if reviewer_issue_types:
+        # Reviewer findings must be applied to the rebuilt artifact, not merely
+        # acknowledged in revision prose.  Re-run the same deterministic,
+        # general-purpose reviser against matching current issues before this
+        # candidate can be promoted and rebound to final routes.
+        from travel_agent.schemas import CriticResult
+        from travel_agent.reviser import revise_itinerary
+
+        matching_issues = [
+            issue
+            for issue in critic_result.issues
+            if issue.code.casefold() in reviewer_issue_types
+        ]
+        if matching_issues:
+            itinerary, critic_result, reviewer_revision_notes = revise_itinerary(
+                itinerary,
+                ranked,
+                ctx.profile,
+                CriticResult(passed=False, issues=matching_issues),
+            )
     return replace(
         result,
         itinerary=itinerary,
         critic_result=critic_result,
         revision_notes=list(result.revision_notes)
         + (["按要求将指定日期调整为室内活动"] if indoor_changed else [])
-        + (["保留已核验返程路线的末站端点"] if terminal_preserved else []),
+        + (["保留已核验返程路线的末站端点"] if terminal_preserved else [])
+        + reviewer_revision_notes,
     )
 
 

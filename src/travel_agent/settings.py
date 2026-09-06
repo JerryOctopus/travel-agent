@@ -326,7 +326,7 @@ def _default_model(provider: str) -> str:
     if provider in {"qwen", "dashscope", "aliyun"}:
         return "qwen-plus"
     if provider == "deepseek":
-        return "deepseek-chat"
+        return "deepseek-v4-flash"
     if provider in {"zhipu", "glm", "zai"}:
         return "glm-4.7-flash"
     if provider in {"google", "gemini", "google-gemini"}:

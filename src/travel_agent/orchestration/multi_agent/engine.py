@@ -1567,11 +1567,15 @@ _REPAIRABLE_CRITICAL_ROUTE_CODES = frozenset({
 
 
 def _repair_route_pairs_for_plan(plan: dict[str, Any]) -> list[list[str]]:
-    """Bind repair evidence for exact anchors and legal tail-trim fallbacks.
+    """Bind repair evidence for exact anchors and scheduled adjacent legs.
 
     A return-deadline closure may remove a late optional final stop.  Include
     every stop on the last scheduled day against the same return endpoint so
-    the next actual terminal is not left with stale or missing evidence.
+    the next actual terminal is not left with stale or missing evidence.  The
+    Reviewer can also identify an unverified route between two already chosen
+    stops.  Include each same-day adjacent pair so the one bounded Transport
+    repair can materialize those exact legs rather than re-searching or
+    guessing endpoints.  Never infer a route across the overnight day break.
     """
     anchors = plan.get("required_route_anchors") or {}
     return_leg = anchors.get("last_stop_to_return_location") or {}
@@ -1612,6 +1616,14 @@ def _repair_route_pairs_for_plan(plan: dict[str, Any]) -> list[list[str]]:
         for stop in reversed(scheduled_days[-1].get("stops") or []):
             if isinstance(stop, dict):
                 add((stop.get("poi") or {}).get("poi_id"), return_id)
+
+    for day in scheduled_days:
+        stops = [stop for stop in day.get("stops") or [] if isinstance(stop, dict)]
+        for previous, current in zip(stops, stops[1:]):
+            add(
+                (previous.get("poi") or {}).get("poi_id"),
+                (current.get("poi") or {}).get("poi_id"),
+            )
     return pairs[:8]
 
 

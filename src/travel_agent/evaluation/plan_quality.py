@@ -87,8 +87,21 @@ def evaluate_plan_quality(
             "error",
             f"actual={itinerary.get('city')},expected={expected_city}",
         )
+    fixed_events = (
+        hard.get("fixed_events")
+        or (final_profile.get("constraint_state") or {}).get("fixed_events")
+        or []
+    )
+    cross_city_fixed_locations = {
+        _normalize(event.get("location"))
+        for event in fixed_events
+        if isinstance(event, dict) and event.get("location")
+    }
     city_coordinates_valid = itinerary_city_valid and _city_coordinates_valid(
-        pois, expected_city, issues
+        pois,
+        expected_city,
+        issues,
+        allowed_cross_city_locations=cross_city_fixed_locations,
     )
     duplicate_poi_free = _duplicates_valid(pois, issues)
 
@@ -230,14 +243,27 @@ def _day_structure_valid(
 
 
 def _city_coordinates_valid(
-    pois: list[dict[str, Any]], expected_city: Any, issues: list[dict[str, Any]]
+    pois: list[dict[str, Any]],
+    expected_city: Any,
+    issues: list[dict[str, Any]],
+    *,
+    allowed_cross_city_locations: set[str] | None = None,
 ) -> bool:
     ok = True
+    allowed = allowed_cross_city_locations or set()
     for poi in pois:
+        normalized_name = _normalize(poi.get("name"))
+        is_fixed_event_venue = any(
+            location and (
+                location in normalized_name or normalized_name in location
+            )
+            for location in allowed
+        )
         if (
             expected_city
             and poi.get("city")
             and _normalize_city(poi.get("city")) != _normalize_city(expected_city)
+            and not is_fixed_event_venue
         ):
             ok = False
             _issue(issues, "poi_city_mismatch", "error", str(poi.get("name") or "unknown"))

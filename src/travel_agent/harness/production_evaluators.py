@@ -143,6 +143,19 @@ def extract_evidence_pool(result: HarnessCaseResult) -> set[str]:
         poi = entry.get("poi") if isinstance(entry, dict) else None
         if isinstance(poi, dict) and poi.get("poi_id"):
             pool.add(str(poi["poi_id"]))
+    itinerary_artifact = artifacts.get("itinerary") or {}
+    if isinstance(itinerary_artifact, dict):
+        # Planner keeps every bound source artifact in domain_inputs even when
+        # the convenience top-level ``candidates``/``ranked`` snapshot exposes
+        # only the latest artifact of that kind.  Those records are evidence,
+        # not claims from the itinerary itself, and must remain visible to the
+        # grounding evaluator.
+        for entries in (itinerary_artifact.get("domain_inputs") or {}).values():
+            for source_record in entries if isinstance(entries, list) else []:
+                if not isinstance(source_record, dict):
+                    continue
+                payload = source_record.get("payload", source_record)
+                pool.update(_extract_evidence_ids(payload))
     for kind in ("restaurants", "hotels"):
         payload = artifacts.get(kind) or {}
         if isinstance(payload, dict):
@@ -383,6 +396,15 @@ def run_status(result: HarnessCaseResult) -> str:
     if not result.turns:
         return "error"
     if any(turn.error for turn in result.turns):
+        return "error"
+    if any(
+        isinstance(event, dict) and bool(event.get("error"))
+        for turn in result.turns
+        for event in turn.agent_trace
+    ):
+        # A later conversational turn must not hide an earlier worker/model
+        # protocol failure. Official runs classify the whole case as an
+        # environment error and rerun it under a fresh run id.
         return "error"
     last = result.last_turn
     if last is None or (not (last.reply_text or "").strip() and not last.clarification):

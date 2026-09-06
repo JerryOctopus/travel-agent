@@ -2,7 +2,14 @@ from travel_agent.critic import critique_itinerary
 from travel_agent.data_loader import load_seed_pois
 from travel_agent.planning import build_simple_itinerary
 from travel_agent.recommendation import score_pois
-from travel_agent.reviser import _reconcile_revision_notes, revise_itinerary
+from travel_agent.reviser import (
+    _fill_sparse_activity_days,
+    _fill_missing_meal_days,
+    _repair_long_routes,
+    _reconcile_revision_notes,
+    _schedule_stops,
+    revise_itinerary,
+)
 from travel_agent.schemas import (
     Itinerary,
     ItineraryDay,
@@ -130,6 +137,76 @@ def test_reviser_replaces_optional_endpoint_of_overlong_route() -> None:
 
     assert [stop.poi.name for stop in revised.days[0].stops] == ["音乐广场", "五四广场"]
     assert any("超长通勤" in note for note in notes)
+
+
+def test_long_route_repair_prefers_reusing_nearby_meal_over_dropping_activity() -> None:
+    activity = POI("activity", "城内博物馆", "测试城", "museum", 30.0, 120.0, 4.5, 0.8, ["history"], 90, "mid")
+    remote_meal = POI("remote-meal", "远郊合规餐厅", "测试城", "food", 30.0, 120.8, 4.5, 0.8, ["food", "halal"], 60, "mid")
+    nearby_meal = POI("near-meal", "城内合规餐厅", "测试城", "food", 30.0, 120.01, 4.5, 0.8, ["food", "halal"], 60, "mid")
+    itinerary = Itinerary(
+        city="测试城",
+        summary="test",
+        days=[
+            ItineraryDay(1, "test", [ItineraryStop(nearby_meal, "12:00", 60, "")]),
+            ItineraryDay(2, "test", [
+                ItineraryStop(activity, "09:30", 90, ""),
+                ItineraryStop(remote_meal, "17:30", 60, "", RouteInfo("activity", "remote-meal", 80, 180, "public_transport")),
+            ]),
+        ],
+    )
+    profile = TravelProfile(
+        destination="测试城",
+        days=2,
+        constraint_state={"dietary": ["halal"]},
+    )
+
+    repaired, notes = _repair_long_routes(
+        itinerary,
+        [ScoredPOI(activity, 0.9, []), ScoredPOI(remote_meal, 0.8, []), ScoredPOI(nearby_meal, 0.7, [])],
+        profile,
+    )
+
+    assert [stop.poi.poi_id for stop in repaired.days[1].stops] == ["activity", "near-meal"]
+    assert any("替换" in note for note in notes)
+
+
+def test_feasibility_shortlist_drops_optional_stop_when_no_lunch_window() -> None:
+    def attraction(poi_id: str, name: str) -> POI:
+        return POI(poi_id, name, "测试城", "scenic", 30.0, 120.0, 4.5, 0.8, [], 120, "mid")
+
+    first, second, third = (
+        attraction("a", "甲博物馆"),
+        attraction("b", "乙公园"),
+        attraction("c", "丙古街"),
+    )
+    itinerary = Itinerary("测试城", [ItineraryDay(1, "test", [
+        ItineraryStop(first, "09:00", 120, ""),
+        ItineraryStop(second, "12:00", 120, "", RouteInfo("a", "b", 5, 30, "public_transport")),
+        ItineraryStop(third, "15:00", 150, "", RouteInfo("b", "c", 5, 30, "public_transport")),
+    ])], "test")
+    profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        constraint_state={
+            "candidate_only": True,
+            "candidate_attractions": ["甲博物馆", "乙公园", "丙古街"],
+            "return_deadline": "19:00",
+            "return_location": "测试城南站",
+        },
+    )
+    initial = critique_itinerary(itinerary, profile)
+
+    revised, result, notes = revise_itinerary(
+        itinerary,
+        [ScoredPOI(first, 0.9, []), ScoredPOI(second, 0.8, []), ScoredPOI(third, 0.7, [])],
+        profile,
+        initial,
+    )
+
+    assert "meal_break_missing" in {issue.code for issue in initial.issues}
+    assert len(revised.days[0].stops) == 2
+    assert "meal_break_missing" not in {issue.code for issue in result.issues}
+    assert any("用餐窗口" in note for note in notes)
 
 
 def test_reviser_repairs_isolated_activity_before_central_meal() -> None:
@@ -482,6 +559,42 @@ def test_reviser_adds_nearby_activity_to_sparse_multiday_day() -> None:
     assert len(notes) == 3
 
 
+def test_relaxed_day_meal_does_not_consume_second_activity_capacity() -> None:
+    activity = POI(
+        "activity", "上午景点", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, ["history"], 90, "mid",
+    )
+    meal = POI(
+        "meal", "午餐", "测试城", "food", 30.0, 120.01,
+        4.5, 0.8, ["food"], 60, "mid",
+    )
+    afternoon = POI(
+        "afternoon", "下午博物馆", "测试城", "museum", 30.0, 120.02,
+        4.5, 0.8, ["history"], 90, "mid",
+    )
+    itinerary = Itinerary(
+        "测试城",
+        [
+            ItineraryDay(1, "test", [
+                ItineraryStop(activity, "09:30", 90, ""),
+                ItineraryStop(meal, "11:30", 60, ""),
+            ]),
+            ItineraryDay(2, "test", []),
+        ],
+        "test",
+    )
+    profile = TravelProfile(destination="测试城", days=2, pace="relaxed")
+
+    revised, notes = _fill_sparse_activity_days(
+        itinerary, [ScoredPOI(afternoon, 0.8, [])], profile
+    )
+
+    assert [stop.poi.poi_id for stop in revised.days[0].stops] == [
+        "activity", "meal", "afternoon",
+    ]
+    assert any("第1天下午" in note for note in notes)
+
+
 def test_reviser_restores_missing_meal_after_other_repairs() -> None:
     scenic = POI("scenic", "兵马俑", "西安", "museum", 34.38, 109.28, 4.9, 1.0, ["history"], 90, "mid")
     meal = POI("meal", "清真附近餐厅", "西安", "food", 34.37, 109.27, 4.5, 0.8, ["food", "halal", "清真"], 60, "mid")
@@ -507,6 +620,107 @@ def test_reviser_restores_missing_meal_after_other_repairs() -> None:
     assert any(stop.poi.category == "food" for stop in revised.days[0].stops)
     assert "daily_meal_missing" not in {issue.code for issue in result.issues}
     assert any("补全第1天用餐" in note for note in notes)
+
+
+def test_meal_repair_uses_nearest_day_anchor_not_farthest_day_anchor() -> None:
+    near = POI("near", "近端景点", "合成城", "scenic", 30.0, 120.0, 4.5, 0.8, [], 90, "mid")
+    remote = POI("remote", "远端景点", "合成城", "scenic", 30.0, 120.5, 4.5, 0.8, [], 90, "mid")
+    meal = POI("meal", "近端餐厅", "合成城", "food", 30.0, 120.01, 4.5, 0.8, ["food"], 60, "mid")
+    itinerary = Itinerary(
+        city="合成城",
+        summary="test",
+        days=[ItineraryDay(1, "test", [
+            ItineraryStop(near, "09:00", 90, ""),
+            ItineraryStop(remote, "15:00", 90, ""),
+        ])],
+    )
+    profile = TravelProfile(destination="合成城", days=1, interests=["food"])
+
+    revised, notes = _fill_missing_meal_days(
+        itinerary,
+        [ScoredPOI(meal, 0.8, [])],
+        profile,
+    )
+
+    assert any(stop.poi.poi_id == "meal" for stop in revised.days[0].stops)
+    assert any("补全第1天用餐" in note for note in notes)
+
+
+def test_meal_repair_can_reuse_grounded_restaurant_across_trip_days() -> None:
+    day_one = POI(
+        "day-one", "第一天景点", "合成城", "scenic",
+        30.0, 120.0, 4.5, 0.8, [], 90, "mid",
+    )
+    day_two = POI(
+        "day-two", "第二天景点", "合成城", "museum",
+        30.01, 120.01, 4.5, 0.8, [], 90, "mid",
+    )
+    meal = POI(
+        "meal", "有证据餐厅", "合成城", "food",
+        30.005, 120.005, 4.5, 0.8, ["food"], 60, "mid",
+    )
+    itinerary = Itinerary(
+        city="合成城",
+        summary="test",
+        days=[
+            ItineraryDay(1, "test", [
+                ItineraryStop(day_one, "09:30", 90, ""),
+                ItineraryStop(meal, "11:30", 60, ""),
+            ]),
+            ItineraryDay(2, "test", [
+                ItineraryStop(day_two, "09:30", 90, ""),
+            ]),
+        ],
+    )
+    profile = TravelProfile(destination="合成城", days=2, interests=["food"])
+
+    revised, notes = _fill_missing_meal_days(
+        itinerary,
+        [ScoredPOI(meal, 0.8, [])],
+        profile,
+    )
+
+    assert [
+        stop.poi.poi_id
+        for stop in revised.days[1].stops
+        if stop.poi.category == "food"
+    ] == ["meal"]
+    assert any("补全第2天用餐" in note for note in notes)
+
+
+def test_reviser_schedules_evening_only_restaurant_after_opening() -> None:
+    activity = POI("activity", "上午景点", "合成城", "scenic", 30.0, 120.0, 4.5, 0.8, [], 90, "mid")
+    meal = POI(
+        "meal", "晚间餐厅", "合成城", "food", 30.0, 120.01,
+        4.5, 0.8, ["food"], 60, "mid", opening_hours="16:00-04:00",
+    )
+
+    scheduled = _schedule_stops([
+        ItineraryStop(activity, "09:00", 90, ""),
+        ItineraryStop(meal, "12:00", 60, ""),
+    ])
+
+    meal_stop = next(stop for stop in scheduled if stop.poi.category == "food")
+    assert meal_stop.start_time == "16:00"
+
+
+def test_reviser_keeps_a_late_lunch_in_the_lunch_window() -> None:
+    activity = POI(
+        "activity", "上午景点", "合成城", "scenic",
+        30.0, 120.0, 4.5, 0.8, [], 150, "mid",
+    )
+    meal = POI(
+        "meal", "午餐餐厅", "合成城", "food",
+        30.0, 120.01, 4.5, 0.8, ["food"], 60, "mid",
+    )
+
+    scheduled = _schedule_stops([
+        ItineraryStop(activity, "09:00", 150, ""),
+        ItineraryStop(meal, "11:30", 60, ""),
+    ])
+
+    meal_stop = next(stop for stop in scheduled if stop.poi.category == "food")
+    assert meal_stop.start_time == "12:30"
 
 
 def test_reviser_never_claims_an_addition_absent_from_final_itinerary() -> None:

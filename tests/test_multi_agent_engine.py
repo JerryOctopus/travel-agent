@@ -57,6 +57,7 @@ from travel_agent.orchestration.multi_agent.executor import (
     _enforce_required_poi_postcondition,
     _enforce_restaurant_search_postcondition,
     _enforce_hotel_search_postcondition,
+    _planner_route_estimator,
     _task_has_nonempty_domain_evidence,
     _promote_recovered_worker_status,
     build_subagent_executor,
@@ -743,7 +744,7 @@ def test_only_deterministically_bound_critical_route_gap_is_repairable():
     assert _repairable_critical_route_targets(budget_review, route_plan) == []
 
 
-def test_return_route_repair_covers_each_possible_last_day_terminal():
+def test_route_repair_covers_return_fallbacks_and_intra_day_adjacency():
     plan = {
         "itinerary": {"days": [
             {"day_index": 1, "stops": [{"poi": {"poi_id": "day-one"}}]},
@@ -765,6 +766,30 @@ def test_return_route_repair_covers_each_possible_last_day_terminal():
     assert _repair_route_pairs_for_plan(plan) == [
         ["last-b", "station"],
         ["last-a", "station"],
+        ["last-a", "last-b"],
+    ]
+
+
+def test_route_repair_covers_each_intra_day_leg_without_cross_day_guessing():
+    plan = {
+        "itinerary": {"days": [
+            {"day_index": 1, "stops": [
+                {"poi": {"poi_id": "day1-a"}},
+                {"poi": {"poi_id": "day1-b"}},
+                {"poi": {"poi_id": "day1-c"}},
+            ]},
+            {"day_index": 2, "stops": [
+                {"poi": {"poi_id": "day2-a"}},
+                {"poi": {"poi_id": "day2-b"}},
+            ]},
+        ]},
+        "required_route_anchors": {"legs": []},
+    }
+
+    assert _repair_route_pairs_for_plan(plan) == [
+        ["day1-a", "day1-b"],
+        ["day1-b", "day1-c"],
+        ["day2-a", "day2-b"],
     ]
 
 
@@ -2098,6 +2123,33 @@ def test_transport_postcondition_reuses_existing_ordered_route_endpoints():
     ) == (origin_id, destination_id)
 
 
+def test_transport_budget_only_contract_completes_without_model_round_trip():
+    ctx = build_session(session_id="sess_transport_budget_only", persist=False)
+    ctx.profile.destination = "测试城"
+    ctx.profile.days = 3
+    ctx.profile.party_size = 2
+    ctx.profile.budget_limit = 3000
+    ctx.profile.constraint_state = {
+        "destination_city": "测试城",
+        "duration_days": 3,
+        "traveler_count": 2,
+        "budget_max_cny": 3000,
+    }
+    task = _task_for("transport")
+    task.inputs["task_type"] = "full_itinerary"
+
+    result = _enforce_transport_route_postcondition(
+        task, ctx, {"status": STATUS_COMPLETED, "tool_trace": []}
+    )
+
+    assert result["tool_trace"] == ["estimate_budget"]
+    assert result["_transport_contract_satisfied"] is True
+    assert any(
+        record.get("kind") == "budget"
+        for record in ctx.store.snapshot_records().values()
+    )
+
+
 def test_transport_rework_adds_taxi_for_existing_return_deadline_pair():
     from travel_agent.agent import toolkit
 
@@ -2370,6 +2422,32 @@ def test_transport_postcondition_fans_out_routes_for_fixed_event() -> None:
         for route in routes
     } == {("candidate-a", "event"), ("candidate-b", "event")}
     assert {route["mode"] for route in routes} == {"public_transport", "taxi"}
+
+
+def test_planner_route_estimator_binds_task_local_provider_route() -> None:
+    ctx = build_session(session_id="sess_planner_task_route", persist=False)
+    origin = POI(
+        "origin", "上午景点", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, [], 90, "mid",
+    )
+    event = POI(
+        "event", "固定展馆", "测试城", "museum", 30.1, 120.1,
+        4.5, 0.8, [], 90, "mid",
+    )
+    ctx.remember_pois([origin, event])
+    route_id = ctx.store.put("routes", {
+        "origin_poi_id": "origin", "destination_poi_id": "event",
+        "distance_km": 12.0, "duration_min": 42,
+        "mode": "public_transport", "source": "amap",
+        "evidence_status": "provider_verified",
+    })
+
+    estimator = _planner_route_estimator(ctx, [route_id])
+    route = estimator.estimate_route(origin, event, "public_transport")
+
+    assert route.duration_min == 42
+    assert route.source == "amap"
+    assert route.evidence_status == "provider_verified"
 
 
 def test_transport_postcondition_builds_adjacent_chain_for_ordinary_full_plan() -> None:
@@ -2720,6 +2798,39 @@ def test_restaurant_postcondition_replaces_empty_artifact_with_real_candidates()
     assert _task_has_nonempty_domain_evidence(ctx, task)
 
 
+def test_restaurant_postcondition_searches_near_hard_anchors_for_multiday_dietary_trip(monkeypatch):
+    ctx = build_session(session_id="sess_anchor_meal_recovery", persist=False)
+    ctx.profile = TravelProfile(
+        destination="测试城",
+        days=3,
+        must_visit=["远郊遗址", "中心城墙"],
+        constraint_state={
+            "destination_city": "测试城",
+            "duration_days": 3,
+            "dietary": ["仅清真餐厅"],
+            "must_visit": ["远郊遗址", "中心城墙"],
+        },
+    )
+    task = _task_for("restaurant")
+    task.inputs["profile"] = {"constraint_state": dict(ctx.profile.constraint_state)}
+    searched_areas = []
+
+    def fake_search(_ctx, **kwargs):
+        searched_areas.append(kwargs.get("area"))
+        return {"isError": False, "count": 3, "artifact_id": f"meal-{len(searched_areas)}"}
+
+    monkeypatch.setattr(toolkit, "search_restaurant", fake_search)
+
+    result = _enforce_restaurant_search_postcondition(
+        task, ctx, {"status": STATUS_COMPLETED, "tool_trace": []}
+    )
+
+    assert searched_areas == [None, "远郊遗址", "中心城墙"]
+    assert result["tool_trace"] == [
+        "search_restaurant", "search_restaurant", "search_restaurant",
+    ]
+
+
 def test_hotel_postcondition_materializes_grounded_candidates():
     ctx = build_session(session_id="sess_empty_hotel_recovery", persist=False)
     ctx.profile.destination = "测试城"
@@ -2767,6 +2878,35 @@ def test_transport_postcondition_evidence_recovers_budget_exhausted_status():
     ctx.store.put(
         "routes",
         {"origin_poi_id": "a", "destination_poi_id": "b", "duration_min": 12},
+        request_id=task.request_id,
+        task_id=task.task_id,
+        agent="transport",
+    )
+
+    result = _promote_recovered_worker_status(
+        task,
+        ctx,
+        {"status": "budget_exhausted", "warnings": ["redundant call rejected"]},
+    )
+
+    assert result["status"] == STATUS_COMPLETED
+
+
+def test_unanchored_comparison_transit_entities_recover_transport_worker_status():
+    ctx = build_session(session_id="sess_unanchored_comparison_recovery", persist=False)
+    task = _task_for("transport")
+    task.inputs.update({
+        "task_type": "candidate_comparison",
+        "profile": {
+            "constraint_state": {
+                "comparison_candidates": ["甲区", "乙区"],
+                "comparison_dimensions": ["accessibility"],
+            },
+        },
+    })
+    ctx.store.put(
+        "candidates",
+        {"pois": [{"poi_id": "station", "name": "甲区地铁站"}]},
         request_id=task.request_id,
         task_id=task.task_id,
         agent="transport",

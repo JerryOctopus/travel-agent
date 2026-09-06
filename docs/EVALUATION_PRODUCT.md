@@ -13,7 +13,8 @@
 | `challenge_frozen` | `challenge_frozen.jsonl` | 34 | 高难定版集；含 4 条长程多轮 | **禁止用于调优** |
 | `shadow_frozen` | `shadow_frozen.jsonl` | 30 | 影子集，**只跑最终选定版本**，不参与版本选择 | 消融对比中禁止出现 |
 
-- `all_cases.jsonl` 为 192 条全集；`rubric/evaluation_rubric.json` 为评分细则；
+- `all_cases.jsonl` 为 192 条历史归档全集，不得作为本轮 runner 输入；Dev 使用独立
+  `dev.jsonl`，冻结阶段只通过 manifest 加载一个 split。`rubric/evaluation_rubric.json` 为评分细则；
   `faults/fault_configs.json` 仅存档（外部 40 次 fault runs 属 record/replay 范围，本次不迁）。
 - gold 字段（`gold.outcome` / `gold.constraints` 约束树 / required/forbidden_behaviors）
   仅用于评分，运行时保证不进入 agent 输入。
@@ -99,55 +100,58 @@ Judge 仍使用独立的 `TRAVEL_AGENT_JUDGE_*` 配置，不会复用被测 Agen
 `judge_average_score`、`judge_reasonable_rate`、`judge_completion_rate` 和
 `critical_issue_rate`。`--resume` 复用相同模型、rubric、prompt 和输入对应的缓存。
 
-## 三阶段执行规程（V0–V3 消融，对齐外部 version_matrix）
+## 当前发布验收规程（V3 单候选）
 
-0. **开发调优**（不计入正式次数，可反复）：
-   `python scripts/eval_ablation.py --variants v0,v1,v2,v3 --product-split dev`（冒烟加 `--limit 3`）。
-1. **阶段一：四版本正式对比（512 次）**：Core 94 + Challenge 34 = 128 条冻结任务
-   × 4 版本各跑一次：
-   ```bash
-   python scripts/eval_ablation.py --variants v0,v1,v2,v3 --product-split core_frozen
-   python scripts/eval_ablation.py --variants v0,v1,v2,v3 --product-split challenge_frozen
-   ```
-   Shadow Set 不参与版本选择。
-2. **阶段二：最终版本跑 Shadow（30 次）**：依据 128 条的 strict_success_rate
-   选出最终版本，单版本跑影子集：
-   ```bash
-   python scripts/eval_ablation.py --variants <最终版> --product-split shadow_frozen
-   ```
-3. **阶段三：随机稳定性（追加 120 次）**：从冻结集选 60 条
-   （Core 按 subset 分层抽 30 + Challenge 全部 30，清单固化为
-   `data/eval/production_v1/stability_60.json`，seed=42，已提交入库不再重抽），
-   最终版本共跑 3 遍；第一遍已含在阶段一的 512 次里，只补两遍：
-   ```bash
-   python scripts/eval_ablation.py --variants <最终版> --cases-file data/eval/production_v1/stability_60.json --repeat-index 2
-   python scripts/eval_ablation.py --variants <最终版> --cases-file data/eval/production_v1/stability_60.json --repeat-index 3
-   python scripts/eval_ablation.py --stability-merge --merge-runs <阶段一目录>,<repeat2目录>,<repeat3目录>
-   ```
+本轮只验收当前 V3 单候选，不运行 V0–V3 四版本消融，也不执行旧的 512 次
+Core/Challenge 对比。冻结集只能由 `--official-frozen --release-manifest` 入口按
+`Core → Challenge → Shadow` 顺序打开；非正式入口选择 frozen 或 `all` 会在加载正文前拒绝。
 
-### 执行次数口径（必须准确表述）
+发布候选须先在 36 条非冻结合成 readiness 和完整回归上通过，再完成两次不可变
+Dev34 准入。之后提交、推送并打 tag，生成记录 commit、数据哈希、模型、工具、Prompt、
+评分器、Artifact contract 和配置指纹的 manifest。Core、Challenge、Shadow 之间不得修改
+候选或任何指纹项。
 
-| 阶段 | 计算 | 次数 |
-| --- | --- | --- |
-| 阶段一 | 128 条 × 4 版本 | 512 |
-| 阶段二 | 30 条 × 1 最终版 | 30 |
-| 阶段三 | 60 条 × 2 遍追加 | 120 |
-| **正常环境总计** | 512 + 30 + 120 | **662** |
-| 最终架构自身 | 128 + 30 + 120 | **278** |
+| 阶段 | Strict | Hard | 关键分项 |
+| --- | ---: | ---: | --- |
+| Dev34（连续两轮） | ≥30/34 | ≥33/34 | Full ≥19/22；Non ≥11/12；长程 4/4 |
+| Core 94 | ≥80/94 | ≥92/94 | fixed 8/10；long 3/4；multi-city 12/15；multi-turn 8/10；multi-day 16/20；one-day 12/15；special 8/10；strict 8/10 |
+| Challenge 34 | ≥27/34 | ≥32/34 | action 4/4；conflict、impossible 各 4/5；其余六组各 3/4 |
+| Shadow 30 | ≥24/30 | ≥29/30 | Full ≥21/26；Partial ≥3/4 |
 
-共 **158 条独立冻结任务**（Core+Challenge 128 + Shadow 30），4 种架构累计完成
-662 次正常环境执行。**禁止表述为"4 个版本一共只跑 278 次"。**
+所有阶段要求 grounding、authorization、tool schema、architecture policy 满分，无红线；
+固定 DeepSeek `deepseek-v4-flash`（temperature 0.2、thinking off、Hybrid off）、configured AMap，
+Judge 固定 SiliconFlow `Qwen/Qwen3.5-397B-A17B`（temperature 0、thinking off）。适用产物
+Judge 完成率必须 100%，平均分 ≥80、reasonable rate ≥75%、critical issue rate ≤15%。
 
-### 公平控制（五同，落盘 comparison.json 的 `fair_controls`）
+当前执行量为 **158 条独立冻结任务**（94 + 34 + 30），每条在有效正式 run 中恰好执行
+一次；另有两轮 Dev34 准入，共 68 次非冻结执行。历史文档中的 512/662/278 是旧四版本
+消融与稳定性实验口径，不是本轮发布验收口径。
 
-同模型同温度、同工具 Schema 与快照、同 plan_and_critique 版本与规则集、
-同 token/步数硬上限（`--token-budget`）、同评分器版本。
-`execution_plan`（512/30/120/662/278/158）同步落盘。
+创建与验收命令：
 
-### 架构纪律自动校验
+```bash
+# 两轮 Dev34 已完成 rules + Judge 后
+PYTHONPATH=src .venv/bin/python scripts/check_frozen_release.py check-dev \
+  --first-run data/eval/product/runs/<dev-1> \
+  --second-run data/eval/product/runs/<dev-2>
 
-每条 case 的 architecture_policy 评分器校验 V0–V2 无外部 critic 事件、
-V3 恰好一次且返工 ≤1，违规直接 fail。
+# 候选已经 commit、push、tag，且 tracked worktree clean
+PYTHONPATH=src .venv/bin/python scripts/check_frozen_release.py create \
+  --candidate-id <candidate-id> --tag <tag> \
+  --first-dev-run data/eval/product/runs/<dev-1> \
+  --second-dev-run data/eval/product/runs/<dev-2> \
+  --output data/eval/releases/<candidate-id>/manifest.json
+
+PYTHONPATH=src .venv/bin/python scripts/eval_product_multi_model.py \
+  --official-frozen --release-manifest data/eval/releases/<candidate-id>/manifest.json \
+  --product-split core_frozen --model deepseek:deepseek-v4-flash \
+  --run-id <core-run> --write-report --json
+```
+
+确定性门槛通过后才运行 Judge，并用 `check-stage` 生成 acceptance proof。Challenge 同理；
+Shadow 还必须传入同一 manifest 下 Core、Challenge 的 proof。最后用 `check-release` 联合验收。
+环境、配额或服务错误把整轮标为 `invalid`，保持候选不变并用全新 run-id 重跑；真实质量
+失败必须封存，不得从冻结 case 逐条调参。
 
 ## 稳定性五项指标（同一条案例 3 次运行的聚合口径）
 
@@ -175,8 +179,9 @@ V3 恰好一次且返工 ≤1，违规直接 fail。
 
 ## 推荐工作流
 
-日常 dev（反复跑）→ 阶段一 core+challenge 512 定版对比 → 阶段二 shadow 30
-仅最终版 → 阶段三 stability_60 补跑两遍 + 稳定性合并报告。
+非冻结 readiness → Dev34 两轮连续准入 → 冻结 candidate/tag/manifest → Core 94 →
+Challenge 34 → Shadow 30 → 联合 release acceptance。旧 stability_60 与 V0–V3 消融
+仍可用于独立研究，但不属于本轮发布结论，也不得绕过冻结加载纪律读取本轮 sealed split。
 
 日常 remediation 只运行 strict evaluator + trace；不要每次修改都追 Judge 分数。
 当系统发生明显版本变化、strict 连续稳定或准备 freeze candidate 时，对对应的完整

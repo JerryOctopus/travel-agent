@@ -72,6 +72,21 @@ _CLOSED_NAME_MARKERS = (
     "暂未开放",
 )
 _NON_VISITABLE_SUFFIXES = ("有限公司", "有限责任公司", "分公司", "办事处", "服务门店")
+_FOOD_BUSINESS_NAME_MARKERS = (
+    "星巴克",
+    "瑞幸咖啡",
+    "luckin coffee",
+)
+_FOOD_BUSINESS_SUFFIXES = (
+    "咖啡馆",
+    "咖啡厅",
+    "咖啡店",
+    "餐厅",
+    "饭店",
+    "酒楼",
+    "茶饮店",
+    "甜品店",
+)
 
 _AVOID_SPECIFIC_ALIASES: dict[str, frozenset[str]] = {
     "海边": frozenset({"海边", "海湾", "海滨", "沙滩", "海滩", "环岛", "seaside", "beach"}),
@@ -474,6 +489,25 @@ def _entity_avoid_match(poi: POI, rule: _AvoidRule) -> AvoidMatch | None:
 def _semantic_avoid_match(poi: POI, rule: _AvoidRule) -> AvoidMatch | None:
     term = str(rule.term).strip()
     lowered_text = " ".join([poi.name, *poi.tags]).casefold()
+    if any(marker in term for marker in ("排队", "网红")):
+        queue_marker = next(
+            (
+                marker
+                for marker in ("排队", "网红", "热门", "hot", "popular", "crowded")
+                if marker.casefold() in lowered_text
+            ),
+            None,
+        )
+        # Popularity is structured provider evidence.  Only the extreme band
+        # is treated as a deterministic queue-risk signal; ordinary popular
+        # venues remain candidates rather than being guessed away.
+        if float(poi.popularity or 0.0) >= 0.95 or queue_marker is not None:
+            return AvoidMatch(
+                term,
+                rule.source,
+                "provider_popularity_queue_risk",
+                queue_marker or f"popularity={float(poi.popularity or 0.0):.2f}",
+            )
     if term == "连续爬坡":
         mobility_marker = next(
             (
@@ -554,6 +588,10 @@ def poi_avoid_match(poi: POI, profile: TravelProfile) -> AvoidMatch | None:
             return identity
         if rule.entity_only:
             continue
+        if must_visit and any(marker in rule.term for marker in ("排队", "网红")):
+            # A broad crowd preference cannot silently erase an explicit
+            # must-visit. The planner must retain it and expose mitigation.
+            continue
         semantic = _semantic_avoid_match(poi, rule)
         if semantic is not None:
             return semantic
@@ -592,6 +630,12 @@ def normalize_poi_entity(poi: POI, profile: TravelProfile | None = None) -> POI:
     ):
         status = "wrong_entity"
         reason = reason or "名称显示为附属设施或非游览实体，且无父子覆盖证据"
+    elif status == "verified" and poi.category not in {"food", "hotel"} and (
+        any(marker in poi.name.casefold() for marker in _FOOD_BUSINESS_NAME_MARKERS)
+        or any(poi.name.endswith(suffix) for suffix in _FOOD_BUSINESS_SUFFIXES)
+    ):
+        status = "wrong_entity"
+        reason = reason or "名称与餐饮商业实体明确冲突，不能仅凭景点分类进入行程"
     elif (
         status == "verified"
         and entity_type not in ACTIVITY_ENTITY_TYPES

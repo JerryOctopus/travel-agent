@@ -157,6 +157,30 @@ def test_grounding_passes_when_all_claims_supported() -> None:
     assert evaluate_grounding(plan, pool)["passed"] is True
 
 
+def test_grounding_pool_includes_bound_planner_domain_input_pois() -> None:
+    itinerary = _itinerary_artifact()
+    itinerary["itinerary"]["days"][0]["stops"] = [{
+        "poi": {"poi_id": "poi-domain", "name": "有证据景点"},
+        "start_time": "09:00",
+        "duration_min": 90,
+    }]
+    itinerary["domain_inputs"] = {
+        "attractions": [{
+            "artifact_id": "pois-source",
+            "payload": {
+                "pois": [{"poi_id": "poi-domain", "name": "有证据景点"}],
+            },
+        }],
+    }
+    result = _result(final_artifacts={"itinerary": itinerary})
+
+    pool = extract_evidence_pool(result)
+    grounding = evaluate_grounding(normalize_plan(result), pool)
+
+    assert "poi-domain" in pool
+    assert grounding["passed"] is True
+
+
 def test_grounding_rejects_numeric_route_prose_without_route_artifact() -> None:
     turn = _turn("乘地铁3号线，约45-55分钟，打车约100元。")
     result = HarnessCaseResult("route", [turn], {}, {})
@@ -179,6 +203,23 @@ def test_grounding_accepts_route_prose_with_route_artifact() -> None:
     grounding = evaluate_grounding({"days": [], "claims": []}, set(), result)
 
     assert grounding["passed"] is True
+
+
+def test_run_status_rejects_hidden_subagent_error_from_earlier_turn() -> None:
+    failed_turn = _turn(status="incomplete")
+    failed_turn = HarnessTurnResult(
+        **{
+            **failed_turn.__dict__,
+            "agent_trace": [{
+                "agent": "transport",
+                "status": "failed",
+                "error": "BadRequestError: incomplete tool-call messages",
+            }],
+        }
+    )
+    result = _result(turns=[failed_turn, _turn(status="completed")])
+
+    assert run_status(result) == "error"
 
 
 def test_grounding_uses_evidence_from_the_turn_that_made_the_claim() -> None:

@@ -10,14 +10,20 @@ def preflight_llm(settings: Any) -> dict[str, Any]:
     """Send a tiny OpenAI-compatible chat request to validate endpoint/key/quota."""
     llm = settings.llm
     url = f"{llm.base_url.rstrip('/')}/chat/completions"
-    body = json.dumps(
-        {
-            "model": llm.model,
-            "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 4,
-            "temperature": 0,
+    payload: dict[str, Any] = {
+        "model": llm.model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 4,
+        "temperature": llm.temperature,
+    }
+    if (
+        str(llm.provider).lower() == "deepseek"
+        and str(llm.model).lower() in {"deepseek-v4-flash", "deepseek-v4-pro"}
+    ):
+        payload["thinking"] = {
+            "type": "enabled" if llm.thinking_enabled else "disabled"
         }
-    ).encode()
+    body = json.dumps(payload).encode()
     req = Request(
         url,
         data=body,
@@ -29,12 +35,15 @@ def preflight_llm(settings: Any) -> dict[str, Any]:
     )
     try:
         with urlopen(req, timeout=llm.timeout_seconds) as resp:
-            resp.read()
+            response = json.loads(resp.read().decode("utf-8"))
         return {
             "ok": True,
             "provider": llm.provider,
             "model": llm.model,
+            "provider_reported_model": response.get("model"),
             "base_url": llm.base_url,
+            "temperature": llm.temperature,
+            "thinking_enabled": llm.thinking_enabled,
         }
     except HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:500]
@@ -45,6 +54,14 @@ def preflight_llm(settings: Any) -> dict[str, Any]:
             "base_url": llm.base_url,
             "status": exc.code,
             "detail": detail,
+        }
+    except json.JSONDecodeError as exc:
+        return {
+            "ok": False,
+            "provider": llm.provider,
+            "model": llm.model,
+            "base_url": llm.base_url,
+            "detail": f"invalid JSON response: {exc}",
         }
     except URLError as exc:
         return {

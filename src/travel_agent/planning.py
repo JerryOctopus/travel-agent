@@ -309,7 +309,49 @@ def _select_plan_candidates(
     # distant second restaurant must not displace a viable attraction after
     # the daily evidenced-meal requirement has already been satisfied.
     fill_order = [item for item in eligible if item.poi.category != "food"]
-    if meal_requested:
+    mobility_text = " ".join(
+        str(value or "")
+        for value in [state.get("mobility"), *(state.get("avoid") or [])]
+    ).casefold()
+    mobility_sensitive = bool(
+        state.get("elderly")
+        or state.get("wheelchair_user")
+        or state.get("accessibility_priority")
+        or any(
+            state.get(key) not in (None, "", [], {})
+            for key in (
+                "max_walking_km_per_day", "max_single_walk_km",
+                "walking_time_max_min", "max_single_walk_min",
+            )
+        )
+        or any(
+            marker in mobility_text
+            for marker in (
+                "low_walking", "少步行", "不要安排太多步行", "避免步行",
+                "wheelchair", "轮椅", "台阶", "楼梯", "爬坡",
+            )
+        )
+    )
+    activity_anchors = [
+        item.poi for item in selected if item.poi.category != "food"
+    ]
+    if mobility_sensitive and activity_anchors:
+        fill_order.sort(key=lambda item: (
+            min(
+                _haversine_km(
+                    item.poi.lng, item.poi.lat, anchor.lng, anchor.lat
+                )
+                for anchor in activity_anchors
+            ),
+            -item.score,
+        ))
+    # Meal reservation above is capped at one concrete restaurant per trip
+    # day. Do not use spare activity capacity for additional restaurants: two
+    # adjacent meals can create an infeasible transfer and does not improve a
+    # full itinerary's completeness.
+    if meal_requested and profile.days == 1:
+        # A one-day food-focused request may intentionally be a lunch/dinner
+        # crawl; the multi-day cap above is about preventing uneven clustering.
         fill_order += [item for item in eligible if item.poi.category == "food"]
     for item in fill_order:
         if len(selected) >= total_stops:
@@ -457,7 +499,9 @@ def apply_structured_schedule_constraints(
             if not poi_open_on_trip_day(stop.poi, profile, day.day_index):
                 continue
             requested_start = _time_to_minutes(stop.start_time)
-            opening_window = _daily_opening_window(stop.poi.opening_hours)
+            opening_window = _opening_window_for_trip_day(
+                stop.poi, profile, day.day_index
+            )
             if opening_window is not None:
                 requested_start = max(requested_start, opening_window[0])
             candidates.append((requested_start, None, stop, False))
@@ -515,7 +559,9 @@ def apply_structured_schedule_constraints(
         if required_flexible:
             required_flexible.sort(
                 key=lambda entry: (
-                    (_daily_opening_window(entry[2].poi.opening_hours) or (0, 24 * 60))[1],
+                    (_opening_window_for_trip_day(
+                        entry[2].poi, profile, day.day_index
+                    ) or (0, 24 * 60))[1],
                     entry[0],
                 )
             )
@@ -631,7 +677,9 @@ def apply_structured_schedule_constraints(
                 continue
             if deadline is not None and actual_start + duration > deadline:
                 continue
-            opening_window = _daily_opening_window(stop.poi.opening_hours)
+            opening_window = _opening_window_for_trip_day(
+                stop.poi, profile, day.day_index
+            )
             if opening_window is not None:
                 opens, closes = opening_window
                 actual_start = max(actual_start, opens)
@@ -657,6 +705,27 @@ def apply_structured_schedule_constraints(
                         )
                     if actual_start + duration > closes:
                         continue
+            last_admission = _last_admission_for_trip_day(
+                stop.poi, profile, day.day_index
+            )
+            if not is_fixed and last_admission is not None and actual_start > last_admission:
+                # Admission cutoffs govern arrival, not the venue's closing
+                # time.  Move a flexible visit earlier only when doing so still
+                # preserves the preceding route and opening boundary.
+                earliest_allowed = 0
+                if scheduled:
+                    previous = scheduled[-1]
+                    earliest_allowed = _round_up_to_quarter(
+                        _time_to_minutes(previous.start_time)
+                        + previous.duration_min
+                        + (route.duration_min if route else 0)
+                        + TRANSFER_BUFFER_MIN
+                    )
+                if opening_window is not None:
+                    earliest_allowed = max(earliest_allowed, opening_window[0])
+                if earliest_allowed > last_admission:
+                    continue
+                actual_start = last_admission
             scheduled.append(
                 ItineraryStop(
                     poi=stop.poi,
@@ -684,13 +753,18 @@ def apply_structured_schedule_constraints(
                     + route_duration
                     + TRANSFER_BUFFER_MIN
                 )
-            opening_window = _daily_opening_window(last.poi.opening_hours)
+            opening_window = _opening_window_for_trip_day(
+                last.poi, profile, day.day_index
+            )
             opens_late_enough = (
                 opening_window is None
                 or (
                     proposed_start >= opening_window[0]
                     and activity_end_target <= opening_window[1]
                 )
+            )
+            last_admission = _last_admission_for_trip_day(
+                last.poi, profile, day.day_index
             )
             overlaps_reserved = any(
                 proposed_start < reserved_end
@@ -706,6 +780,7 @@ def apply_structured_schedule_constraints(
                 and proposed_start >= earliest
                 and (deadline is None or activity_end_target <= deadline)
                 and opens_late_enough
+                and (last_admission is None or proposed_start <= last_admission)
                 and not overlaps_reserved
             ):
                 scheduled[-1] = replace(
@@ -777,7 +852,182 @@ def _daily_opening_window(value: str | None) -> tuple[int, int] | None:
         return None
     opens = int(match.group(1)) * 60 + int(match.group(2))
     closes = int(match.group(3)) * 60 + int(match.group(4))
-    return (opens, closes) if closes > opens else None
+    # Overnight businesses (for example 16:00-04:00) are usable from their
+    # opening time through midnight on the itinerary day.  Preserve the next-
+    # day close as >24h so daytime scheduling can honor the opening boundary.
+    if closes <= opens:
+        closes += 24 * 60
+    return opens, closes
+
+
+_WEEKDAY_INDEX = {name: index for index, name in enumerate("一二三四五六日")}
+
+
+def _opening_window_for_trip_day(
+    poi: POI,
+    profile: TravelProfile,
+    day_index: int,
+) -> tuple[int, int] | None:
+    """Return the opening window that applies to the itinerary weekday.
+
+    Provider strings often contain several weekday clauses.  Reading the first
+    clock range for every day can schedule a weekend visit using weekday hours.
+    When a dated trip is available, select the matching semicolon-delimited
+    weekday clause before parsing its time range.
+    """
+    text = str(poi.opening_hours or "").strip()
+    if not text or not profile.start_date:
+        return _daily_opening_window(text)
+    try:
+        trip_date = (
+            date.fromisoformat(str(profile.start_date))
+            + timedelta(days=day_index - 1)
+        )
+    except (TypeError, ValueError):
+        return _daily_opening_window(text)
+    weekday_index = trip_date.weekday()
+
+    clauses = [clause.strip() for clause in re.split(r"[；;]", text) if clause.strip()]
+    scoped_clauses = [
+        clause for clause in clauses
+        if _has_weekday_selector(clause)
+        or _calendar_ranges(clause, trip_date.year)
+    ]
+    for clause in scoped_clauses:
+        if (
+            _weekday_clause_applies(clause, weekday_index)
+            and _date_clause_applies(clause, trip_date)
+        ):
+            return _daily_opening_window(clause)
+    # If the provider supplied weekday-specific clauses but none applies, the
+    # venue is not evidenced open that day.  The separate closure predicate
+    # handles explicit closed text; here None keeps the scheduler fail-closed
+    # instead of borrowing another day's hours.
+    if scoped_clauses:
+        return None
+    return _daily_opening_window(text)
+
+
+def _last_admission_for_trip_day(
+    poi: POI,
+    profile: TravelProfile,
+    day_index: int,
+) -> int | None:
+    """Return an evidenced last-entry cutoff applicable to the trip day."""
+    text = str(poi.opening_hours or "").strip()
+    if not text:
+        return None
+    applicable = text
+    if profile.start_date:
+        try:
+            trip_date = (
+                date.fromisoformat(str(profile.start_date))
+                + timedelta(days=day_index - 1)
+            )
+        except (TypeError, ValueError):
+            trip_date = None
+        if trip_date is not None:
+            clauses = [
+                clause.strip() for clause in re.split(r"[；;]", text)
+                if clause.strip()
+            ]
+            scoped = [
+                clause for clause in clauses
+                if _has_weekday_selector(clause)
+                or _calendar_ranges(clause, trip_date.year)
+            ]
+            matching = [
+                clause for clause in scoped
+                if _weekday_clause_applies(clause, trip_date.weekday())
+                and _date_clause_applies(clause, trip_date)
+            ]
+            if scoped and not matching:
+                return None
+            if matching:
+                applicable = "；".join(matching)
+    patterns = (
+        r"最晚(?:进入|入园|入馆|入场|检票|售票)\s*(\d{1,2}):(\d{2})",
+        r"(\d{1,2}):(\d{2})\s*停止(?:进入|入园|入馆|入场|检票|售票)",
+    )
+    values: list[int] = []
+    for pattern in patterns:
+        values.extend(
+            int(hour) * 60 + int(minute)
+            for hour, minute in re.findall(pattern, applicable)
+        )
+    return min(values) if values else None
+
+
+def _weekday_clause_applies(clause: str, weekday_index: int) -> bool:
+    selectors = _weekday_selector_text(clause)
+    if not re.search(r"周[一二三四五六日]", selectors):
+        return True
+    selected: set[int] = set()
+    for start, end in re.findall(
+        r"周([一二三四五六日])\s*(?:至|到|[-—–~])\s*周?([一二三四五六日])",
+        selectors,
+    ):
+        left, right = _WEEKDAY_INDEX[start], _WEEKDAY_INDEX[end]
+        if left <= right:
+            selected.update(range(left, right + 1))
+        else:
+            selected.update((*range(left, 7), *range(0, right + 1)))
+    without_ranges = re.sub(
+        r"周[一二三四五六日]\s*(?:至|到|[-—–~])\s*周?[一二三四五六日]",
+        "",
+        selectors,
+    )
+    selected.update(
+        _WEEKDAY_INDEX[name]
+        for name in re.findall(r"周([一二三四五六日])", without_ranges)
+    )
+    return weekday_index in selected
+
+
+def _weekday_selector_text(clause: str) -> str:
+    selectors = re.split(r"\d{1,2}:\d{2}", clause, maxsplit=1)[0].replace("、", ",")
+    # A weekday in parentheses immediately following a concrete calendar date
+    # is a date annotation (for example ``9月1日(周二)起``), not a recurrence
+    # selector.  Treating it as a selector incorrectly closes the venue on all
+    # other days after the effective date.
+    return re.sub(
+        r"(?<=日)\s*[（(]周[一二三四五六日](?:\s*(?:至|到|[-—–~])\s*周?[一二三四五六日])?[）)]",
+        "",
+        selectors,
+    )
+
+
+def _has_weekday_selector(clause: str) -> bool:
+    return re.search(r"周[一二三四五六日]", _weekday_selector_text(clause)) is not None
+
+
+def _calendar_ranges(clause: str, year: int) -> list[tuple[date, date]]:
+    ranges: list[tuple[date, date]] = []
+    pattern = re.compile(
+        r"(?<!\d)(\d{1,2})(?:/|-|月)(\d{1,2})(?:日)?\s*"
+        r"(?:至|到|[-—–~])\s*"
+        r"(\d{1,2})(?:/|-|月)(\d{1,2})(?:日)?"
+    )
+    for start_month, start_day, end_month, end_day in pattern.findall(clause):
+        try:
+            start = date(year, int(start_month), int(start_day))
+            end = date(year, int(end_month), int(end_day))
+        except ValueError:
+            continue
+        ranges.append((start, end))
+    return ranges
+
+
+def _date_clause_applies(clause: str, trip_date: date) -> bool:
+    ranges = _calendar_ranges(clause, trip_date.year)
+    if not ranges:
+        return True
+    for start, end in ranges:
+        if start <= end and start <= trip_date <= end:
+            return True
+        if start > end and (trip_date >= start or trip_date <= end):
+            return True
+    return False
 
 
 def _matches_candidate_attraction(poi: POI, term: str) -> bool:

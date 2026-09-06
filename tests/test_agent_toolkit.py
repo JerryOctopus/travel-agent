@@ -6,10 +6,20 @@ from dataclasses import replace
 from pathlib import Path
 
 from travel_agent.agent import toolkit
-from travel_agent.agent.serde import poi_brief
+from travel_agent.agent.serde import poi_brief, poi_to_dict
 from travel_agent.agent.session import build_session, session_tool_lock
+from travel_agent.critic import critique_itinerary
+from travel_agent.planning_subgraph import PlanAndCritiqueResult
 from travel_agent.providers import ProviderRateLimitError
-from travel_agent.schemas import POI, ScoredPOI, TravelProfile
+from travel_agent.schemas import (
+    Itinerary,
+    ItineraryDay,
+    ItineraryStop,
+    POI,
+    RouteInfo,
+    ScoredPOI,
+    TravelProfile,
+)
 
 POI_PATH = Path(__file__).resolve().parents[1] / "data" / "seed" / "pois.json"
 
@@ -198,6 +208,43 @@ def test_search_poi_does_not_repeat_city_supply_after_full_provider_page(monkeyp
     assert len(calls) == 1
 
 
+def test_multi_day_sparse_search_adds_verified_category_supply(monkeypatch) -> None:
+    ctx = _session()
+    toolkit.update_travel_profile(ctx, destination="合成城", days=4)
+    base = dict(
+        city="合成城", lat=30.0, lng=120.0, rating=4.5,
+        popularity=0.8, tags=["history"], estimated_duration_min=90,
+        price_level="unknown", source="amap", entity_type="attraction",
+        verification_status="verified",
+    )
+    initial = [POI("base-1", "综合景点一", category="scenic", **base)]
+    scenic = [
+        POI(f"scenic-{index}", f"自然景点{index}", category="scenic", **base)
+        for index in range(3)
+    ]
+    museums = [
+        POI(f"museum-{index}", f"历史博物馆{index}", category="museum", **base)
+        for index in range(3)
+    ]
+    calls = []
+
+    def search_pois(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("category") == "scenic":
+            return scenic
+        if kwargs.get("category") == "museum":
+            return museums
+        return initial
+
+    monkeypatch.setattr(ctx.provider, "search_pois", search_pois)
+
+    result = toolkit.search_poi(ctx, interests=["history"], max_results=30)
+
+    assert result["isError"] is False
+    assert result["count"] == 7
+    assert {call.get("category") for call in calls} >= {"scenic", "museum"}
+
+
 def test_request_travel_info_when_missing():
     ctx = _session()
     toolkit.update_travel_profile(ctx, interests=["food"])
@@ -316,7 +363,9 @@ def test_restaurant_search_binds_local_area_into_provider_query(monkeypatch):
 
     result = toolkit.search_restaurant(ctx, area="杭州滨江区星光大道")
 
-    assert calls[0]["query_tags"] == ["杭州滨江区星光大道", "餐厅"]
+    assert calls[0]["query_tags"] == ["杭州滨江区星光大道"]
+    assert calls[-1]["query_tags"] == ["杭州滨江区星光大道", "餐厅"]
+    assert calls[-1]["category"] == "food"
     assert result["restaurants"][0]["name"] == "青禾餐厅"
 
 
@@ -359,8 +408,50 @@ def test_halal_restaurant_search_uses_explicit_query_after_sparse_broad_search(m
 
     result = toolkit.search_restaurant(ctx, cuisine="清真", area="兵马俑")
 
-    assert len(calls) == 3
+    assert len(calls) == 4
     assert [item["name"] for item in result["restaurants"]] == ["清真餐厅一", "清真餐厅二"]
+
+
+def test_area_restaurant_search_keeps_provider_nearby_results_without_address_name_match(
+    monkeypatch,
+) -> None:
+    ctx = _session()
+    toolkit.update_travel_profile(ctx, destination="合成城", days=2)
+    ctx.profile.constraint_state = {"dietary": ["仅清真餐厅"]}
+    anchor = POI(
+        "anchor", "远端景区", "合成城", "scenic", 34.38, 109.27,
+        4.8, 0.9, [], 120, "unknown", source="amap", entity_type="attraction",
+    )
+    nearby = POI(
+        "nearby", "清真风味餐厅", "合成城", "food", 34.381, 109.271,
+        4.6, 0.8, ["halal"], 60, "unknown", address="东环路",
+        source="amap", entity_type="restaurant",
+    )
+    distant = POI(
+        "distant", "清真市区餐厅", "合成城", "food", 34.20, 109.00,
+        4.7, 0.9, ["halal"], 60, "unknown", address="中心街",
+        source="amap", entity_type="restaurant",
+    )
+
+    def search_pois(**kwargs):
+        if kwargs.get("query_tags") == ["远端景区"]:
+            return [anchor]
+        return [distant]
+
+    nearby_calls = []
+
+    def search_pois_nearby(**kwargs):
+        nearby_calls.append(kwargs)
+        return [nearby]
+
+    monkeypatch.setattr(ctx.provider, "search_pois", search_pois)
+    monkeypatch.setattr(ctx.provider, "search_pois_nearby", search_pois_nearby, raising=False)
+
+    result = toolkit.search_restaurant(ctx, cuisine="清真", area="远端景区")
+
+    assert nearby_calls[0]["anchor"].poi_id == "anchor"
+    assert nearby_calls[0]["category"] == "food"
+    assert [item["name"] for item in result["restaurants"]][:1] == ["清真风味餐厅"]
 
 
 def test_worker_hotel_area_hint_falls_back_to_grounded_city_results(monkeypatch) -> None:
@@ -437,6 +528,42 @@ def test_directional_hotel_area_is_validated_against_landmark_coordinates(monkey
             return [west, east]
         if kwargs.get("query_tags") == ["中心湖"]:
             return [landmark]
+        return []
+
+    monkeypatch.setattr(ctx.provider, "search_pois", search_pois)
+
+    result = toolkit.search_hotel(ctx, budget_level="low")
+
+    assert [item["name"] for item in result["hotels"]] == ["东岸酒店"]
+    assert result["hotels"][0]["area"] == "中心湖东侧"
+
+
+def test_directional_hotel_area_broadens_then_rechecks_coordinates(monkeypatch) -> None:
+    ctx = _session()
+    toolkit.update_travel_profile(
+        ctx, destination="测试城", days=3, hotel_area="中心湖东侧"
+    )
+    west = POI(
+        "hotel-west", "西岸酒店", "测试城", "hotel", 30.0, 119.98,
+        4.8, 0.9, ["hotel"], 0, "low", source="amap", entity_type="hotel",
+    )
+    east = POI(
+        "hotel-east", "东岸酒店", "测试城", "hotel", 30.0, 120.03,
+        4.5, 0.8, ["hotel"], 0, "low", source="amap", entity_type="hotel",
+    )
+    landmark = POI(
+        "lake", "中心湖风景区", "测试城", "scenic", 30.0, 120.0,
+        4.9, 1.0, ["classic"], 120, "unknown", source="amap",
+        entity_type="attraction",
+    )
+
+    def search_pois(**kwargs):
+        if kwargs.get("query_tags") == ["中心湖东侧"]:
+            return [west]
+        if kwargs.get("query_tags") == ["中心湖"]:
+            return [landmark]
+        if kwargs.get("query_tags") is None and kwargs.get("category") == "hotel":
+            return [west, east]
         return []
 
     monkeypatch.setattr(ctx.provider, "search_pois", search_pois)
@@ -593,6 +720,61 @@ def test_amap_hotel_without_price_evidence_is_not_rejected_as_wrong_budget_tier(
 
     assert result["hotels"][0]["name"] == "湖畔酒店"
     assert result["hotels"][0]["budget_level"] == "low"
+
+
+def test_hotel_search_without_requested_area_starts_with_central_area_evidence(
+    monkeypatch,
+) -> None:
+    ctx = _session()
+    toolkit.update_travel_profile(ctx, destination="合成城", days=3)
+    central = POI(
+        "central-hotel", "中心酒店", "合成城", "hotel", 30.25, 120.15,
+        4.6, 0.8, ["hotel"], 0, "unknown", source="amap",
+        entity_type="hotel",
+    )
+    remote = POI(
+        "remote-hotel", "远郊酒店", "合成城", "hotel", 30.8, 120.8,
+        4.8, 0.9, ["hotel"], 0, "unknown", source="amap",
+        entity_type="hotel",
+    )
+    calls = []
+
+    def search_pois(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("query_tags") == ["市中心", "核心商圈"]:
+            return [central]
+        return [remote]
+
+    monkeypatch.setattr(ctx.provider, "search_pois", search_pois)
+
+    result = toolkit.search_hotel(ctx)
+
+    assert len(calls) == 1
+    assert calls[0]["query_tags"] == ["市中心", "核心商圈"]
+    assert [item["name"] for item in result["hotels"]] == ["中心酒店"]
+    assert result["hotels"][0]["area"] == "核心商圈"
+
+
+def test_hotel_search_applies_explicit_nightly_budget_to_estimated_candidates(
+    monkeypatch,
+) -> None:
+    ctx = _session()
+    toolkit.update_travel_profile(ctx, destination="合成城", days=3)
+    ctx.profile.constraint_state = {"hotel_budget_per_night_cny": 600}
+    candidates = [
+        POI(
+            f"hotel-{index}", f"酒店{index}", "合成城", "hotel",
+            30.25, 120.15, 4.6, 0.8, ["hotel"], 0, "unknown",
+            source="amap", entity_type="hotel",
+        )
+        for index in range(1, 4)
+    ]
+    monkeypatch.setattr(ctx.provider, "search_pois", lambda **_kwargs: candidates)
+
+    result = toolkit.search_hotel(ctx)
+
+    assert [item["price_per_night"] for item in result["hotels"]] == [585]
+    assert result["hotel_budget_per_night_cny"] == 600.0
 
 
 def test_entity_dedupe_prefers_main_museum_over_directional_branch() -> None:
@@ -792,6 +974,37 @@ def test_build_return_plan_reserves_cross_city_buffer_without_inventing_inventor
     assert "车次" not in result["intercity_segment"]
 
 
+def test_same_city_return_plan_uses_actual_final_stop_route() -> None:
+    profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        constraint_state={"return_deadline": "19:00", "return_location": "测试城南站"},
+    )
+    itinerary = {"days": [{"stops": [
+        {"poi": {"poi_id": "first"}},
+        {"poi": {"poi_id": "final"}},
+    ]}]}
+    stale_route = {
+        "origin_poi_id": "first", "destination_poi_id": "station",
+        "origin_name": "第一站", "destination_name": "测试城南站",
+        "duration_min": 25, "source": "amap", "evidence_status": "provider_verified",
+    }
+    final_route = {
+        "origin_poi_id": "final", "destination_poi_id": "station",
+        "origin_name": "最终站", "destination_name": "测试城南站",
+        "duration_min": 35, "source": "amap", "evidence_status": "provider_verified",
+    }
+
+    result = toolkit._build_return_plan(
+        profile,
+        itinerary,
+        {"transport": [{"payload": stale_route}, {"payload": final_route}]},
+    )
+
+    assert result is not None
+    assert result["terminal_transfer"] == final_route
+
+
 def test_lodging_and_budget_plans_select_grounded_hotel_and_compare_limit() -> None:
     profile = TravelProfile(destination="北京", days=2, party_size=2, budget_limit=4500)
     domain_inputs = {
@@ -822,6 +1035,66 @@ def test_lodging_and_budget_plans_select_grounded_hotel_and_compare_limit() -> N
     assert budget["total_expected_cny"] == 1965
     assert budget["total_high_cny"] == 2254.5
     assert budget["within_user_limit"] is True
+
+
+def test_budget_plan_includes_grounded_intercity_distance_allowance() -> None:
+    profile = TravelProfile(
+        destination="目的城",
+        days=1,
+        party_size=2,
+        budget_limit=1200,
+    )
+    domain_inputs = {
+        "budgets": [{
+            "artifact_id": "budget-1",
+            "payload": {
+                "days": 1,
+                "companions": 2,
+                "hotel": 0,
+                "meals": 180,
+                "tickets": 100,
+                "inner_city_transport": 50,
+                "total_low": 280.5,
+                "total_high": 379.5,
+            },
+        }],
+        "transport": [
+            {
+                "artifact_id": "outbound",
+                "post_plan_origin_closure": True,
+                "payload": {
+                    "origin_poi_id": "origin",
+                    "destination_poi_id": "first",
+                    "distance_km": 180,
+                    "duration_min": 120,
+                    "mode": "public_transport",
+                    "source": "amap",
+                    "evidence_status": "provider_verified",
+                },
+            },
+            {
+                "artifact_id": "return",
+                "post_plan_endpoint_closure": True,
+                "payload": {
+                    "origin_poi_id": "last",
+                    "destination_poi_id": "return",
+                    "distance_km": 180,
+                    "duration_min": 120,
+                    "mode": "public_transport",
+                    "source": "amap",
+                    "evidence_status": "provider_verified",
+                },
+            },
+        ],
+    }
+
+    budget = toolkit._build_budget_plan(profile, domain_inputs, None)
+
+    assert budget["intercity_transport_estimate_cny"] == 360
+    assert budget["transport"] == 410
+    assert budget["total_expected_cny"] == 690
+    assert budget["within_user_limit"] is True
+    assert budget["intercity_estimate_method"] == "verified_distance_allowance_not_live_fare"
 
 
 def test_lodging_plan_fails_closed_when_grounded_hotel_misses_required_area() -> None:
@@ -952,6 +1225,28 @@ def test_budget_plan_multiplies_per_person_limit_and_surfaces_high_risk() -> Non
     assert budget["risk_high_exceeds_limit"] is True
 
 
+def test_mobility_sensitive_budget_reserves_taxi_fallback_allowance() -> None:
+    profile = TravelProfile(
+        destination="测试城", days=3, party_size=2,
+        constraint_state={"elderly": True, "max_walking_km_per_day": 4},
+    )
+    domain_inputs = {"budgets": [{
+        "artifact_id": "budget-1",
+        "payload": {
+            "days": 3, "companions": 2, "hotel": 900, "meals": 600,
+            "tickets": 300, "inner_city_transport": 200,
+            "total_low": 1800, "total_high": 2400,
+        },
+    }]}
+
+    budget = toolkit._build_budget_plan(profile, domain_inputs, None)
+
+    assert budget["mobility_fallback_transport_cny"] == 240
+    assert budget["transport"] == 440
+    assert budget["total_expected_cny"] == 2240
+    assert "行动不便" in budget["note"]
+
+
 def test_budget_plan_reads_constraint_total_and_uses_grounded_low_scenario() -> None:
     profile = TravelProfile(
         destination="北京",
@@ -982,9 +1277,10 @@ def test_budget_plan_reads_constraint_total_and_uses_grounded_low_scenario() -> 
 
     assert budget["user_limit_cny"] == 3000
     assert budget["user_limit_basis"] == "constraint_total_budget"
-    assert budget["status"] == "budget_optimized_low_scenario"
-    assert budget["total_expected_cny"] == 2764.5
-    assert budget["within_user_limit"] is True
+    assert budget["status"] == "estimate"
+    assert budget["within_user_limit"] is False
+    assert budget["mobility_fallback_transport_cny"] == 240
+    assert budget["total_expected_cny"] == 3480
     assert mobility["days"][0]["taxi_fallback_required"] is True
 
 
@@ -1076,6 +1372,108 @@ def test_meal_reservation_avoids_overlapping_scheduled_activity() -> None:
     assert meal["end_time"] == "14:30"
 
 
+def test_meal_strategy_does_not_publish_a_false_window_when_day_has_no_gap() -> None:
+    profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        constraint_state={"activity_end_deadline": "18:00"},
+    )
+    itinerary = {"days": [{"day_index": 1, "stops": [
+        {"start_time": "09:00", "duration_min": 120, "poi": {"category": "museum", "name": "上午活动"}},
+        {"start_time": "12:00", "duration_min": 120, "poi": {"category": "scenic", "name": "中午活动"}},
+        {"start_time": "15:00", "duration_min": 150, "poi": {"category": "scenic", "name": "下午活动"}},
+    ]}]}
+
+    strategy = toolkit._build_meal_strategy(profile, itinerary, {})
+
+    assert strategy["scheduled_meals"] == []
+    assert strategy["unscheduled_meal_days"] == [{
+        "day_index": 1,
+        "reason": "no_non_overlapping_meal_window",
+    }]
+
+
+def test_meal_strategy_uses_early_lunch_gap_before_inbound_transfer() -> None:
+    profile = TravelProfile(
+        destination="合成城",
+        days=1,
+        constraint_state={"dietary": ["清淡"]},
+    )
+    itinerary = {"days": [{"day_index": 1, "stops": [
+        {
+            "start_time": "09:00", "duration_min": 120,
+            "poi": {"category": "museum", "name": "上午活动"},
+        },
+        {
+            "start_time": "13:00", "duration_min": 90,
+            "route_from_previous": {"duration_min": 17},
+            "poi": {"category": "scenic", "name": "下午活动"},
+        },
+    ]}]}
+
+    strategy = toolkit._build_meal_strategy(profile, itinerary, {})
+
+    lunch = next(
+        meal for meal in strategy["scheduled_meals"]
+        if meal.get("period") == "lunch"
+    )
+    assert (lunch["start_time"], lunch["end_time"]) == ("11:15", "12:15")
+    assert strategy["unscheduled_meal_days"] == []
+
+
+def test_reviewer_sparse_day_directive_materializes_in_rebuilt_itinerary() -> None:
+    first = POI(
+        "first", "第一天景点", "合成城", "scenic",
+        30.0, 120.0, 4.5, 0.8, [], 90, "mid",
+    )
+    second = POI(
+        "second", "第二天景点", "合成城", "museum",
+        30.01, 120.01, 4.5, 0.8, [], 90, "mid",
+    )
+    extra_one = POI(
+        "extra-one", "第一天下午景点", "合成城", "museum",
+        30.0, 120.01, 4.5, 0.8, [], 90, "mid",
+    )
+    extra_two = POI(
+        "extra-two", "第二天下午景点", "合成城", "scenic",
+        30.01, 120.02, 4.5, 0.8, [], 90, "mid",
+    )
+    itinerary = Itinerary(
+        city="合成城",
+        summary="test",
+        days=[
+            ItineraryDay(1, "test", [ItineraryStop(first, "09:30", 90, "")]),
+            ItineraryDay(2, "test", [ItineraryStop(second, "09:30", 90, "")]),
+        ],
+    )
+    profile = TravelProfile(destination="合成城", days=2, pace="relaxed")
+    result = PlanAndCritiqueResult(
+        itinerary=itinerary,
+        original_itinerary=itinerary,
+        critic_result=critique_itinerary(itinerary, profile),
+    )
+    ctx = _session()
+    ctx.profile = profile
+
+    revised = toolkit._apply_revision_directives(
+        result,
+        [
+            ScoredPOI(extra_one, 0.8, []),
+            ScoredPOI(extra_two, 0.8, []),
+        ],
+        ctx,
+        {"reviewer_issue_types": ["daily_activity_sparse"]},
+    )
+
+    assert [
+        sum(stop.poi.category != "food" for stop in day.stops)
+        for day in revised.itinerary.days
+    ] == [2, 2]
+    assert "daily_activity_sparse" not in {
+        issue.code for issue in revised.critic_result.issues
+    }
+
+
 def test_meal_reservation_leaves_transfer_buffer_before_and_after_activities() -> None:
     profile = TravelProfile(
         destination="测试城",
@@ -1132,6 +1530,59 @@ def test_last_day_meal_reservation_stays_before_return_activity_cutoff() -> None
     assert meal["end_time"] == "15:45"
 
 
+def test_post_plan_return_closure_uses_live_provider_when_bound_routes_are_only_geometry() -> None:
+    final = POI(
+        "museum", "湖畔博物馆", "测试城市", "museum", 30.1, 120.1,
+        4.6, 0.8, ["history"], 90, "mid", source="amap",
+        entity_type="museum", verification_status="verified",
+    )
+    station = POI(
+        "station", "测试城东站", "测试城市", "transport", 30.2, 120.2,
+        4.5, 0.8, ["railway"], 30, "mid", source="amap",
+        entity_type="transport", verification_status="verified",
+    )
+
+    class Provider:
+        def search_pois(self, **_kwargs):
+            return [station]
+
+        def estimate_route(self, origin, destination, mode="public_transport"):
+            assert origin.poi_id == final.poi_id
+            assert destination.poi_id == station.poi_id
+            return RouteInfo(
+                origin.poi_id, destination.poi_id, 12.0, 35, mode,
+                source="amap", evidence_status="provider_verified",
+            )
+
+    class BoundGeometryOnly:
+        def estimate_route(self, origin, destination, mode="public_transport"):
+            return RouteInfo(
+                origin.poi_id, destination.poi_id, 12.0, 90, mode,
+                source="haversine_recovery_estimate", evidence_status="deterministic_estimate",
+            )
+
+    ctx = _session()
+    ctx.provider = Provider()
+    ctx.profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        constraint_state={"return_location": "测试城东站", "return_deadline": "17:00"},
+    )
+    itinerary = {"days": [{"day_index": 1, "stops": [{
+        "start_time": "13:00", "duration_min": 90, "poi": poi_to_dict(final),
+    }]}]}
+    domain_inputs = {}
+
+    route = toolkit._close_post_plan_return_route(
+        ctx, itinerary, domain_inputs, BoundGeometryOnly()
+    )
+
+    assert route is not None
+    assert route["source"] == "amap"
+    assert route["evidence_status"] == "provider_verified"
+    assert route["hard_feasibility_proven"] is True
+
+
 def test_late_activity_deadline_reserves_both_lunch_and_dinner() -> None:
     profile = TravelProfile(
         destination="广州",
@@ -1150,6 +1601,96 @@ def test_late_activity_deadline_reserves_both_lunch_and_dinner() -> None:
         "午餐", "晚餐",
     ]
     assert strategy["scheduled_meals"][1]["end_time"] <= "20:30"
+
+
+def test_multi_day_plan_reserves_dinner_without_artificially_extending_stops() -> None:
+    profile = TravelProfile(destination="合成城", days=2)
+    itinerary = {"days": [
+        {"day_index": day_index, "stops": [{
+            "start_time": "09:00", "duration_min": 120,
+            "poi": {"category": "museum", "name": f"博物馆{day_index}"},
+        }]}
+        for day_index in (1, 2)
+    ]}
+
+    strategy = toolkit._build_meal_strategy(profile, itinerary, {})
+
+    assert [
+        (meal["day_index"], meal["name"].split("时段", 1)[0])
+        for meal in strategy["scheduled_meals"]
+    ] == [(1, "午餐"), (1, "晚餐"), (2, "午餐"), (2, "晚餐")]
+
+
+def test_concrete_dinner_still_reserves_dietary_lunch_each_day() -> None:
+    profile = TravelProfile(
+        destination="合成城",
+        days=1,
+        interests=["food"],
+        constraint_state={"dietary": ["仅清真餐厅"]},
+    )
+    itinerary = {"days": [{"day_index": 1, "stops": [
+        {
+            "start_time": "09:00",
+            "duration_min": 120,
+            "poi": {"category": "museum", "name": "城市博物馆"},
+        },
+        {
+            "start_time": "18:00",
+            "duration_min": 60,
+            "poi": {
+                "category": "food",
+                "name": "清真风味餐厅",
+                "source": "amap",
+                "verification_status": "verified",
+            },
+        },
+    ]}]}
+
+    strategy = toolkit._build_meal_strategy(profile, itinerary, {})
+
+    assert [meal["name"] for meal in strategy["scheduled_meals"]] == [
+        "午餐时段（当日活动区域就近自行安排）", "清真风味餐厅",
+    ]
+    assert strategy["unscheduled_meal_days"] == []
+
+
+def test_dietary_strategy_adds_grounded_lunch_when_only_dinner_is_scheduled() -> None:
+    profile = TravelProfile(
+        destination="合成城", days=1,
+        constraint_state={"dietary": ["仅清真餐厅"]},
+    )
+    itinerary = {"days": [{"day_index": 1, "stops": [
+        {
+            "start_time": "09:00", "duration_min": 120,
+            "poi": {"category": "museum", "name": "城市博物馆"},
+        },
+        {
+            "start_time": "18:00", "duration_min": 60,
+            "poi": {
+                "poi_id": "dinner", "category": "food", "name": "清真晚餐",
+                "source": "amap", "verification_status": "verified",
+                "tags": ["halal"],
+            },
+        },
+    ]}]}
+    domain_inputs = {"restaurants": [{
+        "artifact_id": "restaurants-1",
+        "payload": {"status": "verified", "restaurants": [{
+            "poi_id": "lunch", "name": "清真午餐候选", "city": "合成城",
+            "category": "food", "lat": 30.0, "lng": 120.0,
+            "rating": 4.5, "popularity": 0.8, "tags": ["halal"],
+            "estimated_duration_min": 60, "price_level": "mid",
+            "source": "amap", "verification_status": "verified",
+        }]},
+    }]}
+
+    strategy = toolkit._build_meal_strategy(profile, itinerary, domain_inputs)
+
+    lunch = next(meal for meal in strategy["scheduled_meals"] if meal.get("period") == "lunch")
+    assert lunch["name"] == "清真午餐候选"
+    assert lunch["poi_id"] == "lunch"
+    assert lunch["source"] == "amap"
+    assert lunch["is_reservation_only"] is True
 
 
 def test_early_dinner_is_reserved_before_long_evening_activity() -> None:
@@ -1178,12 +1719,43 @@ def test_early_dinner_is_reserved_before_long_evening_activity() -> None:
     ]
     assert dinners == [{
         "day_index": 1,
+        "period": "dinner",
         "name": "晚餐时段（当日活动区域就近自行安排）",
         "start_time": "16:30",
         "end_time": "17:30",
         "source": "deterministic_schedule_reservation",
         "is_reservation_only": True,
     }]
+
+
+def test_early_dinner_moves_before_inbound_route_to_late_activity() -> None:
+    profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        constraint_state={"activity_end_deadline": "20:30"},
+    )
+    itinerary = {"days": [{"day_index": 1, "stops": [
+        {
+            "start_time": "09:00",
+            "duration_min": 150,
+            "poi": {"category": "museum", "name": "上午活动"},
+        },
+        {
+            "start_time": "18:00",
+            "duration_min": 150,
+            "route_from_previous": {"duration_min": 68},
+            "poi": {"category": "scenic", "name": "晚间活动"},
+        },
+    ]}]}
+
+    strategy = toolkit._build_meal_strategy(profile, itinerary, {})
+
+    dinner = next(
+        meal for meal in strategy["scheduled_meals"]
+        if meal["name"].startswith("晚餐")
+    )
+    assert dinner["start_time"] == "15:30"
+    assert dinner["end_time"] == "16:30"
 
 
 def test_evening_meal_fallback_is_labeled_as_dinner() -> None:

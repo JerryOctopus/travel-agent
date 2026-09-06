@@ -248,6 +248,7 @@ _EXPLICIT_LOCAL_ADJUSTMENT_RE = re.compile(
     r"(?:已有|已经有|现有|当前).{0,12}(?:行程|计划).{0,30}"
     r"(?:不要重写|不重写|只.{0,12}(?:替换|调整|修改)|局部调整)"
     r"|(?:不要重写|不重写).{0,18}(?:行程|计划)"
+    r"|(?:原|原有)(?:行程|计划).{0,12}(?:不变|保留).{0,20}(?:只|仅).{0,12}(?:建议|备选|调整)"
 )
 _EXPLICIT_COMPARISON_RE = re.compile(
     r"比较|对比|候选.{0,12}(?:排序|比较|对比|推荐|选)"
@@ -588,7 +589,7 @@ def classify_task_type_rule_based(
         return TaskType.LOCAL_ADJUSTMENT_ADVICE
     # Explicit scope words beat the generic verb “规划”. This is crucial for
     # requests such as “只需要规划 9 月 5 日从机场到酒店区的路线”.
-    if re.search(r"(?:只需要|只要|仅).{0,40}(?:路线|怎么走|公共交通|打车)", text):
+    if re.search(r"(?:只需要|只要|仅|只(?:需)?规划).{0,40}(?:路线|怎么走|公共交通|打车)", text):
         return TaskType.ROUTE_PLAN
     if _FULL_PLAN_CUE_RE.search(text):
         return TaskType.FULL_TRIP_PLAN
@@ -1141,6 +1142,8 @@ def _apply_general_constraint_patterns(
         if len(candidates) >= 2:
             state["candidate_attractions"] = candidates
             state["comparison_candidates"] = candidates
+            if _venues_require_verification(text):
+                state["candidate_only"] = True
     compare_candidates = re.search(r"比较去([^。；;]+?)三个地点", text)
     if compare_candidates:
         candidates = _split_named_items(compare_candidates.group(1))
@@ -1508,6 +1511,11 @@ def _venues_require_verification(text: str) -> bool:
         re.search(
             r"(?:请?先).{0,12}(?:核验|确认|检查).{0,30}"
             r"(?:是否|能否).{0,12}(?:适合|可以|可否).{0,8}安排",
+            text,
+        )
+        or re.search(
+            r"(?:判断|看看|确认).{0,8}(?:能否|是否|可不可以).{0,6}(?:都|全部)?(?:去|安排)"
+            r".{0,16}(?:不能|不行|不可行).{0,8}(?:删减|删除|取舍|少去)",
             text,
         )
     )

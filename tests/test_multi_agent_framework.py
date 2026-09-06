@@ -927,6 +927,61 @@ def test_reviewer_keeps_unknown_route_recoverable_for_hard_timed_event():
     assert review.issues[0].severity == "recoverable"
 
 
+def test_reviewer_downgrades_bounded_lodging_route_unrelated_to_return_deadline():
+    ctx = ReviewContext(
+        request_id="req_bounded_lodging_route",
+        plan={
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+            "required_route_anchors": {
+                "last_stop_to_return_location": {
+                    "evidence_status": "provider_verified",
+                    "recommended_latest_departure": "15:20",
+                    "route": {"hard_feasibility_proven": True},
+                },
+            },
+            "mobility_plan": {
+                "required": True,
+                "status": "bounded_with_taxi_fallback",
+                "max_walking_km_per_day": 6.0,
+                "days": [{
+                    "day_index": 1,
+                    "known_walking_km": 0.0,
+                    "unknown_walking_legs": ["酒店→首站"],
+                    "taxi_fallback_required": True,
+                }],
+            },
+        },
+        profile_brief={
+            "constraint_state": {
+                "elderly": True,
+                "max_walking_km_per_day": 6.0,
+                "lodging_area": "河畔商圈",
+                "return_deadline": "17:00",
+            },
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "lodging_route_evidence",
+                "severity": "recoverable",
+                "description": "酒店到每日首站只有距离估算，公共交通可达性需复核。",
+                "evidence": [
+                    "route_evidence.lodging_route_anchors.daily_routes[0].evidence_status=haversine_estimate"
+                ],
+                "repair_target": "planner",
+                "repair_instruction": "补充住宿接驳路线。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
 def test_reviewer_downgrades_schedule_tightness_after_deterministic_validation():
     ctx = ReviewContext(
         request_id="req_schedule_advisory",
@@ -985,6 +1040,41 @@ def test_reviewer_downgrades_nonfixed_schedule_conflict_after_validation():
     assert review.issues[0].severity == "noncritical"
 
 
+def test_reviewer_treats_source_backed_budget_estimate_as_advisory_without_contrary_evidence():
+    ctx = ReviewContext(
+        request_id="req_budget_estimate_advisory",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+            "budget_plan": {
+                "tickets": 240.0,
+                "expected_total": 1600.0,
+                "within_user_limit": None,
+                "source_artifact_id": "budget_synthetic",
+            },
+        },
+        profile_brief={"constraint_state": {}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "budget_inconsistency",
+                "severity": "recoverable",
+                "description": "门票估算缺乏依据，景点没有提供实时票价信息。",
+                "evidence": ["budget_plan.tickets=240; itinerary.days[0] 没有票价字段"],
+                "repair_target": "planner",
+                "repair_instruction": "删除门票估算。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
 def test_reviewer_keeps_schedule_conflict_recoverable_with_fixed_event():
     ctx = ReviewContext(
         request_id="req_schedule_fixed_event",
@@ -1018,6 +1108,120 @@ def test_reviewer_keeps_schedule_conflict_recoverable_with_fixed_event():
 
     assert review.verdict == "rework"
     assert review.issues[0].severity == "recoverable"
+
+
+def test_reviewer_defers_to_verified_return_anchor_for_return_schedule_claim():
+    ctx = ReviewContext(
+        request_id="req_verified_return_schedule",
+        plan={
+            "itinerary": {
+                "days": [{
+                    "day_index": 1,
+                    "stops": [{
+                        "start_time": "10:00",
+                        "duration_min": 90,
+                        "poi": {"name": "丝绸博物馆", "category": "museum"},
+                    }],
+                }],
+            },
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+            "required_route_anchors": {
+                "last_stop_to_return_location": {
+                    "evidence_status": "provider_verified",
+                    "recommended_latest_departure": "16:10",
+                    "route": {
+                        "hard_feasibility_proven": True,
+                        "duration_min": 20,
+                    },
+                },
+            },
+        },
+        profile_brief={
+            "constraint_state": {
+                "return_location": "中央车站",
+                "return_deadline": "17:00",
+            },
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "schedule_feasibility",
+                "severity": "recoverable",
+                "description": "酒店到博物馆需要47分钟，因此可能无法在17:00前返回中央车站。",
+                "evidence": [
+                    "required_route_anchors.last_stop_to_return_location.route.duration_min=20"
+                ],
+                "repair_target": "planner",
+                "repair_instruction": "删除博物馆。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_defers_to_validated_route_bindings_for_schedule_gap_claim() -> None:
+    ctx = ReviewContext(
+        request_id="req_validated_route_bindings",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": [
+                {
+                    "start_time": "09:30", "duration_min": 120,
+                    "poi": {"poi_id": "first", "name": "第一站", "category": "scenic"},
+                },
+                {
+                    "start_time": "14:30", "duration_min": 120,
+                    "poi": {"poi_id": "final", "name": "最终站", "category": "museum"},
+                    "route_from_previous": {
+                        "origin_poi_id": "first", "destination_poi_id": "final",
+                        "duration_min": 25, "evidence_status": "provider_verified",
+                    },
+                },
+            ]}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+            "required_route_anchors": {
+                "trip_origin_to_first_stop": {
+                    "evidence_status": "provider_verified",
+                    "origin_poi_id": "station", "destination_poi_id": "first",
+                    "route": {"origin_poi_id": "station", "destination_poi_id": "first"},
+                },
+                "last_stop_to_return_location": {
+                    "evidence_status": "provider_verified",
+                    "origin_poi_id": "final", "destination_poi_id": "station",
+                    "recommended_latest_departure": "17:30",
+                    "route": {"hard_feasibility_proven": True, "duration_min": 30},
+                },
+            },
+        },
+        profile_brief={"constraint_state": {
+            "origin": "测试城南站",
+            "return_location": "测试城南站",
+            "return_deadline": "19:00",
+        }},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "schedule_gap",
+                "severity": "recoverable",
+                "description": "缺少从车站到第一站、第一站到最终站，以及最终站返回车站的路线证据。",
+                "evidence": ["itinerary.days[0]"],
+                "repair_target": "planner",
+                "repair_instruction": "补充路线。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
 
 
 def test_reviewer_does_not_turn_uncovered_soft_preference_into_rework():

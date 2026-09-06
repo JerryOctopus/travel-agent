@@ -40,6 +40,11 @@ def extract_internal_counters(result: Any) -> dict[str, int]:
         "system_error": int(
             bool(getattr(result, "errors", None))
             or any(bool(getattr(turn, "error", None)) for turn in getattr(result, "turns", ()))
+            or any(
+                isinstance(event, dict) and bool(event.get("error"))
+                for turn in getattr(result, "turns", ())
+                for event in (getattr(turn, "agent_trace", None) or [])
+            )
         ),
     }
     for turn in getattr(result, "turns", ()):

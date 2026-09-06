@@ -29,12 +29,14 @@ INTEREST_TO_CATEGORIES = {
     "nightlife": {"food", "scenic"},
     "family": {"family", "museum", "scenic"},
     "couple": {"scenic", "culture", "food"},
+    "历史景点": {"culture", "museum"},
 }
 
 INTEREST_ALIASES = {
     "海边": {"海边", "海湾", "海滨", "沙滩", "海滩", "环岛", "seaside", "beach"},
     "咖啡店": {"咖啡", "coffee", "cafe", "café"},
     "园林": {"园林", "花园", "庭园", "庭院", "garden"},
+    "历史景点": {"历史", "古迹", "遗址", "故居", "博物馆", "history", "historic"},
 }
 
 
@@ -165,6 +167,9 @@ def _check_schedule_completeness(
     """Flag obviously partial day plans that previously passed the critic."""
     issues: list[CriticIssue] = []
     state = profile.constraint_state or {}
+    # Dietary restrictions constrain meals that the itinerary actually
+    # recommends.  Requiring a concrete restaurant on every day is a separate
+    # product request, represented by the explicit food interest.
     meal_is_explicit = "food" in requested_interests(profile)
     for day in itinerary.days:
         fixed_event_day = any(
@@ -195,6 +200,22 @@ def _check_schedule_completeness(
                     ),
                 )
             )
+        if (
+            state.get("candidate_only") is True
+            and activity_count >= 3
+            and not any(stop.poi.category == "food" for stop in day.stops)
+            and not _has_lunch_window(day)
+        ):
+            issues.append(
+                CriticIssue(
+                    code="meal_break_missing",
+                    message=(
+                        f"第{day.day_index}天候选全部排入后没有可执行的午餐窗口；"
+                        "应按用户授权删减候选，而不是输出时间冲突。"
+                    ),
+                    severity="error",
+                )
+            )
         if not any(stop.poi.category == "food" for stop in day.stops) and meal_is_explicit:
             issues.append(
                 CriticIssue(
@@ -204,6 +225,20 @@ def _check_schedule_completeness(
                 )
             )
     return issues
+
+
+def _has_lunch_window(day: ItineraryDay) -> bool:
+    """Whether a one-hour lunch plus small transfer margins fits the schedule."""
+    occupied: list[tuple[int, int]] = []
+    for stop in day.stops:
+        start = _clock_minutes(stop.start_time)
+        inbound = max(0, int(stop.route_from_previous.duration_min)) if stop.route_from_previous else 0
+        occupied.append((start - inbound, start + int(stop.duration_min)))
+    for candidate in range(11 * 60 + 30, 14 * 60 + 1, 15):
+        end = candidate + 60
+        if not any(candidate < occupied_end + 15 and end > occupied_start - 15 for occupied_start, occupied_end in occupied):
+            return True
+    return False
 
 
 def _check_route_feasibility(
@@ -443,7 +478,7 @@ def poi_complies_with_dietary(poi: Any, profile: TravelProfile) -> bool:
             return False
         if not any(
             marker in searchable
-            for marker in ("无海鲜", "不含海鲜", "素食", "纯素", "vegetarian", "vegan")
+            for marker in ("无海鲜", "不含海鲜", "不吃海鲜", "素食", "纯素", "vegetarian", "vegan")
         ):
             return False
     if any("不吃辣" in rule or "不太辣" in rule for rule in rules):
@@ -483,7 +518,21 @@ def _check_structured_constraints(
     """Validate hard schedule/transport constraints kept in constraint_state."""
     state = profile.constraint_state or {}
     issues: list[CriticIssue] = []
-    if state.get("accessibility_priority") or state.get("wheelchair_user"):
+    raw_avoid = state.get("avoid") or profile.avoid or []
+    avoid_values = [raw_avoid] if isinstance(raw_avoid, str) else list(raw_avoid)
+    terrain_access_required = any(
+        marker in str(value).casefold()
+        for value in avoid_values
+        for marker in (
+            "爬坡", "上坡", "坡道", "楼梯", "台阶",
+            "hill", "slope", "stairs", "steps",
+        )
+    )
+    if (
+        state.get("accessibility_priority")
+        or state.get("wheelchair_user")
+        or terrain_access_required
+    ):
         evidenced = any(
             any(
                 marker in " ".join(
@@ -498,7 +547,10 @@ def _check_structured_constraints(
             issues.append(
                 CriticIssue(
                     code="accessibility_evidence_missing",
-                    message="当前工具证据不足以确认全程无障碍；请在出发前向场馆和交通运营方核实无障碍入口、电梯及路面情况。",
+                    message=(
+                        "当前工具证据不足以确认无台阶/低坡度可达；请在出发前向场馆和交通运营方"
+                        "核实无障碍入口、电梯及路面情况，无法确认时替换候选。"
+                    ),
                     severity="error",
                 )
             )

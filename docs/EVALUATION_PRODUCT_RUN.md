@@ -1,7 +1,7 @@
 # Dev34 正式验收运行报告
 
 - 数据集：`travel-agent-eval-production-v1.1`
-- 被测模型：`deepseek / deepseek-chat`
+- 被测模型：`deepseek / deepseek-v4-flash`
 - 模型参数：temperature 0.2，thinking off，Hybrid flags off
 - 工具：configured real tools（AMap）
 - Judge：`siliconflow / Qwen/Qwen3.5-397B-A17B`，temperature 0，thinking off

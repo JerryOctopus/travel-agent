@@ -49,6 +49,7 @@ _ACTIONABLE_REVISER_ISSUES = {
     "walking_distance_exceeded",
     "daily_activity_sparse",
     "daily_meal_missing",
+    "meal_break_missing",
 }
 
 

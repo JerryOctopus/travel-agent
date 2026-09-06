@@ -324,6 +324,27 @@ def test_structured_specific_interests_are_not_satisfied_by_broad_categories() -
     )
 
 
+def test_history_attraction_interest_accepts_verified_history_category() -> None:
+    profile = TravelProfile(
+        destination="测试城", days=1,
+        constraint_state={"interests": ["历史景点"]},
+    )
+    itinerary = Itinerary(
+        city="测试城", summary="test",
+        days=[ItineraryDay(1, "历史", [ItineraryStop(
+            poi=_poi("城市历史博物馆", "museum", ["history"]),
+            start_time="09:30", duration_min=90, note="test",
+        )])],
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    assert not any(
+        issue.code == "interest_not_covered" and "历史景点" in issue.message
+        for issue in result.issues
+    )
+
+
 def test_accessibility_priority_fails_when_evidence_is_missing() -> None:
     profile = TravelProfile(
         destination="苏州",
@@ -343,6 +364,26 @@ def test_accessibility_priority_fails_when_evidence_is_missing() -> None:
                 note="test",
             )],
         )],
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    assert result.passed is False
+    assert "accessibility_evidence_missing" in {issue.code for issue in result.issues}
+
+
+def test_explicit_stairs_and_hills_avoidance_fails_closed_without_access_evidence() -> None:
+    profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        constraint_state={"avoid": ["连续爬坡", "长楼梯"]},
+    )
+    itinerary = Itinerary(
+        city="测试城",
+        summary="test",
+        days=[ItineraryDay(1, "test", [
+            ItineraryStop(_poi("普通景点", "scenic", []), "09:30", 90, "")
+        ])],
     )
 
     result = critique_itinerary(itinerary, profile)

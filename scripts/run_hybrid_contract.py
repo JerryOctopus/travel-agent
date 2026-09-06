@@ -35,7 +35,7 @@ from travel_agent.settings import load_settings
 
 
 MODEL_PROVIDER = "deepseek"
-MODEL_NAME = "deepseek-chat"
+MODEL_NAME = "deepseek-v4-flash"
 MODEL_BASE_URL = "https://api.deepseek.com/v1"
 TEMPERATURE = 0.0
 MAX_BUSINESS_CALLS = 12

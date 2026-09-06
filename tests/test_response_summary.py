@@ -211,6 +211,30 @@ def test_plan_reply_uses_actual_non_overlapping_meal_strategy() -> None:
     assert "12:00–13:00" not in text
 
 
+def test_return_plan_uses_the_actual_trip_city_in_reply() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile = TravelProfile(destination="南京", days=1)
+    ctx.store.put(
+        "itinerary",
+        {
+            "itinerary": {"summary": "南京一日游", "days": []},
+            "critic": {"passed": True, "issues": []},
+            "return_plan": {
+                "required": True,
+                "from_city": "南京",
+                "to_location": "南京南站",
+                "activity_cutoff": "18:00",
+                "arrival_deadline": "19:00",
+            },
+        },
+    )
+
+    text = build_plan_reply_text(ctx)
+
+    assert "结束南京活动" in text
+    assert "结束杭州活动" not in text
+
+
 def test_finalize_prefers_artifact_over_llm() -> None:
     ctx = build_session(persist=False)
     ctx.store.put(

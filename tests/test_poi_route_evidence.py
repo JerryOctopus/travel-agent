@@ -81,6 +81,26 @@ def test_legitimate_attraction_is_not_rejected_by_name_vocabulary() -> None:
     assert rejected == []
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["星巴克臻选店", "滨海咖啡馆", "旧城主题餐厅", "瑞幸咖啡中心店"],
+)
+def test_food_business_name_conflict_rejects_provider_scenic_taxonomy(name) -> None:
+    verified, rejected = partition_verified_candidates([_poi("food-business", name)])
+
+    assert verified == []
+    assert rejected[0].verification_status == "wrong_entity"
+    assert "餐饮商业实体" in str(rejected[0].verification_reason)
+
+
+def test_cafe_museum_name_is_not_rejected_as_food_business() -> None:
+    poi = _poi("coffee-museum", "咖啡文化博物馆", category="museum", entity_type="museum")
+    verified, rejected = partition_verified_candidates([poi])
+
+    assert verified == [poi]
+    assert rejected == []
+
+
 @pytest.mark.parametrize("name", ["城市博物馆（建设中）", "新馆在建暂未开放"])
 def test_construction_or_unopened_entity_is_not_plannable(name) -> None:
     verified, rejected = partition_verified_candidates([
@@ -744,6 +764,132 @@ def test_broad_return_city_reuses_more_specific_origin_endpoint() -> None:
     assert route["return_location_name"] == "甲城"
 
 
+def test_cross_city_return_retries_live_transit_after_bound_estimator_is_unverified() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile = TravelProfile(
+        destination="乙城",
+        days=1,
+        constraint_state={
+            "origin": "甲城中央车站",
+            "return_location": "甲城",
+            "return_deadline": "21:30",
+        },
+    )
+    final_stop = replace(_poi("planner-final", "最终景点"), city="乙城市")
+    station = replace(
+        _poi(
+            "station-1",
+            "甲城中央车站",
+            category="transport",
+            entity_type="transport",
+            status="wrong_entity",
+            source="amap",
+        ),
+        city="甲城市",
+    )
+
+    class LiveProvider:
+        calls: list[str] = []
+
+        def search_pois(self, **_kwargs):
+            return [station]
+
+        def estimate_route(self, origin, destination, mode):
+            self.calls.append(mode)
+            return replace(
+                _route(origin.poi_id, destination.poi_id, source="amap"),
+                mode=mode,
+                duration_min=95,
+            )
+
+    class BoundEstimator:
+        def estimate_route(self, origin, destination, mode):
+            return replace(
+                _route(
+                    origin.poi_id,
+                    destination.poi_id,
+                    source="haversine_recovery_estimate",
+                ),
+                mode=mode,
+                duration_min=500,
+            )
+
+    provider = LiveProvider()
+    ctx.provider = provider
+    route = toolkit._close_post_plan_return_route(
+        ctx,
+        {"days": [{"day_index": 1, "stops": [{"poi": final_stop.__dict__}]}]},
+        {"transport": []},
+        BoundEstimator(),
+    )
+
+    assert provider.calls == ["public_transport"]
+    assert route is not None
+    assert route["source"] == "amap"
+    assert route["evidence_status"] == "provider_verified"
+    assert route["duration_min"] == 95
+
+
+def test_cross_city_origin_retries_live_transit_after_bound_estimator_is_unverified() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile = TravelProfile(
+        destination="乙城",
+        days=1,
+        constraint_state={"origin": "甲城中央车站"},
+    )
+    first_stop = replace(_poi("planner-first", "首个景点"), city="乙城市")
+    station = replace(
+        _poi(
+            "station-1",
+            "甲城中央车站",
+            category="transport",
+            entity_type="transport",
+            status="wrong_entity",
+            source="amap",
+        ),
+        city="甲城市",
+    )
+
+    class LiveProvider:
+        calls: list[str] = []
+
+        def search_pois(self, **_kwargs):
+            return [station]
+
+        def estimate_route(self, origin, destination, mode):
+            self.calls.append(mode)
+            return replace(
+                _route(origin.poi_id, destination.poi_id, source="amap"),
+                mode=mode,
+                duration_min=88,
+            )
+
+    class BoundEstimator:
+        def estimate_route(self, origin, destination, mode):
+            return replace(
+                _route(
+                    origin.poi_id,
+                    destination.poi_id,
+                    source="haversine_recovery_estimate",
+                ),
+                mode=mode,
+                duration_min=500,
+            )
+
+    provider = LiveProvider()
+    ctx.provider = provider
+    route = toolkit._close_post_plan_origin_route(
+        ctx,
+        {"days": [{"day_index": 1, "stops": [{"poi": first_stop.__dict__}]}]},
+        {"transport": []},
+        BoundEstimator(),
+    )
+
+    assert provider.calls == ["public_transport"]
+    assert route is not None
+    assert route["source"] == "amap"
+    assert route["evidence_status"] == "provider_verified"
+    assert route["duration_min"] == 88
 def test_same_city_return_retries_verified_taxi_when_transit_is_unverified() -> None:
     ctx = build_session(persist=False)
     ctx.profile = TravelProfile(

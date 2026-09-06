@@ -17,6 +17,7 @@ from travel_agent.harness.runner import AgentHarness
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_PRODUCT_CASES = ROOT / "data" / "eval" / "production_v1" / "all_cases.jsonl"
+DEFAULT_PRODUCT_DEV_CASES = ROOT / "data" / "eval" / "production_v1" / "dev.jsonl"
 PRODUCTION_DATASET_VERSION = "travel-agent-eval-production-v1.1"
 
 # 192 条数据集的 split 构成（随数据集冻结，禁止用于训练/调优回流）。
@@ -270,17 +271,20 @@ def validate_product_dataset(cases: list[HarnessCase]) -> ProductDatasetValidati
 def run_product_suite(
     harness: AgentHarness,
     *,
-    case_path: Path | str = DEFAULT_PRODUCT_CASES,
+    case_path: Path | str = DEFAULT_PRODUCT_DEV_CASES,
     split: str = "dev",
     limit: int | None = None,
     case_ids: list[str] | None = None,
     remediation_complete: bool = False,
 ) -> HarnessSuiteResult:
-    all_cases = load_cases_json(case_path)
-    validation = validate_product_dataset(all_cases)
-    if not validation.valid:
-        raise ValueError("invalid production_v1 dataset: " + "; ".join(validation.errors))
-    cases = [case for case in all_cases if split == "all" or case.split == split]
+    if split != "dev":
+        raise RuntimeError(
+            "sealed Core/Challenge/Shadow data may only be executed by the "
+            "official frozen manifest runner"
+        )
+    cases = load_cases_json(case_path)
+    if len(cases) != PRODUCTION_SPLIT_COUNTS["dev"] or any(case.split != "dev" for case in cases):
+        raise ValueError("Dev runner requires the standalone 34-row dev.jsonl")
     if case_ids is not None:
         wanted = set(case_ids)
         cases = [case for case in cases if case.case_id in wanted]

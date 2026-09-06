@@ -17,7 +17,7 @@ from travel_agent.evaluation.artifact_contract import (
 
 RUBRIC_VERSION = "travel-plan-quality-v1"
 PARTIAL_RUBRIC_VERSION = "travel-partial-plan-diagnostic-v1"
-PROMPT_VERSION = "travel-plan-judge-v3"
+PROMPT_VERSION = "travel-plan-judge-v4"
 SCHEMA_VERSION = "travel-plan-judge-output-v1"
 REASONABLE_THRESHOLD = 70
 DIMENSIONS = {
@@ -326,7 +326,14 @@ def parse_judge_output(content: str) -> dict[str, Any]:
 
 def aggregate_judge_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     completed = [item for item in results if item.get("status") == "ok"]
-    applicable = [item for item in results if item.get("status") != "not_applicable"]
+    # Applicability follows the delivered artifact, not the case's expected
+    # artifact.  A fail-closed case with no itinerary must not dilute Judge
+    # completion, while an error/missing result for an actually delivered
+    # itinerary must remain in the denominator.
+    applicable = [
+        item for item in results
+        if item.get("status") in {"ok", "error", "missing"}
+    ]
     by_rubric: dict[str, list[dict[str, Any]]] = {}
     for item in completed:
         by_rubric.setdefault(str(item.get("rubric") or "full_itinerary"), []).append(item)
@@ -638,6 +645,9 @@ critical_issues元素包含 code、severity(info/warning/critical)、evidence。
 固定事件通过 itinerary.fixed_event_plan 和 required_route_anchors 保留时，属于完整行程的一部分；
 对用户自有、但系统没有可核验 POI 实体的事件，只能保留时段和转场计划，不得要求伪造 itinerary stop。
 饮食限制及预留用餐时段应结合 itinerary.meal_strategy 判断，不能只搜索景点 stops。
+用户明确要求的避让时段、固定事件交通缓冲、返程 cutoff，以及 meal_strategy 中的用餐时段，
+都是有解释的时间块，不得计为 unexplained gap；只有扣除这些时间块后仍存在影响可执行性的长空档，
+才能判日程不完整或 critical。
 不要输出total_score，系统会根据分项计算。证据不足必须记录，不得猜测。{repair_note}"""
     return [
         {"role": "system", "content": system},

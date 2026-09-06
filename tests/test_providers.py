@@ -1,5 +1,7 @@
-import pytest
 import json
+from dataclasses import replace
+
+import pytest
 
 from travel_agent.providers import (
     AmapToolProvider,
@@ -77,6 +79,23 @@ def test_fallback_tool_provider_does_not_hide_primary_rate_limit() -> None:
 
     with pytest.raises(ProviderRateLimitError, match="10044"):
         provider.search_pois("杭州")
+
+
+def test_fallback_tool_provider_delegates_nearby_search_and_preserves_rate_limits() -> None:
+    anchor = _poi("锚点")
+    nearby = replace(_poi("附近餐厅"), category="food")
+
+    class Primary:
+        def search_pois_nearby(self, *args, **kwargs):
+            assert kwargs["anchor"] is anchor
+            return [nearby]
+
+    provider = FallbackToolProvider(
+        primary=Primary(),
+        fallback=LocalToolProvider([]),
+    )
+
+    assert provider.search_pois_nearby("杭州", anchor=anchor)[0].name == "附近餐厅"
 
 
 def test_local_tool_provider_estimates_route() -> None:
@@ -273,6 +292,54 @@ def test_amap_food_search_uses_taxonomy_filter_and_rejects_non_food_payload(monk
     results = provider.search_pois("杭州", query_tags=["星光大道"], category="food")
 
     assert [item.name for item in results] == ["青禾餐厅"]
+
+
+def test_amap_nearby_search_uses_anchor_radius_and_food_taxonomy(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+    anchor = POI(
+        "anchor", "合成景区", "合成城", "scenic", 34.384, 109.278,
+        4.8, 0.9, [], 120, "unknown",
+    )
+
+    def fake_get_json(path: str, params: dict[str, str]) -> dict:
+        assert path == "/v5/place/around"
+        assert params["location"] == "109.278000,34.384000"
+        assert params["radius"] == "8000"
+        assert params["region"] == "合成城"
+        assert params["city_limit"] == "true"
+        assert params["sortrule"] == "distance"
+        assert params["types"] == "050000"
+        assert params["keywords"] == "清真餐厅"
+        return {
+            "status": "1",
+            "pois": [
+                {
+                    "id": "near-meal",
+                    "name": "清真风味餐厅",
+                    "type": "餐饮服务;中餐厅",
+                    "location": "109.279,34.385",
+                    "address": "景区东路",
+                },
+                {
+                    "id": "near-shop",
+                    "name": "纪念品店",
+                    "type": "购物服务;特色商业街",
+                    "location": "109.280,34.386",
+                },
+            ],
+        }
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+
+    results = provider.search_pois_nearby(
+        "合成城",
+        anchor,
+        query_tags=["清真餐厅"],
+        category="food",
+        radius_m=8000,
+    )
+
+    assert [item.name for item in results] == ["清真风味餐厅"]
 
 
 def test_amap_search_normalizes_chinese_category_before_taxonomy_filter(monkeypatch) -> None:

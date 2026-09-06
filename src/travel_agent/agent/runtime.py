@@ -723,6 +723,19 @@ def _build_chat_model(
                 "type": "enabled" if settings.llm.thinking_enabled else "disabled"
             }
         }
+    elif (
+        settings.llm.provider.lower() == "deepseek"
+        and settings.llm.model.lower() in {"deepseek-v4-flash", "deepseek-v4-pro"}
+    ):
+        # DeepSeek V4 enables thinking by default.  Explicitly control it so
+        # temperature remains effective for deterministic production evals.
+        extra_body = {
+            "thinking": {
+                "type": "enabled" if settings.llm.thinking_enabled else "disabled"
+            }
+        }
+        if settings.llm.thinking_enabled:
+            extra_body["reasoning_effort"] = "high"
     elif settings.llm.model.lower() == "deepseek-ai/deepseek-v4-flash":
         # SiliconFlow defaults V4-Flash to a reasoning mode unless the switch
         # is sent explicitly.  ``max_tokens`` only limits the visible answer,

@@ -215,6 +215,22 @@ def test_venues_pending_feasibility_check_are_candidates_not_must_visits(
     assert analysis.constraint_state["candidate_attractions"] == ["甲博物馆", "乙公园"]
 
 
+def test_candidate_list_with_active_pruning_request_is_not_hardened_to_must_visit(
+    offline_settings,
+) -> None:
+    ctx = build_session(persist=False)
+    analysis = analyze_travel_turn(
+        "从测试城南站出发，想去甲博物馆、乙公园和丙古街，帮我判断能否都去，不能就主动删减。",
+        ctx,
+        offline_settings,
+    )
+
+    assert "must_visit" not in analysis.patches
+    assert analysis.constraint_state.get("must_visit") in (None, [])
+    assert analysis.constraint_state["candidate_attractions"] == ["甲博物馆", "乙公园", "丙古街"]
+    assert analysis.constraint_state["candidate_only"] is True
+
+
 def test_hotel_comparison_candidates_strip_request_and_action_prefixes() -> None:
     variants = {
         "请比较鼓楼和河西住在哪边更合适": ["鼓楼", "河西"],

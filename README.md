@@ -311,7 +311,7 @@ Live Tools Shadow：高德 API live/replay 工具可靠性
 三套结果先做失败归因，再决定修 Prompt、工作流、工具、记忆或进入 SFT。
 ```
 
-production_v1 的 split 纪律、三阶段执行规程（480/30/120/630/270）与稳定性五项指标
+production_v1 的 split 纪律、V3 单候选 Core/Challenge/Shadow 发布验收与历史稳定性指标
 见 [docs/EVALUATION_PRODUCT.md](docs/EVALUATION_PRODUCT.md)；V0–V3 架构消融见
 [docs/ABLATION_V0_V3.md](docs/ABLATION_V0_V3.md)。
 
@@ -319,14 +319,14 @@ production_v1 的 split 纪律、三阶段执行规程（480/30/120/630/270）�
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m travel_agent.harness.cli --suite agent-product --env offline --product-split dev
-PYTHONPATH=src .venv/bin/python -m travel_agent.harness.cli --suite agent-product --env real_agent --product-split core_frozen --remediation-complete --write-report
 
-# 生产 Multi-Agent Full（V3）+ 顺序模型接力（默认即项目约定的 6 个模型）
-PYTHONPATH=src python scripts/eval_product_multi_model.py --preflight-only --json
-PYTHONPATH=src python scripts/eval_product_multi_model.py --product-split all --write-report --json
+# 非冻结 Dev 可定向运行；Core/Challenge/Shadow 禁止使用 legacy/all/relay 入口
+PYTHONPATH=src python scripts/eval_product_multi_model.py --product-split dev --model deepseek:deepseek-v4-flash --write-report --json
 
-# 中断后从同一 run 继续；配额/余额耗尽、鉴权失败、模型下线或本地 token 上限才切模型
-PYTHONPATH=src python scripts/eval_product_multi_model.py --run-id <run_id> --resume --write-report --json
+# 冻结发布只能运行单候选、单模型、不可 resume 的 manifest 入口
+PYTHONPATH=src python scripts/eval_product_multi_model.py --official-frozen \
+  --release-manifest data/eval/releases/<candidate-id>/manifest.json \
+  --product-split core_frozen --model deepseek:deepseek-v4-flash --run-id <run-id> --write-report --json
 
 # 对已保存 Product run 做质量后处理，不重新调用被测 Agent
 PYTHONPATH=src .venv/bin/python scripts/eval_plan_quality.py rules --run-dir data/eval/product/runs/<run_id>

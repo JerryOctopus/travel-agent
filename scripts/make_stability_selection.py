@@ -1,4 +1,4 @@
-"""一次性工具：生成阶段三稳定性 60 条抽样清单（冻结后不再重新抽样）。
+"""Retired historical selector; frozen data is sealed in the current release cycle.
 
 规则（对齐外部 version_matrix 的 stability 段）：
 - core_frozen 按 ``subset`` 字段分层抽取 30 条（层内固定 seed 随机，
@@ -53,6 +53,12 @@ def stratified_sample(cases: list[dict], quota: int, rng: random.Random) -> list
 
 
 def build_selection(data_dir: Path = DATA_DIR, seed: int = SEED) -> dict:
+    raise RuntimeError(
+        "current single-candidate release forbids legacy stability selection from "
+        "opening Core/Challenge; use the official frozen manifest runner"
+    )
+    # Historical implementation is intentionally unreachable during this
+    # release cycle.  It remains below solely to document the committed sample.
     core = [
         case
         for case in load_jsonl(data_dir / "core_frozen.jsonl")

@@ -6,8 +6,7 @@ from pathlib import Path
 
 from travel_agent.harness.cases import HarnessCase, load_cases_json
 from travel_agent.harness.product import (
-    DEFAULT_PRODUCT_CASES,
-    FROZEN_SPLITS,
+    DEFAULT_PRODUCT_DEV_CASES,
     aggregate_product_results,
     validate_absolute_return_deadline_evidence,
     _execution_case,
@@ -17,10 +16,12 @@ from travel_agent.harness.runner import AgentHarness
 
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_LONG_HORIZON_CASES = DEFAULT_PRODUCT_CASES
+DEFAULT_LONG_HORIZON_CASES = DEFAULT_PRODUCT_DEV_CASES
 LONG_HORIZON_DATASET_VERSION = "travel-agent-eval-production-v1.1"
 EXPECTED_TURN_BANDS = {5: 4, 8: 4, 12: 4}
 EXPECTED_SPLIT_COUNTS = {"dev": 4, "core_frozen": 4, "challenge_frozen": 4}
+EXPECTED_DEV_TURN_BANDS = {5: 1, 8: 1, 12: 2}
+EXPECTED_DEV_SPLIT_COUNTS = {"dev": 4}
 TRAINING_DATA_POLICY = "production_v1 frozen cases must never be used for training or tuning."
 
 
@@ -42,10 +43,20 @@ def validate_long_horizon_dataset(
     if len(ids) != len(set(ids)):
         errors.append("case ids must be unique")
     turn_counts = dict(Counter(len(case.turns) for case in cases))
-    if turn_counts != EXPECTED_TURN_BANDS:
+    expected_turn_bands = (
+        EXPECTED_DEV_TURN_BANDS
+        if set(case.split for case in cases) <= {"dev"}
+        else EXPECTED_TURN_BANDS
+    )
+    if turn_counts != expected_turn_bands:
         errors.append(f"turn-band counts mismatch: {turn_counts}")
     split_counts = dict(Counter(case.split for case in cases))
-    if split_counts != EXPECTED_SPLIT_COUNTS:
+    expected_split_counts = (
+        EXPECTED_DEV_SPLIT_COUNTS
+        if set(split_counts) <= {"dev"}
+        else EXPECTED_SPLIT_COUNTS
+    )
+    if split_counts != expected_split_counts:
         errors.append(f"split counts mismatch: {split_counts}")
     for case in cases:
         if case.subset != "long_horizon_state":
@@ -75,17 +86,16 @@ def run_long_horizon_suite(
     split: str = "dev",
     limit: int | None = None,
 ) -> HarnessSuiteResult:
+    if split != "dev":
+        raise RuntimeError(
+            "frozen long-horizon cases are sealed and require the official frozen manifest runner"
+        )
     all_cases = load_cases_json(case_path)
     validation = validate_long_horizon_dataset(all_cases)
     if not validation.valid:
         raise ValueError("invalid long_horizon_v1 dataset: " + "; ".join(validation.errors))
-    if split not in {"dev", "frozen", "all"}:
-        raise ValueError(f"unknown long_horizon_v1 split: {split}")
     cases = [case for case in all_cases if case.subset == "long_horizon_state"]
-    if split == "dev":
-        cases = [case for case in cases if case.split == "dev"]
-    elif split == "frozen":
-        cases = [case for case in cases if case.split in FROZEN_SPLITS]
+    cases = [case for case in cases if case.split == "dev"]
     if limit is not None:
         cases = cases[: max(1, limit)]
     variant = str(harness.environment.variant or "").upper() or "V3"

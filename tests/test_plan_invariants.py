@@ -56,6 +56,80 @@ def test_duplicate_day_index_is_a_delivery_error() -> None:
     assert "day_index_not_contiguous" in {item["code"] for item in result["issues"]}
 
 
+def test_final_artifact_rejects_stop_outside_date_specific_opening_window() -> None:
+    profile = TravelProfile(
+        destination="任意城市",
+        days=1,
+        start_date="2026-11-07",
+    )
+    payload = _payload(1)
+    payload["itinerary"]["days"][0]["stops"][0] = {
+        "poi": {
+            **_poi("dated-hours", "日期营业场馆"),
+            "city": "任意城市",
+            "category": "museum",
+            "lat": 30.0,
+            "lng": 120.0,
+            "opening_hours": "09-07至12-31 周一至周日 09:30-18:30",
+        },
+        "start_time": "19:00",
+        "duration_min": 90,
+    }
+
+    result = validate_plan_artifact(payload, profile)
+
+    assert result["passed"] is False
+    assert "outside_applicable_opening_hours" in {
+        item["code"] for item in result["issues"]
+    }
+
+
+def test_final_artifact_rejects_arrival_after_last_admission() -> None:
+    profile = TravelProfile(destination="任意城市", days=1, start_date="2026-10-15")
+    payload = _payload(1)
+    payload["itinerary"]["days"][0]["stops"][0] = {
+        "poi": {
+            **_poi("entry-cutoff", "停止入场场馆"),
+            "city": "任意城市", "category": "museum", "lat": 30.0, "lng": 120.0,
+            "opening_hours": "周一至周日 08:00-20:00开放 17:30停止入园",
+        },
+        "start_time": "18:00", "duration_min": 90,
+    }
+
+    result = validate_plan_artifact(payload, profile)
+
+    assert result["passed"] is False
+    assert "after_last_admission" in {item["code"] for item in result["issues"]}
+
+
+def test_final_artifact_rejects_insufficient_transfer_time() -> None:
+    profile = TravelProfile(destination="任意城市", days=1)
+    payload = _payload(1)
+    payload["itinerary"]["days"][0]["stops"] = [
+        {
+            "poi": _poi("origin", "上一站"),
+            "start_time": "18:00", "duration_min": 60,
+        },
+        {
+            "poi": _poi("destination", "下一站"),
+            "start_time": "19:00", "duration_min": 60,
+            "route_from_previous": {
+                "origin_poi_id": "origin", "destination_poi_id": "destination",
+                "distance_km": 5, "duration_min": 30,
+                "mode": "public_transport", "source": "amap",
+                "evidence_status": "provider_verified",
+            },
+        },
+    ]
+
+    result = validate_plan_artifact(payload, profile)
+
+    assert result["passed"] is False
+    assert "insufficient_transfer_time" in {
+        item["code"] for item in result["issues"]
+    }
+
+
 def test_remaining_budget_excludes_prepaid_lodging_and_unknown_is_not_zero() -> None:
     profile = TravelProfile(
         destination="任意城市", days=3,
@@ -158,6 +232,36 @@ def test_same_city_terminal_deadline_builds_return_plan() -> None:
     assert plan["arrival_deadline"] == "17:00"
     assert plan["activity_cutoff"] == "16:00"
     assert plan["intercity_segment"] is None
+
+
+def test_return_plan_terminal_transfer_must_match_actual_final_stop() -> None:
+    profile = TravelProfile(
+        destination="任意城市",
+        days=1,
+        constraint_state={"return_location": "任意城市东站", "return_deadline": "19:00"},
+    )
+    payload = _payload(1)
+    route = {
+        "origin_poi_id": "p1", "destination_poi_id": "station",
+        "mode": "public_transport", "duration_min": 30, "distance_km": 8,
+        "source": "amap", "evidence_status": "provider_verified",
+        "recommended_latest_departure": "18:00", "required_buffer_min": 30,
+    }
+    payload["required_route_anchors"] = {
+        "last_stop_to_return_location": {**route, "route": route},
+        "legs": [{"kind": "last_stop_to_return_location", **route, "route": route}],
+    }
+    payload["return_plan"] = {
+        "required": True,
+        "terminal_transfer": {**route, "origin_poi_id": "stale-stop"},
+    }
+
+    result = validate_plan_artifact(payload, profile)
+
+    assert result["passed"] is False
+    assert "return_plan_origin_mismatch" in {
+        item["code"] for item in result["issues"]
+    }
 
 
 def test_user_owned_fixed_event_without_price_does_not_poison_budget_total() -> None:

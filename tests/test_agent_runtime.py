@@ -41,6 +41,57 @@ def test_v4_flash_explicitly_disables_provider_thinking(monkeypatch) -> None:
     assert captured["extra_body"] == {"enable_thinking": False}
 
 
+def test_direct_deepseek_v4_flash_explicitly_disables_thinking(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    settings = Settings(
+        llm=LLMSettings(
+            provider="deepseek",
+            api_key="test-key",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-v4-flash",
+            temperature=0.2,
+            thinking_enabled=False,
+        )
+    )
+
+    _build_chat_model(settings)
+
+    assert captured["temperature"] == 0.2
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_direct_deepseek_v4_flash_thinking_mode_sets_effort(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    settings = Settings(
+        llm=LLMSettings(
+            provider="deepseek",
+            api_key="test-key",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-v4-flash",
+            thinking_enabled=True,
+        )
+    )
+
+    _build_chat_model(settings)
+
+    assert captured["extra_body"] == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "high",
+    }
+
+
 def test_v4_flash_thinking_mode_keeps_explicit_effort(monkeypatch) -> None:
     captured: dict[str, object] = {}
 

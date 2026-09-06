@@ -111,6 +111,32 @@ def validate_plan_artifact(payload: dict[str, Any], profile: TravelProfile) -> d
             if isinstance(route, dict):
                 for code in route_evidence_reason_codes(route):
                     _issue(issues, code, "路线声明为 provider_verified，但缺少匹配、可引用的实际工具证据。")
+            if index > 0 and isinstance(route, dict):
+                try:
+                    from travel_agent.constraint_events import clock_minutes
+
+                    previous = stops[index - 1]
+                    previous_end = (
+                        clock_minutes(previous.get("start_time"))
+                        + int(previous.get("duration_min") or 0)
+                    )
+                    current_start = clock_minutes(stop.get("start_time"))
+                    transfer = int(route.get("duration_min") or 0)
+                except (KeyError, TypeError, ValueError):
+                    pass
+                else:
+                    if previous_end + transfer > current_start:
+                        _issue(
+                            issues,
+                            "insufficient_transfer_time",
+                            f"第{day.get('day_index')}天前往 {poi.get('name') or '下一站'} 的预留时间不足。",
+                        )
+            _validate_stop_opening_hours(
+                issues,
+                stop=stop,
+                profile=profile,
+                day_index=int(day.get("day_index") or 0),
+            )
 
     for required in state.get("must_visit") or profile.must_visit or []:
         if not any(
@@ -315,6 +341,23 @@ def validate_plan_artifact(payload: dict[str, Any], profile: TravelProfile) -> d
                     "return_route_feasibility_incomplete",
                     "返程路线没有可用于截止时间判断的正数耗时、距离和缓冲。",
                 )
+        return_plan = payload.get("return_plan") or {}
+        terminal_transfer = return_plan.get("terminal_transfer")
+        if isinstance(terminal_transfer, dict):
+            final_stop_id = str(
+                ((days[-1].get("stops") or [])[-1].get("poi") or {}).get("poi_id")
+                if days and (days[-1].get("stops") or [])
+                else ""
+            )
+            if (
+                not final_stop_id
+                or str(terminal_transfer.get("origin_poi_id") or "") != final_stop_id
+            ):
+                _issue(
+                    issues,
+                    "return_plan_origin_mismatch",
+                    "return_plan 的接驳路线不是从 Planner 最终日的真实最后一站出发。",
+                )
 
     budget_required = _budget_required(profile)
     budget = payload.get("budget_plan")
@@ -366,8 +409,66 @@ def validate_plan_artifact(payload: dict[str, Any], profile: TravelProfile) -> d
             "trip_origin_route", "return_route",
             "budget_completeness", "evidence_binding", "repair_consistency", "render_gate",
             "datetime_semantics", "activity_end_target",
+            "applicable_opening_hours",
         ],
     }
+
+
+def _validate_stop_opening_hours(
+    issues: list[dict[str, str]],
+    *,
+    stop: dict[str, Any],
+    profile: TravelProfile,
+    day_index: int,
+) -> None:
+    """Recheck provider hours after every reviewer revision.
+
+    Scheduling is not the final authority: a reviewer may move a stop after the
+    planner checked it.  Only check evidenced, timed POIs here so legacy imports
+    without provider hours remain governed by their existing evidence policy.
+    """
+    poi_data = stop.get("poi") or {}
+    if not isinstance(poi_data, dict) or not poi_data.get("opening_hours"):
+        return
+    if stop.get("start_time") in (None, "") or stop.get("duration_min") in (None, ""):
+        return
+    try:
+        from travel_agent.agent.serde import poi_from_dict
+        from travel_agent.constraint_events import clock_minutes
+        from travel_agent.planning import (
+            _last_admission_for_trip_day,
+            _opening_window_for_trip_day,
+            poi_open_on_trip_day,
+        )
+
+        poi = poi_from_dict(poi_data)
+        start = clock_minutes(stop.get("start_time"))
+        duration = int(stop.get("duration_min") or 0)
+    except (KeyError, TypeError, ValueError):
+        return
+    if day_index <= 0 or not poi_open_on_trip_day(poi, profile, day_index):
+        _issue(
+            issues,
+            "poi_closed_on_trip_day",
+            f"第{day_index}天 {poi.name} 的工具证据显示当天闭馆。",
+        )
+        return
+    window = _opening_window_for_trip_day(poi, profile, day_index)
+    if window is not None:
+        opens, closes = window
+        if start < opens or start + duration > closes:
+            _issue(
+                issues,
+                "outside_applicable_opening_hours",
+                f"第{day_index}天 {poi.name} 的安排超出当天适用营业时间。",
+            )
+    last_admission = _last_admission_for_trip_day(poi, profile, day_index)
+    if last_admission is not None and start > last_admission:
+        _issue(
+            issues,
+            "after_last_admission",
+            f"第{day_index}天 {poi.name} 的到达时间晚于工具证据中的停止入场时间。",
+        )
 
 
 def _expected_days(profile: TravelProfile) -> int | None:

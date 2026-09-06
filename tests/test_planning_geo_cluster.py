@@ -183,6 +183,24 @@ def test_explicit_food_plan_reserves_one_evidenced_meal_per_day() -> None:
     )
 
 
+def test_spare_capacity_never_adds_more_than_one_restaurant_per_day() -> None:
+    profile = TravelProfile(destination="杭州", days=2, interests=["food"])
+    ranked = [
+        _poi("activity", 120.10, 30.20, category="scenic"),
+        *[
+            _poi(f"meal-{index}", 120.11 + index / 1000, 30.21, category="food")
+            for index in range(5)
+        ],
+    ]
+
+    itinerary = build_simple_itinerary(ranked, profile)
+
+    assert sum(
+        stop.poi.category == "food"
+        for day in itinerary.days for stop in day.stops
+    ) <= profile.days
+
+
 def test_reserved_meals_prefer_distinct_brands() -> None:
     profile = TravelProfile(destination="北京", days=2, pace="standard", interests=["food"])
     ranked = [
@@ -744,6 +762,28 @@ def test_named_candidates_reserve_verified_open_venues_not_closed_museum() -> No
     assert "天津·海河意式风情区" in names
     assert "天津博物馆" not in names
     assert "天津自然博物馆" not in names
+
+
+def test_low_walking_fill_prefers_activity_near_reserved_must_visit() -> None:
+    profile = TravelProfile(
+        destination="杭州",
+        days=1,
+        pace="relaxed",
+        must_visit=["核心景区"],
+        constraint_state={"mobility": "low_walking", "avoid": ["太多步行"]},
+    )
+    ranked = [
+        _poi("核心景区", 120.10, 30.20),
+        _poi("远郊高分点", 120.30, 30.35),
+        _poi("邻近公园", 120.11, 30.21),
+    ]
+
+    itinerary = build_simple_itinerary(
+        ranked, profile, preserve_must_visit_capacity=True
+    )
+    names = [stop.poi.name for stop in itinerary.days[0].stops]
+
+    assert names == ["核心景区", "邻近公园"]
 
 
 def test_named_candidate_prefers_requested_venue_over_higher_ranked_subvenue() -> None:

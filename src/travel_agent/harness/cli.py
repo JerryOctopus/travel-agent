@@ -27,7 +27,7 @@ from travel_agent.harness.reporting import (
 )
 from travel_agent.harness import AgentHarness, HarnessEnvironment
 from travel_agent.harness.product import (
-    DEFAULT_PRODUCT_CASES,
+    DEFAULT_PRODUCT_DEV_CASES,
     build_product_report,
     run_product_suite,
     write_product_run,
@@ -67,7 +67,7 @@ def main() -> None:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--continue-on-llm-error", action="store_true")
     parser.add_argument("--cases", default=str(ROOT / "eval" / "cases.json"))
-    parser.add_argument("--product-cases", default=str(DEFAULT_PRODUCT_CASES))
+    parser.add_argument("--product-cases", default=str(DEFAULT_PRODUCT_DEV_CASES))
     parser.add_argument("--long-horizon-cases", default=str(DEFAULT_LONG_HORIZON_CASES))
     parser.add_argument(
         "--long-horizon-split",

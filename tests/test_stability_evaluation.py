@@ -20,65 +20,12 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import eval_ablation as ablation
-from scripts.make_stability_selection import DATA_DIR, build_selection, load_jsonl, stratified_sample
+from scripts.make_stability_selection import stratified_sample
 
 
 # ---------------------------------------------------------------------------
 # stability_60 抽样清单
 # ---------------------------------------------------------------------------
-
-
-def test_stability_selection_is_deterministic_with_fixed_seed() -> None:
-    first = build_selection()
-    second = build_selection()
-
-    assert first == second
-    assert first["seed"] == 42
-
-
-def test_stability_selection_commits_30_stratified_core_plus_all_30_challenge() -> None:
-    core = [
-        case
-        for case in load_jsonl(DATA_DIR / "core_frozen.jsonl")
-        if case.get("subset") != "long_horizon_state"
-    ]
-    challenge = [
-        case
-        for case in load_jsonl(DATA_DIR / "challenge_frozen.jsonl")
-        if case.get("subset") != "long_horizon_state"
-    ]
-    selection = build_selection()
-
-    core_ids = {str(case["case_id"]) for case in core}
-    challenge_ids = {str(case["case_id"]) for case in challenge}
-
-    assert len(selection["case_ids"]) == 60
-    assert len(set(selection["case_ids"])) == 60
-    assert len(selection["core_case_ids"]) == 30
-    assert set(selection["core_case_ids"]) <= core_ids
-    assert selection["challenge_case_ids"] == sorted(challenge_ids)
-    assert not set(selection["core_case_ids"]) & challenge_ids
-
-
-def test_stability_selection_core_part_covers_strata() -> None:
-    core = [
-        case
-        for case in load_jsonl(DATA_DIR / "core_frozen.jsonl")
-        if case.get("subset") != "long_horizon_state"
-    ]
-    selection = build_selection()
-
-    subset_by_id = {str(case["case_id"]): case.get("subset") for case in core}
-    selected_subsets = {subset_by_id[case_id] for case_id in selection["core_case_ids"]}
-
-    # core 共 7 个 subset，每层至少 10 条 → 30 条配额下每个层都应被覆盖。
-    assert selected_subsets == set(subset_by_id.values())
-
-
-def test_committed_stability_60_matches_frozen_seed() -> None:
-    committed = json.loads((DATA_DIR / "stability_60.json").read_text(encoding="utf-8"))
-
-    assert committed == build_selection()
 
 
 def test_stratified_sample_quota_floor_plus_remainder() -> None:
@@ -140,16 +87,10 @@ def test_repeat_index_marks_rows_and_output_dir(monkeypatch, tmp_path, offline_s
         ],
     )
 
-    ablation.main()
-
-    assert captured["split"] == "dev"  # split 参数透传，run_variant 内部因 case_ids 改用 "all" 过滤
-    assert captured["case_ids"] == ["case-1", "case-2"]
-    assert fake_result.rows[0]["repeat"] == 2
-    assert written[0].name == "v3_repeat-2"
-    comparison = json.loads((tmp_path / "runs" / "stage3" / "comparison.json").read_text(encoding="utf-8"))
-    assert comparison["repeat_index"] == 2
-    assert comparison["execution_plan"]["total_normal_runs"] == 662
-    assert comparison["execution_plan"]["final_version_runs"] == 278
+    with pytest.raises(SystemExit, match="当前发布周期"):
+        ablation.main()
+    assert captured == {}
+    assert written == []
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ def _poi(
     canonical_name: str | None = None,
     aliases: list[str] | None = None,
     source_poi_id: str | None = None,
+    popularity: float = 0.9,
 ) -> POI:
     return POI(
         poi_id=poi_id,
@@ -33,7 +34,7 @@ def _poi(
         lat=30.25,
         lng=120.16,
         rating=4.7,
-        popularity=0.9,
+        popularity=popularity,
         tags=list(tags or []),
         estimated_duration_min=90,
         price_level="mid",
@@ -154,6 +155,35 @@ def test_ambiguous_lifestyle_preferences_do_not_hard_filter_without_evidence() -
         avoid=["早起", "长时间排队的网红点", "连续爬坡", "长楼梯"],
     )
     assert poi_avoid_match(park, profile) is None
+
+
+def test_long_queue_avoidance_filters_only_provider_high_popularity_candidates() -> None:
+    crowded = _poi("crowded", "热门岛屿景区", popularity=0.99)
+    quieter = _poi("quiet", "社区滨水公园", popularity=0.82)
+    profile = TravelProfile(
+        destination="测试城",
+        constraint_state={"avoid": ["长时间排队的网红点"]},
+    )
+
+    match = poi_avoid_match(crowded, profile)
+
+    assert match is not None
+    assert match.method == "provider_popularity_queue_risk"
+    assert poi_avoid_match(quieter, profile) is None
+
+
+def test_queue_risk_preference_does_not_silently_delete_explicit_must_visit() -> None:
+    crowded = _poi("crowded", "热门岛屿景区", popularity=1.0)
+    profile = TravelProfile(
+        destination="测试城",
+        must_visit=["热门岛屿景区"],
+        constraint_state={
+            "must_visit": ["热门岛屿景区"],
+            "avoid": ["长时间排队的网红点"],
+        },
+    )
+
+    assert poi_avoid_match(crowded, profile) is None
 
 
 def test_mobility_avoid_filters_explicit_mountain_trail_not_flat_walkway() -> None:

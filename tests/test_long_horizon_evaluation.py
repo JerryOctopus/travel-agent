@@ -3,8 +3,8 @@ from __future__ import annotations
 from travel_agent.harness.cases import HarnessCase, load_cases_json
 from travel_agent.harness.long_horizon import (
     DEFAULT_LONG_HORIZON_CASES,
-    EXPECTED_SPLIT_COUNTS,
-    EXPECTED_TURN_BANDS,
+    EXPECTED_DEV_SPLIT_COUNTS,
+    EXPECTED_DEV_TURN_BANDS,
     validate_long_horizon_dataset,
 )
 from travel_agent.harness.result import HarnessCaseResult, HarnessTurnResult
@@ -29,11 +29,11 @@ def test_long_horizon_dataset_has_balanced_5_8_12_turn_bands() -> None:
     validation = validate_long_horizon_dataset(cases)
 
     assert validation.valid is True, validation.errors
-    assert validation.turn_counts == EXPECTED_TURN_BANDS
-    assert validation.split_counts == EXPECTED_SPLIT_COUNTS
+    assert validation.turn_counts == EXPECTED_DEV_TURN_BANDS
+    assert validation.split_counts == EXPECTED_DEV_SPLIT_COUNTS
     assert validation.frozen_warnings == []
     long_cases = [case for case in cases if case.subset == "long_horizon_state"]
-    assert len(long_cases) == 12
+    assert len(long_cases) == 4
     assert all(len(case.turn_expectations) == len(case.turns) for case in long_cases)
     target = next(case for case in long_cases if case.case_id == "lh_12_001")
     assert target.turns[0] == "杭州五天，两个人，总预算5000元。"

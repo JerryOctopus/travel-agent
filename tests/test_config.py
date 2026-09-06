@@ -40,6 +40,18 @@ def test_load_llm_config_uses_qwen_defaults(monkeypatch) -> None:
     assert config.enabled is True
 
 
+def test_load_llm_config_uses_deepseek_v4_flash_default(monkeypatch) -> None:
+    monkeypatch.setenv("TRAVEL_AGENT_LLM_PROVIDER", "deepseek")
+    monkeypatch.setenv("TRAVEL_AGENT_LLM_API_KEY", "test-key")
+    monkeypatch.delenv("TRAVEL_AGENT_LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("TRAVEL_AGENT_LLM_MODEL", raising=False)
+
+    config = load_llm_config()
+
+    assert config.base_url == "https://api.deepseek.com/v1"
+    assert config.model == "deepseek-v4-flash"
+
+
 def test_load_llm_config_uses_zhipu_defaults(monkeypatch) -> None:
     monkeypatch.setenv("TRAVEL_AGENT_LLM_PROVIDER", "zhipu")
     monkeypatch.setenv("TRAVEL_AGENT_LLM_API_KEY", "test-key")

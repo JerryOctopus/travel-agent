@@ -21,6 +21,7 @@ from travel_agent.evaluation.plan_quality_judge import (
     JudgeOutputError,
     PlanQualityJudge,
     _judge_payload,
+    aggregate_judge_results,
     parse_judge_output,
     preflight_judge,
 )
@@ -172,6 +173,41 @@ def test_city_suffix_is_normalized_for_poi_and_itinerary_checks() -> None:
     assert result is not None
     assert result.city_and_coordinates_valid is True
     assert "poi_city_mismatch" not in {issue["code"] for issue in result.issues}
+
+
+def test_fixed_event_venue_may_be_in_a_neighboring_city() -> None:
+    artifacts = _artifacts()
+    fixed_stop = artifacts["itinerary"]["itinerary"]["days"][0]["stops"][1]
+    fixed_stop["poi"]["name"] = "已预约场馆"
+    fixed_stop["poi"]["city"] = "邻市"
+
+    result = evaluate_plan_quality(
+        {
+            "expected_city": "测试城",
+            "expected_days": 1,
+            "hard_constraints": {
+                "destination": "测试城",
+                "fixed_events": [{"location": "已预约场馆", "start": "11:30", "end": "13:30"}],
+            },
+        },
+        {"destination": "测试城", "days": 1},
+        artifacts,
+    )
+
+    assert result is not None
+    assert "poi_city_mismatch" not in {issue["code"] for issue in result.issues}
+
+
+def test_judge_aggregate_excludes_missing_artifacts_from_applicable_count() -> None:
+    summary = aggregate_judge_results([
+        {"status": "ok", "rubric": "full_itinerary", "total_score": 85, "reasonable": True, "critical_issues": []},
+        {"status": "not_run", "reason": "missing_expected_artifact"},
+        {"status": "not_applicable", "reason": "task_does_not_require_itinerary"},
+    ])
+
+    assert summary["applicable_count"] == 1
+    assert summary["completed_count"] == 1
+    assert summary["completion_rate"] == 1.0
 
 
 def test_route_pace_warning_is_quality_not_hard_feasibility() -> None:

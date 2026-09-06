@@ -175,9 +175,16 @@ def build_subagent_executor(settings: Any, model: Any | None = None):
                 ctx,
                 deterministic,
             )
-            if _task_has_domain_evidence(ctx, task):
+            contract_satisfied = bool(
+                deterministic.pop("_transport_contract_satisfied", False)
+            )
+            if _task_has_domain_evidence(ctx, task) or contract_satisfied:
                 deterministic["status"] = STATUS_COMPLETED
-                deterministic["summary"] = "Transport 已按绑定端点完成路线证据。"
+                deterministic["summary"] = (
+                    "Transport 已完成本轮可确定的预算/路线证据。"
+                    if contract_satisfied
+                    else "Transport 已按绑定端点完成路线证据。"
+                )
                 return deterministic
 
         # Hotel discovery is likewise a bounded lookup from canonical profile
@@ -382,6 +389,11 @@ def _task_has_domain_evidence(ctx: Any, task: SubagentTask) -> bool:
         "transport": {"routes"},
         "planner": {"itinerary"},
     }.get(task.agent, set())
+    if task.agent == "transport" and _is_candidate_comparison_task(task):
+        # An unanchored area comparison can satisfy accessibility with
+        # provider-backed transit-node/entity facts; a route is only mandatory
+        # when there is a target anchor or a later matrix-finalization step.
+        expected = {*expected, "candidates", "pois"}
     store = getattr(ctx, "store", None)
     if store is None:
         return False
@@ -482,6 +494,31 @@ def _enforce_restaurant_search_postcondition(
         result.setdefault("warnings", []).append(
             "区域内无结果，已按同一城市扩大一次检索范围"
         )
+    dietary = state.get("dietary") or []
+    dietary_values = [dietary] if isinstance(dietary, str) else list(dietary)
+    hard_dietary = bool(dietary_values)
+    must_visit = state.get("must_visit") or []
+    anchor_values = [must_visit] if isinstance(must_visit, str) else list(must_visit)
+    if hard_dietary and int(state.get("duration_days") or getattr(ctx.profile, "days", 1) or 1) > 1:
+        for anchor in list(dict.fromkeys(str(item).strip() for item in anchor_values if str(item).strip()))[:3]:
+            if area and str(area).strip() == anchor:
+                continue
+            anchored = toolkit.search_restaurant(
+                ctx,
+                city=str(city),
+                area=anchor,
+                budget_level=None,
+                max_results=max_results,
+            )
+            calls.append("search_restaurant")
+            if anchored.get("isError"):
+                result.setdefault("warnings", []).append(
+                    f"硬约束锚点附近餐厅检索失败：{anchor}"
+                )
+            else:
+                result.setdefault("warnings", []).append(
+                    f"已补充硬约束锚点附近的饮食证据：{anchor}"
+                )
     result.setdefault("tool_trace", []).extend(calls)
     if response.get("isError"):
         result.setdefault("unresolved", []).append(
@@ -1357,11 +1394,17 @@ def _enforce_transport_route_postcondition(
             )
         else:
             repaired = True
+            has_budget_artifact = True
             result.setdefault("warnings", []).append(
                 "transport budget postcondition applied deterministically"
             )
 
     if not desired_pairs:
+        result["_transport_contract_satisfied"] = bool(
+            explicit_task_type in {"full_itinerary", "full_trip_plan"}
+            and budget_explicit
+            and has_budget_artifact
+        )
         return result
 
     for origin_id, destination_id in desired_pairs:
@@ -1490,7 +1533,12 @@ def _enforce_planner_postcondition(
             "plan_and_critique",
             toolkit.plan_and_critique,
             artifact_ids=bound_ids + task_ids(),
-            route_estimator=_planner_route_estimator(ctx, bound_ids),
+            # Transport postconditions may have materialized missing endpoint
+            # pairs after dispatch. The planner must bind those task-local
+            # provider routes instead of falling back to local geometry.
+            route_estimator=_planner_route_estimator(
+                ctx, bound_ids + task_ids("routes")
+            ),
         )
         if planned.get("isError") or not task_ids("itinerary"):
             raise RuntimeError(str(planned.get("summary") or "itinerary artifact missing"))

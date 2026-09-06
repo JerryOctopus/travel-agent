@@ -117,6 +117,10 @@ repair_instruction。严重度必须遵循：
 - 每个问题的 evidence 必须绑定 artifact 的具体字段路径（如 budget_plan.expected_total）
   或给定的工具/Artifact evidence id；没有绑定证据的推测只能是 noncritical；
 - validation_result/critic 的确定性通过结论优先于无相反工具证据的推测性建议；
+- 时间衔接只需满足“上一站开始时间 + 上一站停留时长 + 路线耗时 <= 下一站开始时间”；
+  不得再从这个衔接间隔中扣除下一站自身的停留时长；
+- budget_plan 中带 source_artifact_id 的金额是预算领域给出的区间估算；没有相反价格证据、算术错误或
+  用户预算超限时，不得仅因 itinerary 没有逐景点票价字段要求返工；
 - verdict=pass 时 issues 必须为空；verdict=rework 时不得含 critical；存在 critical 时 verdict=failed。
 整体给出 verdict：pass | rework | failed。"""
 
@@ -657,6 +661,63 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
     hard_timed_route_state = bool(
         state.get("return_deadline") or state.get("fixed_events")
     )
+    required_route_anchors = plan.get("required_route_anchors") or {}
+    return_anchor = (
+        required_route_anchors.get("last_stop_to_return_location")
+        if isinstance(required_route_anchors, dict)
+        else None
+    ) or {}
+    return_anchor_route = (
+        return_anchor.get("route")
+        if isinstance(return_anchor, dict)
+        else None
+    ) or {}
+    verified_return_anchor = bool(
+        isinstance(return_anchor, dict)
+        and return_anchor.get("evidence_status") == "provider_verified"
+        and return_anchor.get("recommended_latest_departure")
+        and isinstance(return_anchor_route, dict)
+        and return_anchor_route.get("hard_feasibility_proven") is True
+    )
+    itinerary_days = [
+        day for day in (plan.get("itinerary") or {}).get("days") or []
+        if isinstance(day, dict)
+    ]
+    internal_routes_bound = all(
+        isinstance(stop.get("route_from_previous"), dict)
+        and stop["route_from_previous"].get("evidence_status") not in {None, "unavailable"}
+        for day in itinerary_days
+        for index, stop in enumerate(day.get("stops") or [])
+        if index > 0 and isinstance(stop, dict)
+    )
+    origin_anchor = (
+        required_route_anchors.get("trip_origin_to_first_stop")
+        if isinstance(required_route_anchors, dict)
+        else None
+    ) or {}
+    origin_route_bound = bool(
+        not state.get("origin")
+        or (
+            isinstance(origin_anchor, dict)
+            and origin_anchor.get("evidence_status") in {
+                "provider_verified", "deterministic_estimate"
+            }
+            and origin_anchor.get("origin_poi_id")
+            and origin_anchor.get("destination_poi_id")
+        )
+    )
+    return_route_bound = bool(
+        not state.get("return_location")
+        or not state.get("return_deadline")
+        or verified_return_anchor
+    )
+    deterministic_route_bindings_pass = bool(
+        (plan.get("critic") or {}).get("passed") is True
+        and (plan.get("validation_result") or {}).get("passed") is True
+        and internal_routes_bound
+        and origin_route_bound
+        and return_route_bound
+    )
     hard_mobility_evidence_required = bool(
         state.get("wheelchair_user")
         or state.get("accessibility_priority")
@@ -759,6 +820,18 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             bool(state.get("fixed_events"))
             and any(marker in combined_lower for marker in ("fixed_event", "固定", "预约"))
         )
+        hard_timed_route_claim = bool(
+            hard_timed_route_state
+            and any(
+                marker in combined_lower
+                for marker in (
+                    "return", "deadline", "返程", "返回", "截止",
+                    "fixed_event", "固定事件", "固定预约", "预约会场",
+                    "required_route_anchors.fixed_event",
+                    "required_route_anchors.last_stop_to_return",
+                )
+            )
+        )
         critic_warnings = {
             str(item.get("code") or "")
             for item in (plan.get("critic") or {}).get("issues") or []
@@ -771,15 +844,18 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             and not hard_route_state
         )
         soft_route_evidence_gap = (
-            any(
+            (
+                "route_evidence" in str(issue.issue_type or "").casefold()
+                or any(
                 marker in combined_lower
                 for marker in ("route_evidence", "路线证据", "transport evidence")
+                )
             )
             and (
                 not hard_route_state
                 or (
                     bounded_taxi_fallback
-                    and not hard_timed_route_state
+                    and not hard_timed_route_claim
                 )
             )
             and (plan.get("critic") or {}).get("passed") is True
@@ -813,11 +889,35 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
         deterministic_schedule_advisory = bool(
             any(
                 marker in str(issue.issue_type or "").casefold()
-                for marker in ("schedule_feasibility", "schedule_conflict")
+                for marker in ("schedule_feasibility", "schedule_conflict", "schedule_gap")
             )
             and (plan.get("critic") or {}).get("passed") is True
             and (plan.get("validation_result") or {}).get("passed") is True
-            and not hard_timed_route_state
+            and (
+                not hard_timed_route_state
+                or (
+                    verified_return_anchor
+                    and any(
+                        marker in combined_lower
+                        for marker in ("返程", "返回", "return", "截止", "车站")
+                    )
+                    and not any(
+                        marker in combined_lower
+                        for marker in ("固定预约", "fixed event", "预约冲突")
+                    )
+                )
+            )
+        )
+        false_missing_route_claim = bool(
+            deterministic_route_bindings_pass
+            and any(
+                marker in combined_lower
+                for marker in ("路线证据", "route evidence", "route_evidence", "交通证据")
+            )
+            and any(
+                marker in combined_lower
+                for marker in ("缺少", "缺失", "没有", "未提供", "missing")
+            )
         )
         soft_interest_gap = (
             "interest" in str(issue.issue_type or "").casefold()
@@ -834,6 +934,21 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             and any(
                 marker in combined_lower
                 for marker in ("risk_high_exceeds_limit", "high risk band", "风险区间", "超预算风险")
+            )
+        )
+        deterministic_budget_advisory = bool(
+            "budget" in str(issue.issue_type or "").casefold()
+            and budget_plan.get("source_artifact_id")
+            and budget_plan.get("within_user_limit") is not False
+            and (plan.get("critic") or {}).get("passed") is True
+            and (plan.get("validation_result") or {}).get("passed") is True
+            and not any(
+                marker in combined_lower
+                for marker in (
+                    "超过预算", "超出预算", "合计错误", "算术错误", "未计入",
+                    "漏算", "遗漏固定", "exceeds the budget", "arithmetic error",
+                    "omitted fixed", "missing fixed cost",
+                )
             )
         )
         missing_meal_only = any(
@@ -887,9 +1002,11 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             or bounded_mobility_evidence_gap
             or nonrequired_internal_accessibility_claim
             or deterministic_schedule_advisory
+            or false_missing_route_claim
             or soft_interest_gap
             or soft_preference_gap
             or uncertain_budget_band_only
+            or deterministic_budget_advisory
             or missing_meal_only
             or false_composite_omission
             or unbound_material_issue

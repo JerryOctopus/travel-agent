@@ -22,7 +22,7 @@ from travel_agent.harness import AgentHarness, HarnessEnvironment
 from travel_agent.harness.cases import load_cases_json
 from travel_agent.harness.preflight import preflight_llm
 from travel_agent.harness.product import (
-    DEFAULT_PRODUCT_CASES,
+    DEFAULT_PRODUCT_DEV_CASES,
     PRODUCTION_DATASET_VERSION,
     _execution_case,
     _product_case_output,
@@ -38,11 +38,20 @@ from travel_agent.harness.product import (
     _tooling_fingerprint,
     _tool_snapshot_fingerprint,
     aggregate_product_rows,
-    validate_product_dataset,
     write_product_run,
 )
 from travel_agent.harness.result import HarnessSuiteResult
 from travel_agent.settings import load_settings
+from travel_agent.evaluation.frozen_release_acceptance import (
+    FROZEN_RELEASE_SCHEMA_VERSION,
+    artifact_contract_implementation_fingerprint,
+    load_frozen_split_cases,
+    load_release_manifest,
+    reject_unofficial_frozen_request,
+    validate_frozen_run_request,
+    validate_runtime_against_manifest,
+    validate_shadow_prerequisites,
+)
 
 ALL_AGENT_ROLES = ["attraction", "hotel", "restaurant", "transport", "planner"]
 
@@ -190,13 +199,13 @@ def recorded_model_identity(models: list[dict[str, Any]]) -> tuple[str, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run production_v1.1 (192 cases) with multi-model relay."
+        description="Run Dev34 or an official single-candidate frozen release stage."
     )
-    parser.add_argument("--product-cases", default=str(DEFAULT_PRODUCT_CASES))
+    parser.add_argument("--product-cases", default=str(DEFAULT_PRODUCT_DEV_CASES))
     parser.add_argument(
         "--product-split",
         choices=["dev", "core_frozen", "challenge_frozen", "shadow_frozen", "all"],
-        default="all",
+        default="dev",
     )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
@@ -240,6 +249,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--official-frozen",
+        action="store_true",
+        help="Enforce the pre-registered single-candidate frozen release contract.",
+    )
+    parser.add_argument(
+        "--release-manifest",
+        type=Path,
+        help="Frozen release manifest required by --official-frozen.",
+    )
+    parser.add_argument("--core-acceptance", type=Path)
+    parser.add_argument("--challenge-acceptance", type=Path)
     parser.add_argument("--write-report", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--remediation-complete", action="store_true")
@@ -286,6 +307,7 @@ def build_state_template(
             for provider, model in model_specs
         },
         "model_unavailable": [],
+        "model_preflight": [],
         "model_switch_log": [],
         "rows": [],
     }
@@ -449,15 +471,52 @@ def main() -> None:
     # This entrypoint is exclusively for a real Multi-Agent Full (V3) run;
     # production orchestration is fixed and not configurable here.
 
-    model_specs = parse_models(args.model or DEFAULT_RELAY_MODELS, default_provider)
+    if args.official_frozen and args.release_manifest is None:
+        raise ValueError("--official-frozen requires --release-manifest")
+    model_entries = args.model or (
+        ["deepseek:deepseek-v4-flash"] if args.official_frozen else DEFAULT_RELAY_MODELS
+    )
+    model_specs = parse_models(model_entries, default_provider)
     if not model_specs:
         raise ValueError("No model specified.")
 
-    cases = load_cases_json(args.product_cases)
-    validation = validate_product_dataset(cases)
-    if not validation.valid:
-        raise RuntimeError("invalid production_v1 dataset: " + "; ".join(validation.errors))
-    selected_cases = [case for case in cases if args.product_split == "all" or case.split == args.product_split]
+    release_manifest = None
+    case_source_path = Path(args.product_cases)
+    if args.official_frozen:
+        release_manifest = load_release_manifest(args.release_manifest)
+        request_failures = validate_frozen_run_request(
+            args, settings, model_specs, release_manifest
+        )
+        request_failures.extend(
+            validate_runtime_against_manifest(
+                release_manifest, settings, args.tool_provider
+            )
+        )
+        if _git_revision() != release_manifest.get("commit_sha"):
+            request_failures.append("current git revision differs from release candidate")
+        if args.product_split == "shadow_frozen":
+            request_failures.extend(
+                validate_shadow_prerequisites(
+                    release_manifest,
+                    args.core_acceptance,
+                    args.challenge_acceptance,
+                )
+            )
+        if request_failures:
+            raise RuntimeError(
+                "official frozen run rejected before case loading: "
+                + "; ".join(request_failures)
+            )
+        case_source_path, cases = load_frozen_split_cases(
+            release_manifest, args.product_split
+        )
+        selected_cases = list(cases)
+    else:
+        reject_unofficial_frozen_request(args.product_split)
+        cases = load_cases_json(args.product_cases)
+        if len(cases) != 34 or any(case.split != "dev" for case in cases):
+            raise RuntimeError("nonofficial runner requires the standalone 34-row dev.jsonl")
+        selected_cases = list(cases)
     if args.case_id:
         wanted = set(args.case_id)
         selected_cases = [case for case in selected_cases if case.case_id in wanted]
@@ -512,6 +571,7 @@ def main() -> None:
     if args.preflight and not args.resume:
         print("Preflighting model list...")
         usable: list[tuple[str, str, str]] = []
+        state["model_preflight"] = []
         for provider, model in model_specs:
             api_key = pick_api_key(
                 provider,
@@ -543,6 +603,7 @@ def main() -> None:
                 ),
             )
             result = preflight_llm(model_settings)
+            state["model_preflight"].append(result)
             print(
                 f"[preflight] {provider}:{model} -> "
                 f"{'ok' if result.get('ok') else 'fail'} "
@@ -877,7 +938,7 @@ def main() -> None:
         rows=rows,
         artifacts={
             "dataset_version": PRODUCTION_DATASET_VERSION,
-            "dataset_sha256": _sha256(Path(args.product_cases)),
+            "dataset_sha256": _sha256(case_source_path),
             "code_revision": _git_revision(),
             "model_provider": recorded_provider,
             "model": recorded_model,
@@ -901,6 +962,7 @@ def main() -> None:
             ),
             "evaluator_version": _evaluator_version(),
             "artifact_contract_fingerprint": _artifact_contract_fingerprint(selected_cases),
+            "artifact_contract_implementation_fingerprint": artifact_contract_implementation_fingerprint(),
             "relay_models": state["models"],
             "model_execution_mode": (
                 "model_relay" if relay_enabled else "fixed_single_model"
@@ -913,6 +975,7 @@ def main() -> None:
                     (output.get("execution") or {}).get("provider_reported_models") or []
                 )
             }),
+            "model_preflight": list(state.get("model_preflight") or []),
             "real_multi_agent": True,
             "tool_provider_mode": args.tool_provider,
             "required_agents": sorted({
@@ -931,6 +994,17 @@ def main() -> None:
         stopped_early=stopped_early,
         stop_reason=stop_reason,
     )
+
+    if release_manifest is not None:
+        suite_result.artifacts.update(
+            {
+                "release_manifest_schema_version": FROZEN_RELEASE_SCHEMA_VERSION,
+                "release_candidate_id": release_manifest["candidate_id"],
+                "release_manifest_fingerprint": release_manifest["manifest_fingerprint"],
+                "frozen_split": args.product_split,
+                "frozen_split_sha256": release_manifest["splits"][args.product_split]["sha256"],
+            }
+        )
 
     if args.write_report:
         summary_report = write_product_run(suite_result, output_root, run_id=run_id)

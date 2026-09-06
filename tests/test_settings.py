@@ -29,6 +29,7 @@ def test_env_overrides_toml(tmp_path, monkeypatch):
     assert settings.llm.provider == "deepseek"
     assert settings.llm.api_key == "from_env"  # env 优先于 toml
     assert settings.llm.base_url == "https://api.deepseek.com/v1"
+    assert settings.llm.model == "deepseek-v4-flash"
     assert settings.llm.enabled is True
     assert settings.amap.web_key == "amap_toml"
     assert settings.amap.rest_enabled is True

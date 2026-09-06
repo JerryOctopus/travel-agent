@@ -75,7 +75,7 @@ workflow 不关心底层是 OpenAI、DeepSeek、Qwen，还是规则抽取。
 TRAVEL_AGENT_LLM_PROVIDER=deepseek
 TRAVEL_AGENT_LLM_API_KEY=你的 key
 TRAVEL_AGENT_LLM_BASE_URL=https://api.deepseek.com/v1
-TRAVEL_AGENT_LLM_MODEL=deepseek-chat
+TRAVEL_AGENT_LLM_MODEL=deepseek-v4-flash
 TRAVEL_AGENT_LLM_TIMEOUT_SECONDS=20
 ```
 

@@ -97,10 +97,10 @@ def test_single_model_run_records_actual_identity() -> None:
 
 def test_single_model_execution_is_not_reported_as_model_relay() -> None:
     assert relay_mode_enabled([
-        {"provider": "deepseek", "model": "deepseek-chat"}
+        {"provider": "deepseek", "model": "deepseek-v4-flash"}
     ]) is False
     assert relay_mode_enabled([
-        {"provider": "deepseek", "model": "deepseek-chat"},
+        {"provider": "deepseek", "model": "deepseek-v4-flash"},
         {"provider": "qwen", "model": "qwen-max"},
     ]) is True
 

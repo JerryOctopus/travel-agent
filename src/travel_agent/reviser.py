@@ -5,6 +5,7 @@ import math
 
 from travel_agent.critic import (
     INTEREST_TO_CATEGORIES,
+    _has_lunch_window,
     critique_itinerary,
     poi_complies_with_dietary,
     poi_matches_interest,
@@ -12,7 +13,7 @@ from travel_agent.critic import (
     requested_interests,
 )
 from travel_agent.planning import (
-    ACTIVITY_TIMES, MEAL_TIMES, START_TIMES, _daily_opening_window,
+    ACTIVITY_TIMES, MEAL_TIMES, MEAL_TIME_WINDOWS, START_TIMES, _daily_opening_window,
     poi_open_on_trip_day,
 )
 from travel_agent.poi_evidence import is_verified_plannable_poi, poi_avoid_match
@@ -48,6 +49,9 @@ def revise_itinerary(
         elif issue.code == "interest_not_covered":
             revised, changed = _ensure_interest_coverage(revised, ranked_pois, profile)
             notes.extend(changed)
+        elif issue.code == "meal_break_missing":
+            revised, changed = _make_room_for_meal_window(revised, profile)
+            notes.extend(changed)
 
     if any(
         issue.code in {"route_too_long", "daily_route_too_long", "walking_distance_exceeded"}
@@ -76,6 +80,51 @@ def revise_itinerary(
     return revised, revised_result, _reconcile_revision_notes(notes, revised, profile)
 
 
+def _make_room_for_meal_window(
+    itinerary: Itinerary,
+    profile: TravelProfile,
+) -> tuple[Itinerary, list[str]]:
+    """Apply the user's explicit shortlist-pruning permission for a real meal."""
+    state = profile.constraint_state or {}
+    if state.get("candidate_only") is not True:
+        return itinerary, []
+    fixed_terms = {
+        str(event.get("location") or "").strip()
+        for event in state.get("fixed_events") or []
+        if isinstance(event, dict) and str(event.get("location") or "").strip()
+    }
+    days: list[ItineraryDay] = []
+    notes: list[str] = []
+    for day in itinerary.days:
+        stops = list(day.stops)
+        if _has_lunch_window(day):
+            days.append(day)
+            continue
+        removable = [
+            index for index, stop in enumerate(stops)
+            if stop.poi.category != "food"
+            and not any(poi_matches_must_visit(stop.poi, term) for term in profile.must_visit)
+            and not any(poi_matches_must_visit(stop.poi, term) for term in fixed_terms)
+        ]
+        selected: tuple[int, list[ItineraryStop]] | None = None
+        for index in removable:
+            candidate_stops = [stop for offset, stop in enumerate(stops) if offset != index]
+            candidate_day = replace(day, stops=candidate_stops)
+            if _has_lunch_window(candidate_day):
+                selected = index, candidate_stops
+                break
+        if selected is None:
+            days.append(day)
+            continue
+        removed_index, kept = selected
+        removed = stops[removed_index]
+        days.append(replace(day, stops=kept, theme=_make_day_theme(kept)))
+        notes.append(
+            f"为保留可执行用餐窗口，按候选取舍授权删减 `{removed.poi.name}`。"
+        )
+    return replace(itinerary, days=days), notes
+
+
 def _repair_long_routes(
     itinerary: Itinerary,
     ranked_pois: list[ScoredPOI],
@@ -99,7 +148,10 @@ def _repair_long_routes(
     pool = [
         item
         for item in ranked_pois
-        if item.poi.poi_id not in used_ids
+        # A verified restaurant may truthfully be recommended on more than one
+        # day. Reusing a nearby compatible meal is preferable to deleting the
+        # day's only grounded meal when no distinct local alternative exists.
+        if (item.poi.poi_id not in used_ids or item.poi.category == "food")
         and item.poi.category not in {"hotel", "transport"}
         and (item.poi.category != "food" or poi_complies_with_dietary(item.poi, profile))
         and poi_avoid_match(item.poi, profile) is None
@@ -185,6 +237,7 @@ def _repair_long_routes(
                 removable,
                 key=lambda index: (
                     _isolation_score(stops, index),
+                    stops[index].poi.category == "food",
                     any(
                         item.poi.category == stops[index].poi.category
                         for item in pool
@@ -199,7 +252,16 @@ def _repair_long_routes(
             if 0 <= index < len(stops)
         ]
         replacement_pool = (
-            [item for item in pool if item.poi.category == "food"]
+            [
+                item for item in pool
+                if item.poi.category == "food"
+                and item.poi.poi_id != culprit.poi.poi_id
+                and all(
+                    stop.poi.poi_id != item.poi.poi_id
+                    for index, stop in enumerate(stops)
+                    if index != culprit_index
+                )
+            ]
             if culprit.poi.category == "food"
             else [item for item in pool if item.poi.category != "food"]
         )
@@ -430,7 +492,6 @@ def _fill_sparse_activity_days(
         if (
             day.day_index in fixed_days
             or activity_count >= 2
-            or len(stops) >= _max_stops_per_day(profile)
         ):
             days.append(day)
             continue
@@ -480,43 +541,56 @@ def _fill_missing_meal_days(
 ) -> tuple[Itinerary, list[str]]:
     """Restore one nearby, dietary-compliant meal after route repairs."""
     used_ids = _used_poi_ids(itinerary)
-    pool = [
+    candidates = [
         item
         for item in ranked_pois
-        if item.poi.poi_id not in used_ids
-        and item.poi.category == "food"
+        if item.poi.category == "food"
         and poi_complies_with_dietary(item.poi, profile)
     ]
     notes: list[str] = []
     days: list[ItineraryDay] = []
     for day in itinerary.days:
         stops = list(day.stops)
-        if any(stop.poi.category == "food" for stop in stops) or not pool:
+        if any(stop.poi.category == "food" for stop in stops) or not candidates:
             days.append(day)
             continue
         anchors = [stop.poi for stop in stops]
-        candidate = min(
-            pool,
-            key=lambda item: (
-                max((_haversine_km(item.poi, anchor) for anchor in anchors), default=0.0),
-                -item.score,
-            ),
-        )
-        max_anchor_distance = max(
-            (_haversine_km(candidate.poi, anchor) for anchor in anchors),
-            default=0.0,
-        )
         meal_fill_radius_km = {
             "relaxed": 10.0,
             "standard": 15.0,
             "intensive": 25.0,
         }[profile.pace]
-        if anchors and max_anchor_distance > meal_fill_radius_km:
+        day_candidates = [
+            (
+                item,
+                min(
+                    (_haversine_km(item.poi, anchor) for anchor in anchors),
+                    default=0.0,
+                ),
+            )
+            for item in candidates
+            if poi_open_on_trip_day(item.poi, profile, day.day_index)
+        ]
+        viable = [
+            (item, distance)
+            for item, distance in day_candidates
+            if not anchors or distance <= meal_fill_radius_km
+        ]
+        if not viable:
             # A meal-completeness repair must not undo a prior long-route
             # repair. The renderer can truthfully reserve an unspecific meal
             # window when no dietary-compliant evidenced venue is nearby.
             days.append(day)
             continue
+        candidate, _distance = min(
+            viable,
+            key=lambda pair: (
+                pair[0].poi.poi_id in used_ids,
+                pair[1],
+                -pair[0].score,
+            ),
+        )
+        reused = candidate.poi.poi_id in used_ids
         meal_stop = _stop_from_scored(candidate, MEAL_TIMES[0])
         if len(stops) < _max_stops_per_day(profile):
             stops.append(meal_stop)
@@ -534,9 +608,11 @@ def _fill_missing_meal_days(
                 days.append(day)
                 continue
             stops[replaceable[-1]] = meal_stop
-        pool.remove(candidate)
         used_ids.add(candidate.poi.poi_id)
-        notes.append(f"为补全第{day.day_index}天用餐，增加 `{candidate.poi.name}`。")
+        action = "复用" if reused else "增加"
+        notes.append(
+            f"为补全第{day.day_index}天用餐，{action} `{candidate.poi.name}`。"
+        )
         days.append(replace(day, stops=stops, theme=_make_day_theme(stops)))
     return replace(itinerary, days=days), notes
 
@@ -670,6 +746,9 @@ def _schedule_stops(stops: list[ItineraryStop]) -> list[ItineraryStop]:
             start_minutes = max(start_minutes, _round_up_to_quarter(earliest))
         if stop.poi.category == "food":
             start_minutes = _next_meal_time_minutes(start_minutes)
+        opening_window = _daily_opening_window(stop.poi.opening_hours)
+        if opening_window is not None:
+            start_minutes = max(start_minutes, opening_window[0])
         retimed.append(_retime_stop(stop, _minutes_to_time(start_minutes)))
     return retimed
 
@@ -700,7 +779,10 @@ def _minutes_to_time(value: int) -> str:
 
 
 def _next_meal_time_minutes(earliest: int) -> int:
-    for slot in [*MEAL_TIMES, "19:00"]:
+    # Keep a delayed lunch in the lunch window.  Jumping directly from the
+    # canonical 11:30 slot to 18:00 creates a false half-day gap whenever an
+    # earlier activity plus transfer ends around noon.
+    for slot in MEAL_TIME_WINDOWS:
         minutes = _time_to_minutes(slot)
         if minutes >= earliest:
             return minutes

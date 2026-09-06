@@ -40,7 +40,7 @@ DEV34_EXPECTED_ARTIFACTS = {
     for case_id in DEV34_CASE_IDS
 }
 DEV34_DATASET_VERSION = "travel-agent-eval-production-v1.1"
-DEV34_DATASET_SHA256 = "ff47dfa5d429baae1a173095fef8d1626f59ae32424407e4b38bf649c71de477"
+DEV34_DATASET_SHA256 = "6460b21b8a7c95a5b989fb17472e2dc67c52af16d2a81c2f1290efcf221d91f3"
 DEV34_EVALUATOR_VERSION = "product-v1.1+dev34-artifact-contract-v3"
 DEV34_ARTIFACT_CONTRACT_FINGERPRINT = (
     "7478fe592648c408fad4b4600e0619c2298120bb1f82a221fbd097ba3a4b180c"
@@ -65,6 +65,8 @@ FINGERPRINT_FIELDS = (
     "model",
     "model_temperature",
     "model_thinking_enabled",
+    "provider_reported_models",
+    "model_preflight",
     "tool_provider_mode",
     "hybrid_flags",
     "judge_provider",
@@ -150,13 +152,13 @@ def evaluate_dev34_run(
     _require(len(full_rows) == 22, failures, f"full-itinerary contract must be 22, got {len(full_rows)}")
     _require(len(non_rows) == 12, failures, f"non-itinerary contract must be 12, got {len(non_rows)}")
     _require(len(long_rows) == 4, failures, f"long-horizon contract must be 4, got {len(long_rows)}")
-    _require(len(strict) >= 26, failures, f"strict success {len(strict)}/34 is below 26")
-    _require(len(full_strict) >= 16, failures, f"full-itinerary success {len(full_strict)}/22 is below 16")
-    _require(len(non_strict) >= 9, failures, f"non-itinerary success {len(non_strict)}/12 is below 9")
-    _require(len(long_strict) >= 3, failures, f"long-horizon strict {len(long_strict)}/4 is below 3")
+    _require(len(strict) >= 30, failures, f"strict success {len(strict)}/34 is below 30")
+    _require(len(full_strict) >= 19, failures, f"full-itinerary success {len(full_strict)}/22 is below 19")
+    _require(len(non_strict) >= 11, failures, f"non-itinerary success {len(non_strict)}/12 is below 11")
+    _require(len(long_strict) >= 4, failures, f"long-horizon strict {len(long_strict)}/4 is below 4")
 
     boolean_gates = {
-        "hard_constraints_ok": 31,
+        "hard_constraints_ok": 33,
         "grounding_ok": 34,
         "authorization_ok": 34,
         "tool_schema_valid": 34,
@@ -174,7 +176,27 @@ def evaluate_dev34_run(
     _require(not redlines, failures, "redline cases: " + ", ".join(redlines))
 
     _require(artifacts.get("model_provider") == "deepseek", failures, "model provider must be deepseek")
-    _require(artifacts.get("model") == "deepseek-chat", failures, "model must be deepseek-chat")
+    _require(artifacts.get("model") == "deepseek-v4-flash", failures, "model must be deepseek-v4-flash")
+    provider_models = artifacts.get("provider_reported_models") or []
+    _require(
+        isinstance(provider_models, list)
+        and bool(provider_models)
+        and all(isinstance(item, str) and item.strip() for item in provider_models),
+        failures,
+        "provider-reported model identity must be recorded",
+    )
+    preflights = artifacts.get("model_preflight") or []
+    preflight_ok = (
+        isinstance(preflights, list)
+        and len(preflights) == 1
+        and preflights[0].get("ok") is True
+        and preflights[0].get("provider") == "deepseek"
+        and preflights[0].get("model") == "deepseek-v4-flash"
+        and preflights[0].get("provider_reported_model") in provider_models
+        and _same_number(preflights[0].get("temperature"), 0.2)
+        and preflights[0].get("thinking_enabled") is False
+    )
+    _require(preflight_ok, failures, "real DeepSeek V4 Flash preflight identity/config must be recorded")
     _require(_same_number(artifacts.get("model_temperature"), 0.2), failures, "model temperature must be 0.2")
     _require(artifacts.get("model_thinking_enabled") is False, failures, "model thinking must be disabled")
     _require(artifacts.get("tool_provider_mode") == "configured", failures, "tool provider must be configured")
@@ -242,11 +264,11 @@ def evaluate_dev34_run(
         if completed_judges else None
     )
     if require_judge:
-        _require(len(judge_cases) >= 16, failures, f"Judge-eligible complete itineraries {len(judge_cases)} is below 16")
+        _require(len(judge_cases) >= 19, failures, f"Judge-eligible complete itineraries {len(judge_cases)} is below 19")
         _require(len(completed_judges) == len(judge_cases), failures, f"Judge completion {len(completed_judges)}/{len(judge_cases)} is not 100%")
-        _require(judge_average is not None and judge_average >= 75, failures, f"Judge average {judge_average} is below 75")
-        _require(judge_reasonable_rate is not None and judge_reasonable_rate >= 0.70, failures, f"Judge reasonable rate {judge_reasonable_rate} is below 0.70")
-        _require(critical_issue_rate is not None and critical_issue_rate <= 0.20, failures, f"Judge critical issue rate {critical_issue_rate} exceeds 0.20")
+        _require(judge_average is not None and judge_average >= 80, failures, f"Judge average {judge_average} is below 80")
+        _require(judge_reasonable_rate is not None and judge_reasonable_rate >= 0.75, failures, f"Judge reasonable rate {judge_reasonable_rate} is below 0.75")
+        _require(critical_issue_rate is not None and critical_issue_rate <= 0.15, failures, f"Judge critical issue rate {critical_issue_rate} exceeds 0.15")
         _require(
             artifacts.get("judge_provider") == DEV34_JUDGE_PROVIDER,
             failures,
@@ -295,6 +317,7 @@ def evaluate_dev34_run(
     _check_summary_consistency(metrics, len(strict), len(full_strict), len(non_strict), gate_counts, failures)
     return {
         "passed": not failures,
+        "status": "invalid" if execution_errors else ("accepted" if not failures else "rejected"),
         "mode": "full_with_judge" if require_judge else "deterministic_only",
         "run_dir": str(root),
         "counts": {

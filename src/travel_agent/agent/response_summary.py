@@ -171,7 +171,8 @@ def build_plan_reply_text(ctx: SessionContext, plan_artifact_id: str | None = No
     if isinstance(return_plan, dict) and return_plan.get("required"):
         lines.append(
             "返程计划：最晚 "
-            f"{return_plan.get('activity_cutoff')} 结束杭州活动，"
+            f"{return_plan.get('activity_cutoff')} 结束"
+            f"{return_plan.get('from_city') or profile.destination or '当地'}活动，"
             f"选择 {return_plan.get('arrival_deadline')} 前抵达"
             f"{return_plan.get('to_location')}的公共交通班次；"
             "实时车次、余票与检票时间需在购票平台复核。"
