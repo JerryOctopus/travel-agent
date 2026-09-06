@@ -731,6 +731,25 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
         for check in (plan.get("validation_result") or {}).get("checks_run") or []
         if str(check).strip()
     }
+    fixed_event_plan_items = [
+        event
+        for event in (plan.get("fixed_event_plan") or {}).get("events") or []
+        if isinstance(event, dict)
+    ]
+    verified_fixed_event_schedule = bool(
+        fixed_events
+        and len(fixed_event_plan_items) >= len(fixed_events)
+        and "schedule_route_feasibility" in validation_checks
+        and (plan.get("critic") or {}).get("passed") is True
+        and (plan.get("validation_result") or {}).get("passed") is True
+        and all(
+            event.get("route_evidence_status") in {
+                "provider_verified", "deterministic_estimate"
+            }
+            and bool(event.get("recommended_departure"))
+            for event in fixed_event_plan_items
+        )
+    )
     hard_mobility_evidence_required = bool(
         state.get("wheelchair_user")
         or state.get("accessibility_priority")
@@ -965,6 +984,23 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
                 )
             )
         )
+        verified_fixed_event_schedule_advisory = bool(
+            verified_fixed_event_schedule
+            and any(
+                marker in combined_lower
+                for marker in (
+                    "fixed_event", "fixed event", "固定事件", "固定预约",
+                    "预约", "晚饭", "晚餐", "午饭", "午餐",
+                )
+            )
+            and any(
+                marker in combined_lower
+                for marker in (
+                    "时间冲突", "时间不足", "来不及", "迟到",
+                    "schedule conflict", "insufficient time", "too late",
+                )
+            )
+        )
         verified_return_feasibility_advisory = bool(
             verified_return_anchor
             and "return" in str(issue.issue_type or "").casefold()
@@ -1131,6 +1167,7 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             or bounded_mobility_evidence_gap
             or nonrequired_internal_accessibility_claim
             or deterministic_schedule_advisory
+            or verified_fixed_event_schedule_advisory
             or verified_return_feasibility_advisory
             or soft_schedule_rhythm_advisory
             or false_missing_route_claim

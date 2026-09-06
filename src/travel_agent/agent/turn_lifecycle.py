@@ -183,6 +183,12 @@ def _sync_profile_constraints(profile: Any) -> None:
         ]
     if state.get("lodging_area"):
         profile.hotel_area = str(state["lodging_area"])
+    if state.get("pace") in {"relaxed", "standard", "intensive"}:
+        # Constraint events are the latest-write-wins source of truth.  A
+        # later rebuild request may not repeat the pace directive, so leaving
+        # the compact profile unchanged here would silently plan with a stale
+        # default while the active constraint hash says otherwise.
+        profile.pace = str(state["pace"])
     if state.get("budget_max_cny") is not None:
         profile.budget_limit = float(state["budget_max_cny"])
         people = int(profile.party_size or state.get("traveler_count") or 1)

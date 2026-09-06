@@ -1370,6 +1370,62 @@ def test_reviewer_keeps_schedule_conflict_recoverable_with_fixed_event():
     assert review.issues[0].severity == "recoverable"
 
 
+def test_reviewer_defers_to_verified_fixed_event_schedule_arithmetic() -> None:
+    ctx = ReviewContext(
+        request_id="req_verified_fixed_event_schedule",
+        plan={
+            "itinerary": {"days": [{"day_index": 2, "stops": [{
+                "start_time": "14:45",
+                "duration_min": 90,
+                "poi": {"poi_id": "museum", "name": "城市博物馆"},
+            }]}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {
+                "passed": True,
+                "issues": [],
+                "checks_run": ["schedule_route_feasibility", "fixed_events"],
+            },
+            "fixed_event_plan": {"events": [{
+                "day": 2,
+                "start": "18:00",
+                "end": "20:00",
+                "location": "预约区域",
+                "recommended_departure": "16:48",
+                "route_evidence_status": "provider_verified",
+            }]},
+        },
+        profile_brief={"constraint_state": {"fixed_events": [{
+            "day": 2,
+            "start": "18:00",
+            "end": "20:00",
+            "location": "预约区域",
+        }]}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "cross_domain_consistency",
+                "severity": "recoverable",
+                "description": (
+                    "博物馆16:15结束，固定预约建议16:48前出发，"
+                    "但可用时间不足，存在时间冲突。"
+                ),
+                "evidence": [
+                    "itinerary.days[1].stops[0]",
+                    "fixed_event_plan.events[0].recommended_departure=16:48",
+                ],
+                "repair_target": "planner",
+                "repair_instruction": "调整预约前活动。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
 def test_reviewer_defers_to_verified_return_anchor_for_return_schedule_claim():
     ctx = ReviewContext(
         request_id="req_verified_return_schedule",

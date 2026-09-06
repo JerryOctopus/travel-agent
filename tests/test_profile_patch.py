@@ -159,6 +159,16 @@ def test_constraint_state_syncs_and_sanitizes_compact_profile() -> None:
     assert ctx.profile.constraint_state["must_visit"] == ["鼓浪屿"]
 
 
+def test_constraint_state_syncs_latest_explicit_pace_to_compact_profile() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile.pace = "standard"
+    ctx.profile.constraint_state = {"pace": "relaxed"}
+
+    _sync_profile_constraints(ctx.profile)
+
+    assert ctx.profile.pace == "relaxed"
+
+
 def test_constraint_state_sync_lets_avoid_override_stale_must_visit() -> None:
     ctx = build_session(persist=False)
     ctx.profile.must_visit = ["外滩", "迪士尼"]
