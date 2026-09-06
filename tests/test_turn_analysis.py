@@ -986,6 +986,23 @@ def test_state_only_followup_does_not_launch_search_or_planner(offline_settings)
     assert ctx.profile.constraint_state["max_walking_km_per_day"] == 6
 
 
+def test_new_safety_constraint_rebuilds_current_plan_without_defer_wording(
+    offline_settings,
+) -> None:
+    ctx = _ctx_with_itinerary()
+
+    prepared = prepare_turn(
+        "补充一下，其中一位是72岁老人，每天步行控制在6公里以内。",
+        ctx,
+        offline_settings,
+        [("user", "请安排三天完整行程")],
+    )
+
+    assert prepared.analysis.delivery_intent == DeliveryIntent.REBUILD_NOW
+    assert prepared.early_reply is None
+    assert ctx.profile.constraint_state["max_walking_km_per_day"] == 6
+
+
 def test_ordinal_day_is_reference_not_duration_variant() -> None:
     patches = build_rule_patches("第三天下午保留自由活动", TaskType.LOCAL_ADJUSTMENT)
     state = build_rule_constraint_state("第三天下午保留自由活动", patches)

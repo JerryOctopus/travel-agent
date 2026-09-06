@@ -307,6 +307,12 @@ _ADDITIVE_CONSTRAINT_FIELDS = frozenset({
     "must_visit", "candidate_attractions", "fixed_events", "interests",
     "dietary", "transport_modes", "avoid", "exclude", "optional_remove",
 })
+_IMMEDIATE_SAFETY_REBUILD_FIELDS = frozenset({
+    "mobility", "wheelchair_user", "accessibility_priority",
+    "walking_time_max_min", "max_single_walk_min", "max_walking_km_per_day",
+    "max_transfers_per_day", "return_deadline", "return_deadline_local_time",
+    "return_deadline_day", "return_location", "activity_end_deadline",
+})
 _STATE_PROFILE_ALIASES: dict[str, str] = {
     "date_start": "start_date",
     "duration_days": "days",
@@ -462,6 +468,16 @@ def classify_delivery_intent(
         return DeliveryIntent.LIGHTWEIGHT_ADVICE
     if task_type == TaskType.LOCAL_ADJUSTMENT_ADVICE:
         return DeliveryIntent.LIGHTWEIGHT_ADVICE
+    if (
+        _has_current_plan(ctx)
+        and not deferred
+        and task_type in {TaskType.FULL_ITINERARY, TaskType.ITINERARY_PATCH}
+        and _IMMEDIATE_SAFETY_REBUILD_FIELDS.intersection(state)
+    ):
+        # A newly introduced safety boundary changes whether the already
+        # delivered itinerary is usable. Apply it immediately unless the user
+        # explicitly asks us to collect constraints for a later final build.
+        return DeliveryIntent.REBUILD_NOW
     if rebuild_pending:
         return DeliveryIntent.STATE_UPDATE_ONLY
     if task_type == TaskType.ITINERARY_PATCH and _has_local_patch_target(text, state):

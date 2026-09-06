@@ -2471,11 +2471,30 @@ def _build_fixed_event_plan(
             == normalize_entity_name(location)
         ), None)
         anchor_routes = list((anchor or {}).get("routes") or [])
-        route = next((
+        declared_origin = str((anchor or {}).get("origin_poi_id") or "")
+        event_poi_id = str((anchor or {}).get("event_poi_id") or "")
+        verified_routes = [
             item for item in anchor_routes
             if isinstance(item, dict)
             and canonical_route_evidence_status(item) == "provider_verified"
-        ), None)
+            and (
+                not event_poi_id
+                or str(item.get("destination_poi_id") or "") == event_poi_id
+            )
+        ]
+        route = next((
+            item for item in verified_routes
+            if declared_origin
+            and str(item.get("origin_poi_id") or "") == declared_origin
+            and str(item.get("mode") or "") == profile.transport_mode
+        ), None) or next((
+            item for item in verified_routes
+            if declared_origin
+            and str(item.get("origin_poi_id") or "") == declared_origin
+        ), None) or next((
+            item for item in verified_routes
+            if str(item.get("mode") or "") == profile.transport_mode
+        ), None) or next(iter(verified_routes), None)
         day_index = None
         try:
             if event.get("day") is not None:
@@ -2487,7 +2506,6 @@ def _build_fixed_event_plan(
                 ).days + 1
         except (TypeError, ValueError):
             day_index = None
-        event_poi_id = str((anchor or {}).get("event_poi_id") or "")
         # If the appointment is the day's first itinerary stop, the concrete
         # departure context is the selected hotel. A short subvenue-to-parent
         # route inside the appointment complex must not masquerade as the

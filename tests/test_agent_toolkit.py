@@ -663,6 +663,58 @@ def test_fixed_event_plan_uses_hotel_departure_leg_when_event_is_first_stop() ->
     assert event["route_evidence_status"] == "haversine_estimate"
 
 
+def test_fixed_event_plan_uses_route_from_declared_preceding_stop() -> None:
+    profile = TravelProfile(
+        destination="测试城",
+        days=2,
+        start_date="2026-10-03",
+        transport_mode="public_transport",
+        constraint_state={
+            "fixed_events": [{
+                "day": 2,
+                "start": "14:30",
+                "end": "16:30",
+                "location": "预约博物馆",
+            }],
+        },
+    )
+    required = {
+        "legs": [{
+            "kind": "fixed_event_transfer",
+            "required_name": "预约博物馆",
+            "origin_poi_id": "preceding-stop",
+            "event_poi_id": "event",
+            "routes": [
+                {
+                    "origin_poi_id": "unrelated-stop",
+                    "destination_poi_id": "event",
+                    "distance_km": 42.0,
+                    "duration_min": 107,
+                    "mode": "public_transport",
+                    "source": "amap",
+                    "evidence_status": "provider_verified",
+                },
+                {
+                    "origin_poi_id": "preceding-stop",
+                    "destination_poi_id": "event",
+                    "distance_km": 5.0,
+                    "duration_min": 51,
+                    "mode": "public_transport",
+                    "source": "amap",
+                    "evidence_status": "provider_verified",
+                },
+            ],
+        }],
+    }
+
+    plan = toolkit._build_fixed_event_plan(profile, {}, required, {})
+    event = plan["events"][0]
+
+    assert event["route_evidence_reference"]["origin_poi_id"] == "preceding-stop"
+    assert event["transfer_duration_min"] == 51
+    assert event["recommended_departure"] == "13:24"
+
+
 def test_required_fixed_event_anchor_rebinds_to_verified_hotel_leg() -> None:
     anchors = {
         "legs": [{

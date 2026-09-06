@@ -753,6 +753,41 @@ def test_reviewer_downgrades_soft_route_limit_and_budget_risk_band():
     assert {issue.severity for issue in review.issues} == {"noncritical"}
 
 
+def test_reviewer_does_not_treat_default_transport_as_user_taxi_prohibition():
+    ctx = ReviewContext(
+        request_id="req_default_transport_fallback",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True},
+        },
+        profile_brief={
+            "transport_mode": "public_transport",
+            "constraint_state": {"budget_max_cny": 1800},
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "transport_mode_conflict",
+                "severity": "recoverable",
+                "description": (
+                    "行程使用 taxi，但 profile.transport_mode=public_transport，"
+                    "且没有 taxi_backup，违反用户明确公共交通要求。"
+                ),
+                "evidence": ["itinerary.days[0]"],
+                "repair_target": "planner",
+                "repair_instruction": "改用公共交通。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
 def test_reviewer_treats_unrequested_internal_accessibility_as_advisory():
     ctx = ReviewContext(
         request_id="req_bounded_mobility",

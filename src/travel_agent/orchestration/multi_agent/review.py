@@ -860,6 +860,21 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             )
             and (plan.get("critic") or {}).get("passed") is True
         )
+        default_transport_fallback_claim = bool(
+            not state.get("public_transport_required")
+            and state.get("transport_mode") in (None, "")
+            and any(marker in combined_lower for marker in ("taxi", "出租车", "打车"))
+            and any(
+                marker in combined_lower
+                for marker in ("public_transport", "公共交通", "公交")
+            )
+            and any(
+                marker in combined_lower
+                for marker in ("违反", "冲突", "禁止", "prohibit", "conflict")
+            )
+            and (plan.get("critic") or {}).get("passed") is True
+            and (plan.get("validation_result") or {}).get("passed") is True
+        )
         bounded_mobility_evidence_gap = bool(
             bounded_taxi_fallback
             and not state.get("wheelchair_user")
@@ -999,6 +1014,7 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             or unrequested_lodging_gap
             or soft_route_pace_claim
             or soft_route_evidence_gap
+            or default_transport_fallback_claim
             or bounded_mobility_evidence_gap
             or nonrequired_internal_accessibility_claim
             or deterministic_schedule_advisory
