@@ -556,12 +556,21 @@ class FallbackToolProvider:
         destination: POI,
         mode: TransportMode = "public_transport",
     ) -> RouteInfo:
-        try:
-            route = self.primary.estimate_route(origin, destination, mode)
-        except ProviderRateLimitError:
-            raise
-        except Exception:
-            route = None
+        route: RouteInfo | None = None
+        for _attempt in range(2):
+            try:
+                route = self.primary.estimate_route(origin, destination, mode)
+            except ProviderRateLimitError:
+                # Account-level provider failure is never retried or hidden.
+                raise
+            except Exception:
+                route = None
+            if (
+                route
+                and route.duration_min > 0
+                and "fallback_estimate" not in str(route.source or "").casefold()
+            ):
+                return route
         if route and route.duration_min > 0:
             return route
         return self.fallback.estimate_route(origin, destination, mode)

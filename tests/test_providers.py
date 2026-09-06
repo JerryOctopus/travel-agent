@@ -9,7 +9,7 @@ from travel_agent.providers import (
     LocalToolProvider,
     ProviderRateLimitError,
 )
-from travel_agent.schemas import POI, WeatherInfo
+from travel_agent.schemas import POI, RouteInfo, WeatherInfo
 
 
 class _JSONResponse:
@@ -65,6 +65,61 @@ def test_fallback_tool_provider_uses_local_when_primary_fails() -> None:
     assert provider.search_pois("杭州")[0].name == "西湖"
     assert provider.get_weather("杭州").source == "mock"
     assert provider.estimate_route(_poi("西湖"), _poi("灵隐寺")).source == "haversine_estimate"
+
+
+def test_fallback_tool_provider_retries_transient_primary_route_once() -> None:
+    calls = 0
+
+    class FlakyPrimary:
+        def estimate_route(self, origin, destination, mode):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ConnectionError("temporary route connection failure")
+            return RouteInfo(
+                origin_poi_id=origin.poi_id,
+                destination_poi_id=destination.poi_id,
+                distance_km=2.1,
+                duration_min=18,
+                mode=mode,
+                source="amap",
+                evidence_status="provider_verified",
+            )
+
+    provider = FallbackToolProvider(
+        primary=FlakyPrimary(),
+        fallback=LocalToolProvider([_poi()]),
+    )
+
+    route = provider.estimate_route(
+        replace(_poi("甲馆"), poi_id="origin"),
+        replace(_poi("乙馆"), poi_id="destination"),
+    )
+
+    assert calls == 2
+    assert route.source == "amap"
+    assert route.evidence_status == "provider_verified"
+
+
+def test_fallback_tool_provider_never_retries_provider_quota_route() -> None:
+    calls = 0
+
+    class LimitedPrimary:
+        def estimate_route(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            raise ProviderRateLimitError(
+                "AMap rate limit: USER_DAILY_QUERY_OVER_LIMIT (10044)"
+            )
+
+    provider = FallbackToolProvider(
+        primary=LimitedPrimary(),
+        fallback=LocalToolProvider([_poi()]),
+    )
+
+    with pytest.raises(ProviderRateLimitError, match="10044"):
+        provider.estimate_route(_poi("甲馆"), _poi("乙馆"))
+    assert calls == 1
 
 
 def test_fallback_tool_provider_does_not_hide_primary_rate_limit() -> None:
