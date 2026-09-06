@@ -997,6 +997,56 @@ def test_reviewer_keeps_unknown_route_recoverable_for_hard_timed_event():
     assert review.issues[0].severity == "recoverable"
 
 
+def test_reviewer_accepts_bound_internal_routes_when_summary_says_no_route_evidence():
+    ctx = ReviewContext(
+        request_id="req_bound_internal_routes",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": [
+                {"poi": {"poi_id": "a", "name": "甲馆"}},
+                {
+                    "poi": {"poi_id": "b", "name": "乙馆"},
+                    "route_from_previous": {
+                        "origin_poi_id": "a",
+                        "destination_poi_id": "b",
+                        "evidence_status": "provider_verified",
+                        "source": "amap",
+                    },
+                },
+            ]}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+        },
+        profile_brief={
+            "constraint_state": {
+                "fixed_events": [
+                    {"day": 2, "start": "15:00", "end": "17:00", "location": "远郊展馆"}
+                ]
+            }
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "route_evidence_gap",
+                "severity": "recoverable",
+                "description": (
+                    "Only the fixed_event_transfer is summarized separately; "
+                    "there is no route evidence between consecutive stops "
+                    "within the same day."
+                ),
+                "evidence": ["itinerary.days[0].stops"],
+                "repair_target": "transport",
+                "repair_instruction": "Add route evidence.",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
 def test_reviewer_downgrades_bounded_lodging_route_unrelated_to_return_deadline():
     ctx = ReviewContext(
         request_id="req_bounded_lodging_route",

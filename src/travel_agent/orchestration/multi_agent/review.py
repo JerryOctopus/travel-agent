@@ -960,7 +960,10 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             )
             and any(
                 marker in combined_lower
-                for marker in ("缺少", "缺失", "没有", "未提供", "missing")
+                for marker in (
+                    "缺少", "缺失", "没有", "未提供", "missing",
+                    "no route evidence",
+                )
             )
         )
         soft_interest_gap = (
