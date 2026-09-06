@@ -6,9 +6,9 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from urllib.error import HTTPError, URLError
+from urllib.error import URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -16,43 +16,14 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from travel_agent.settings import get_settings
+from travel_agent.harness.preflight import preflight_llm
 
 
 def _check_llm(settings) -> dict:
     llm = settings.llm
     if not llm.enabled:
         return {"ok": True, "skipped": True, "detail": "provider=rule 或无 api_key，走离线兜底"}
-    url = f"{llm.base_url.rstrip('/')}/chat/completions"
-    payload = {
-        "model": llm.model,
-        "messages": [{"role": "user", "content": "ping"}],
-        "max_tokens": 5,
-    }
-    if llm.model.startswith("glm-"):
-        payload["thinking"] = {
-            "type": "enabled" if llm.thinking_enabled else "disabled"
-        }
-    elif llm.model.startswith("qwen3"):
-        payload["enable_thinking"] = llm.thinking_enabled
-    body = json.dumps(payload).encode()
-    req = Request(
-        url,
-        data=body,
-        headers={"Authorization": f"Bearer {llm.api_key}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(req, timeout=llm.timeout_seconds) as resp:
-            resp.read()
-        return {
-            "ok": True,
-            "model": llm.model,
-            "thinking_enabled": llm.thinking_enabled,
-        }
-    except HTTPError as exc:
-        return {"ok": False, "status": exc.code, "detail": exc.read().decode()[:200]}
-    except URLError as exc:
-        return {"ok": False, "detail": str(exc.reason)}
+    return preflight_llm(settings)
 
 
 def _check_amap(settings) -> dict:

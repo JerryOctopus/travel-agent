@@ -29,6 +29,14 @@ def _settings():
     )
 
 
+def test_llm_preflight_uses_shared_provider_aware_probe(monkeypatch) -> None:
+    settings = SimpleNamespace(llm=SimpleNamespace(enabled=True))
+    expected = {"ok": True, "provider_reported_model": "deepseek-v4-flash"}
+    monkeypatch.setattr(validate_api_keys, "preflight_llm", lambda value: expected)
+
+    assert validate_api_keys._check_llm(settings) is expected
+
+
 def test_amap_preflight_requires_place_search_quota(monkeypatch) -> None:
     def fake_urlopen(url: str, timeout: int):
         if "/v5/place/text" in url:
