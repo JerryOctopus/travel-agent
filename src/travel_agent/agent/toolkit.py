@@ -1725,6 +1725,9 @@ def plan_and_critique(
     meal_strategy = _build_meal_strategy(
         ctx.profile, itinerary_dict, domain_inputs, return_plan
     )
+    free_time_plan = _build_free_time_plan(
+        ctx.profile, itinerary_dict, meal_strategy, return_plan
+    )
     fixed_event_plan = _build_fixed_event_plan(
         ctx.profile, domain_inputs, required_route_anchors, lodging_route_anchors
     )
@@ -1811,6 +1814,7 @@ def plan_and_critique(
             "lodging_route_anchors": lodging_route_anchors,
             "budget_plan": budget_plan,
             "meal_strategy": meal_strategy,
+            "free_time_plan": free_time_plan,
             "fixed_event_plan": fixed_event_plan,
             "mobility_plan": mobility_plan,
             "candidate_verification": candidate_verification,
@@ -2222,6 +2226,115 @@ def _build_meal_strategy(
             state.get("specific_restaurant_required")
             or state.get("concrete_restaurant_required")
         ),
+    }
+
+
+def _build_free_time_plan(
+    profile: TravelProfile,
+    itinerary: dict[str, Any],
+    meal_strategy: dict[str, Any],
+    return_plan: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Record a sparse day's largest gap without inventing another venue."""
+
+    def minutes(value: object) -> int | None:
+        try:
+            parsed = time.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+        return parsed.hour * 60 + parsed.minute
+
+    def clock(value: int) -> str:
+        return f"{value // 60:02d}:{value % 60:02d}"
+
+    state = profile.constraint_state or {}
+    days = [day for day in (itinerary.get("days") or []) if isinstance(day, dict)]
+    meals = [
+        item
+        for item in (meal_strategy.get("scheduled_meals") or [])
+        if isinstance(item, dict)
+    ]
+    windows: list[dict[str, Any]] = []
+    for day in days:
+        day_index = int(day.get("day_index") or 0)
+        stops = [item for item in (day.get("stops") or []) if isinstance(item, dict)]
+        activity_count = sum(
+            str(((stop.get("poi") or {}).get("category") or "")).lower()
+            not in {"food", "restaurant", "cafe", "meal"}
+            for stop in stops
+        )
+        if activity_count >= 2:
+            continue
+        occupied: list[tuple[int, int]] = []
+        for stop in stops:
+            start = minutes(stop.get("start_time"))
+            if start is None:
+                continue
+            try:
+                duration = max(0, int(stop.get("duration_min") or 0))
+            except (TypeError, ValueError):
+                duration = 0
+            occupied.append((start, start + duration))
+        for meal in meals:
+            if int(meal.get("day_index") or 0) != day_index:
+                continue
+            start = minutes(meal.get("start_time"))
+            end = minutes(meal.get("end_time"))
+            if start is not None:
+                occupied.append((start, end if end is not None else start + 60))
+
+        service_start = 9 * 60
+        service_end = 18 * 60
+        deadline = minutes(state.get("activity_end_deadline"))
+        if deadline is not None:
+            service_end = min(service_end, deadline)
+        if (
+            isinstance(return_plan, dict)
+            and day_index == len(days)
+            and return_plan.get("activity_cutoff")
+        ):
+            cutoff = minutes(return_plan.get("activity_cutoff"))
+            if cutoff is not None:
+                service_end = min(service_end, cutoff)
+
+        merged: list[list[int]] = []
+        for start, end in sorted(occupied):
+            start = max(service_start, start)
+            end = min(service_end, end)
+            if end <= start:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        gaps: list[tuple[int, int]] = []
+        cursor = service_start
+        for start, end in merged:
+            if start > cursor:
+                gaps.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < service_end:
+            gaps.append((cursor, service_end))
+        gap = max(gaps, key=lambda item: item[1] - item[0], default=None)
+        if gap is None or gap[1] - gap[0] < 120:
+            continue
+        windows.append({
+            "day_index": day_index,
+            "start_time": clock(gap[0]),
+            "end_time": clock(gap[1]),
+            "purpose": (
+                "午休或低强度自由活动"
+                if state.get("max_walking_km_per_day") is not None
+                else "自由活动或行程机动"
+            ),
+            "reason": (
+                "没有同区域且已核验的补充候选，"
+                "避免为凑满行程引入远距离或未核验地点"
+            ),
+        })
+    return {
+        "status": "explicitly_reserved" if windows else "not_required",
+        "windows": windows,
     }
 
 

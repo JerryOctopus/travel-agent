@@ -679,3 +679,37 @@ def test_amap_provider_retries_one_empty_route_response(monkeypatch) -> None:
     assert calls == 2
     assert route.source == "amap"
     assert route.evidence_status == "provider_verified"
+
+
+def test_amap_provider_uses_verified_walk_for_short_empty_transit(monkeypatch) -> None:
+    provider = AmapToolProvider(api_key="fake-key")
+    origin = replace(_poi("甲馆"), poi_id="origin", lng=121.492497, lat=31.227714)
+    destination = replace(
+        _poi("乙馆"), poi_id="destination", lng=121.490405, lat=31.239137
+    )
+    calls: list[str] = []
+
+    def fake_get_json(path: str, params: dict[str, str]) -> dict:
+        calls.append(path)
+        if path == "/v3/direction/transit/integrated":
+            return {"status": "1", "route": {"transits": []}}
+        assert path == "/v3/direction/walking"
+        return {
+            "status": "1",
+            "route": {"paths": [{"distance": "1400", "duration": "1080"}]},
+        }
+
+    monkeypatch.setattr(provider, "_get_json", fake_get_json)
+
+    route = provider.estimate_route(origin, destination, mode="public_transport")
+
+    assert calls == [
+        "/v3/direction/transit/integrated",
+        "/v3/direction/transit/integrated",
+        "/v3/direction/walking",
+    ]
+    assert route.origin_poi_id == "origin"
+    assert route.destination_poi_id == "destination"
+    assert route.mode == "walk"
+    assert route.source == "amap"
+    assert route.evidence_status == "provider_verified"

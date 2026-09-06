@@ -1533,6 +1533,39 @@ def test_reviewer_sparse_day_directive_materializes_in_rebuilt_itinerary() -> No
     }
 
 
+def test_sparse_day_exposes_truthful_reserved_free_time_window() -> None:
+    profile = TravelProfile(
+        destination="合成城",
+        days=2,
+        constraint_state={"max_walking_km_per_day": 6},
+    )
+    itinerary = {"days": [{
+        "day_index": 1,
+        "stops": [{
+            "start_time": "09:30",
+            "duration_min": 105,
+            "poi": {"category": "museum", "name": "上午活动"},
+        }],
+    }]}
+    meal_strategy = {
+        "scheduled_meals": [
+            {"day_index": 1, "start_time": "11:30", "end_time": "12:30"},
+            {"day_index": 1, "start_time": "16:30", "end_time": "17:30"},
+        ]
+    }
+
+    plan = toolkit._build_free_time_plan(profile, itinerary, meal_strategy, None)
+
+    assert plan["status"] == "explicitly_reserved"
+    assert plan["windows"] == [{
+        "day_index": 1,
+        "start_time": "12:30",
+        "end_time": "16:30",
+        "purpose": "午休或低强度自由活动",
+        "reason": "没有同区域且已核验的补充候选，避免为凑满行程引入远距离或未核验地点",
+    }]
+
+
 def test_meal_reservation_leaves_transfer_buffer_before_and_after_activities() -> None:
     profile = TravelProfile(
         destination="测试城",

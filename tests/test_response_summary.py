@@ -235,6 +235,69 @@ def test_return_plan_uses_the_actual_trip_city_in_reply() -> None:
     assert "结束杭州活动" not in text
 
 
+def test_candidate_verification_distinguishes_scheduled_from_unscheduled() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile = TravelProfile(destination="测试城", days=1)
+    ctx.store.put(
+        "itinerary",
+        {
+            "itinerary": {
+                "summary": "测试城一日游",
+                "days": [{
+                    "day_index": 1,
+                    "stops": [{"poi": {"name": "甲景区"}}],
+                }],
+            },
+            "critic": {"passed": True, "issues": []},
+            "candidate_verification": {
+                "results": [
+                    {"requested_name": "甲", "status": "suitable"},
+                    {"requested_name": "乙", "status": "suitable"},
+                    {
+                        "requested_name": "丙",
+                        "status": "excluded",
+                        "reason": "当日闭馆",
+                    },
+                ]
+            },
+        },
+    )
+
+    text = build_plan_reply_text(ctx)
+
+    assert "候选核验已排入：甲" in text
+    assert "核验可行但因行程取舍未排入：乙" in text
+    assert "候选核验未排入：丙（当日闭馆）" in text
+    assert "候选核验可安排：甲、乙" not in text
+
+
+def test_plan_reply_explains_reserved_sparse_day_window() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile = TravelProfile(destination="测试城", days=2)
+    ctx.store.put(
+        "itinerary",
+        {
+            "itinerary": {"summary": "测试城两日游", "days": []},
+            "critic": {"passed": True, "issues": []},
+            "free_time_plan": {
+                "status": "explicitly_reserved",
+                "windows": [{
+                    "day_index": 1,
+                    "start_time": "12:30",
+                    "end_time": "16:30",
+                    "purpose": "午休或低强度自由活动",
+                    "reason": "没有同区域且已核验的补充候选",
+                }],
+            },
+        },
+    )
+
+    text = build_plan_reply_text(ctx)
+
+    assert "第1天 12:30–16:30 午休或低强度自由活动" in text
+    assert "没有同区域且已核验的补充候选" in text
+
+
 def test_finalize_prefers_artifact_over_llm() -> None:
     ctx = build_session(persist=False)
     ctx.store.put(

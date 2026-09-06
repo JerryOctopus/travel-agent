@@ -511,6 +511,23 @@ def test_independent_judge_payload_includes_lodging_and_budget_plans() -> None:
     assert payload["itinerary"]["budget_plan"]["within_user_limit"] is True
 
 
+def test_independent_judge_payload_includes_explicit_free_time_plan() -> None:
+    case = _case_output()
+    case["final_itinerary"]["free_time_plan"] = {
+        "status": "explicitly_reserved",
+        "windows": [{
+            "day_index": 1,
+            "start_time": "13:00",
+            "end_time": "16:00",
+            "purpose": "午休或低强度自由活动",
+        }],
+    }
+
+    payload = _judge_payload(case)
+
+    assert payload["itinerary"]["free_time_plan"]["windows"][0]["end_time"] == "16:00"
+
+
 def test_human_sample_has_20_representative_10_diagnostic_and_10_rescores() -> None:
     cases = []
     for index in range(35):

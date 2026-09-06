@@ -159,13 +159,30 @@ def build_plan_reply_text(ctx: SessionContext, plan_artifact_id: str | None = No
         lines.append(f"约束检查：{orig} → {final} 项（{status}）。")
         if notes:
             lines.append("自动修正：" + "；".join(notes[:3]))
+    free_time_plan = payload.get("free_time_plan")
+    free_time_windows = (
+        free_time_plan.get("windows") or []
+        if isinstance(free_time_plan, dict)
+        else []
+    )
     warnings = [
         str(issue.get("message") or "").strip()
         for issue in (critic.get("issues") or [])
-        if issue.get("severity") == "warning" and str(issue.get("message") or "").strip()
+        if issue.get("severity") == "warning"
+        and not (free_time_windows and issue.get("code") == "daily_activity_sparse")
+        and str(issue.get("message") or "").strip()
     ]
     if warnings:
         lines.append("需复核：" + "；".join(warnings[:3]))
+    if free_time_windows:
+        lines.append(
+            "留白说明：" + "；".join(
+                f"第{item.get('day_index')}天 {item.get('start_time')}–{item.get('end_time')} "
+                f"{item.get('purpose')}（{item.get('reason')}）"
+                for item in free_time_windows
+                if isinstance(item, dict)
+            ) + "。"
+        )
 
     return_plan = payload.get("return_plan")
     if isinstance(return_plan, dict) and return_plan.get("required"):
@@ -228,10 +245,33 @@ def build_plan_reply_text(ctx: SessionContext, plan_artifact_id: str | None = No
     candidate_verification = payload.get("candidate_verification")
     if isinstance(candidate_verification, dict):
         results = candidate_verification.get("results") or []
-        suitable = [item.get("requested_name") for item in results if item.get("status") == "suitable"]
+        scheduled_names = [
+            str((stop.get("poi") or stop).get("name") or "")
+            for day in itinerary.get("days") or []
+            if isinstance(day, dict)
+            for stop in day.get("stops") or []
+            if isinstance(stop, dict)
+        ]
+        suitable = [
+            item.get("requested_name")
+            for item in results
+            if item.get("status") == "suitable"
+        ]
+        scheduled = [
+            name
+            for name in suitable
+            if any(_candidate_name_matches(name, actual) for actual in scheduled_names)
+        ]
+        unscheduled = [name for name in suitable if name not in scheduled]
         excluded = [item for item in results if item.get("status") != "suitable"]
-        if suitable:
-            lines.append("候选核验可安排：" + "、".join(str(item) for item in suitable) + "。")
+        if scheduled:
+            lines.append("候选核验已排入：" + "、".join(str(item) for item in scheduled) + "。")
+        if unscheduled:
+            lines.append(
+                "核验可行但因行程取舍未排入："
+                + "、".join(str(item) for item in unscheduled)
+                + "。"
+            )
         if excluded:
             lines.append(
                 "候选核验未排入：" + "；".join(
@@ -241,6 +281,15 @@ def build_plan_reply_text(ctx: SessionContext, plan_artifact_id: str | None = No
             )
 
     return "\n".join(lines)
+
+
+def _candidate_name_matches(requested: object, actual: object) -> bool:
+    def normalize(value: object) -> str:
+        return re.sub(r"[^\w\u3400-\u9fff]+", "", str(value or "").casefold())
+
+    left = normalize(requested)
+    right = normalize(actual)
+    return bool(left and right and (left in right or right in left))
 
 
 def fallback_no_artifact_message() -> str:

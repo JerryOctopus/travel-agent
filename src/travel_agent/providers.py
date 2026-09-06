@@ -396,6 +396,33 @@ class AmapToolProvider:
             )
             if distance_m > 0 and duration_seconds > 0:
                 break
+        # Transit APIs commonly return an empty plan for very short urban
+        # legs even when the pedestrian endpoint has a valid provider route.
+        # Prefer that verified walk over a straight-line estimate. This is a
+        # mode fallback, not fabricated transit evidence.
+        if distance_m <= 0 and duration_seconds <= 0 and mode == "public_transport":
+            straight_distance_km, _ = estimate_route_minutes(
+                origin, destination, "walk"
+            )
+            if 0 < straight_distance_km <= 2.5:
+                walk_path, walk_params = _amap_route_request(
+                    origin, destination, "walk"
+                )
+                try:
+                    walk_payload = self._get_json(
+                        walk_path, {"key": self.api_key, **walk_params}
+                    )
+                    _raise_for_provider_limit(walk_payload)
+                    distance_m, duration_seconds, walking_distance_m = (
+                        _parse_amap_route_payload(walk_payload, "walk")
+                    )
+                    if distance_m > 0 and duration_seconds > 0:
+                        mode = "walk"
+                except ProviderRateLimitError:
+                    raise
+                except Exception:
+                    distance_m = duration_seconds = 0.0
+                    walking_distance_m = None
         if distance_m <= 0 or duration_seconds <= 0:
             distance_km, duration_min = estimate_route_minutes(origin, destination, mode)
             return normalize_route_evidence(RouteInfo(

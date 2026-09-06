@@ -395,6 +395,7 @@ def _judge_payload(case_output: dict[str, Any]) -> dict[str, Any]:
         for key in (
             "return_plan", "lodging_plan", "budget_plan", "fixed_event_plan",
             "candidate_verification", "mobility_plan", "meal_strategy",
+            "free_time_plan",
             "required_route_anchors", "lodging_route_anchors", "validation_result",
         ):
             structured_plan = itinerary_artifact.get(key)
