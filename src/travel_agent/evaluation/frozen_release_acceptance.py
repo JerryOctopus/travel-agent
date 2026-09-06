@@ -14,7 +14,9 @@ from travel_agent.evaluation.artifact_contract import (
     actual_artifact_type,
     artifact_contract_fingerprint,
     expected_artifact_type,
+    itinerary_judge_route,
 )
+from travel_agent.evaluation.plan_quality_judge import PARTIAL_RUBRIC_VERSION
 
 
 FROZEN_RELEASE_SCHEMA_VERSION = "frozen-release-manifest-v1"
@@ -591,7 +593,16 @@ def _judge_metrics(
         actual = (evaluation.get("rule_metrics") or {}).get("actual_artifact_type") or evaluation.get("actual_artifact_type") or actual_artifact_type(case, expected)
         if expected in ITINERARY_TYPES and actual in ITINERARY_TYPES:
             result = dict(evaluation.get("independent_judge") or {})
-            result["_expected_rubric"] = expected
+            route = itinerary_judge_route(expected, actual)
+            result["_expected_rubric"] = route.get("rubric")
+            result["_expected_diagnostic_only"] = bool(
+                route.get("diagnostic_only")
+            )
+            result["_expected_rubric_version"] = (
+                PARTIAL_RUBRIC_VERSION
+                if route.get("rubric") == "partial_itinerary"
+                else JUDGE_MODEL["rubric_version"]
+            )
             eligible.append(result)
     completed = [item for item in eligible if item.get("status") == "ok"]
     scores = [float(item["total_score"]) for item in completed if isinstance(item.get("total_score"), (int, float))]
@@ -608,8 +619,9 @@ def _judge_metrics(
         item.get("provider") == JUDGE_MODEL["provider"]
         and item.get("model") == JUDGE_MODEL["model"]
         and item.get("rubric") == item.get("_expected_rubric")
-        and item.get("diagnostic_only") is False
-        and item.get("rubric_version") == JUDGE_MODEL["rubric_version"]
+        and item.get("diagnostic_only")
+        is item.get("_expected_diagnostic_only")
+        and item.get("rubric_version") == item.get("_expected_rubric_version")
         and item.get("prompt_version") == JUDGE_MODEL["prompt_version"]
         and item.get("schema_version") == JUDGE_MODEL["schema_version"]
         and item.get("independence_warning") is False

@@ -106,7 +106,11 @@ def _stage_run(root: Path, split: str, manifest: dict, *, judge: bool = True) ->
                     "total_score": 85,
                     "reasonable": True,
                     "critical_issues": [],
-                    "rubric_version": "travel-plan-quality-v1",
+                    "rubric_version": (
+                        "travel-partial-plan-diagnostic-v1"
+                        if expected == "partial_itinerary"
+                        else "travel-plan-quality-v1"
+                    ),
                     "prompt_version": "travel-plan-judge-v4",
                     "schema_version": "travel-plan-judge-output-v1",
                     "independence_warning": False,
@@ -457,6 +461,43 @@ def test_judge_completion_rubric_and_critical_rate_are_enforced(tmp_path: Path) 
 
     assert any("Judge result identity" in item for item in result["failures"])
     assert any("critical issue rate" in item for item in result["failures"])
+
+
+def test_judge_accepts_delivered_partial_with_diagnostic_partial_rubric(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(tmp_path)
+    run = tmp_path / "core-run"
+    _stage_run(run, "core_frozen", manifest)
+
+    case_path = sorted((run / "cases").glob("*.json"))[0]
+    case = json.loads(case_path.read_text(encoding="utf-8"))
+    metrics = case["evaluation"]["rule_metrics"]
+    metrics["actual_artifact_type"] = "partial_itinerary"
+    metrics["strict_task_success"] = False
+    case["final_artifacts"]["artifact_type"] = "partial_itinerary"
+    case["evaluation"]["independent_judge"].update(
+        {
+            "rubric": "partial_itinerary",
+            "diagnostic_only": True,
+            "rubric_version": "travel-partial-plan-diagnostic-v1",
+        }
+    )
+    case_path.write_text(json.dumps(case), encoding="utf-8")
+
+    summary_path = run / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    row = summary["rows"][0]
+    row["actual_artifact_type"] = "partial_itinerary"
+    row["strict_task_success"] = False
+    summary["metrics"]["strict_success_rate"] = 93 / 94
+    summary["metrics"]["overall_strict_success_rate"] = 93 / 94
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = evaluate_frozen_stage(run, manifest, "core_frozen")
+
+    assert result["passed"] is True
+    assert result["judge"]["eligible"] == 94
 
 
 def test_release_dev34_gate_is_stricter_than_legacy_contract(tmp_path: Path) -> None:
