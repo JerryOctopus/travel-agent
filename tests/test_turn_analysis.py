@@ -713,6 +713,19 @@ def test_standalone_cancel_and_budget_increase_are_deterministic(offline_setting
     assert budget.constraint_state["budget_max_cny"] == 6500
 
 
+def test_optional_place_removal_does_not_create_hard_tombstone(offline_settings) -> None:
+    ctx = _ctx_with_itinerary()
+
+    analysis = analyze_travel_turn(
+        "驾照没带，取消自驾，全部改成公共交通和打车，南山可以不去。",
+        ctx,
+        offline_settings,
+    )
+
+    assert analysis.constraint_state["optional_remove"] == ["南山"]
+    assert "removed" not in analysis.constraint_state
+
+
 def test_cancelled_venue_never_overwrites_destination_without_current_itinerary(
     offline_settings,
 ) -> None:

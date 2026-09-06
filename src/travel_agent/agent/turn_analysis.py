@@ -1301,6 +1301,13 @@ def _apply_general_constraint_patterns(
     optional = re.search(r"([^，。]+?)可以不去", text)
     if optional:
         state["optional_remove"] = [optional.group(1).strip()]
+        # “X 可以不去” authorizes the planner to drop X when useful; it is not
+        # the hard deletion expressed by “不去 X / X 不去了”.  The broad
+        # suffix matcher above otherwise captures ``X 可以`` and creates a
+        # tombstone, which can incorrectly turn an optional trade-off into a
+        # hard constraint conflict.
+        if state.get("removed") == [f"{optional.group(1).strip()}可以"]:
+            state.pop("removed", None)
     if "不同类型" in text:
         state["diversity_required"] = True
     if re.search(r"节奏.{0,4}(?:轻松|别太赶|不要太赶)|别太赶|不要太赶", text):
