@@ -788,6 +788,41 @@ def test_reviewer_does_not_treat_default_transport_as_user_taxi_prohibition():
     assert review.issues[0].severity == "noncritical"
 
 
+def test_reviewer_does_not_invent_explicit_transport_requirement_from_profile_default():
+    ctx = ReviewContext(
+        request_id="req_default_transport_explicitness",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+        },
+        profile_brief={
+            "transport_mode": "public_transport",
+            "constraint_state": {"budget_max_cny": 2400},
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "transport_mode_compliance",
+                "severity": "recoverable",
+                "description": (
+                    "行程使用 taxi，但用户明确要求 public_transport，"
+                    "且没有 taxi_backup 说明。"
+                ),
+                "evidence": ["profile.transport_mode=public_transport"],
+                "repair_target": "planner",
+                "repair_instruction": "全部改用公共交通。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
 def test_reviewer_treats_unrequested_internal_accessibility_as_advisory():
     ctx = ReviewContext(
         request_id="req_bounded_mobility",
@@ -1038,6 +1073,73 @@ def test_reviewer_downgrades_schedule_tightness_after_deterministic_validation()
                 "evidence": ["itinerary.days[0].stops"],
                 "repair_target": "planner",
                 "repair_instruction": "调整普通游览节奏。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_downgrades_soft_schedule_rhythm_after_deterministic_validation():
+    ctx = ReviewContext(
+        request_id="req_schedule_rhythm_advisory",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+        },
+        profile_brief={
+            "constraint_state": {
+                "fixed_events": [
+                    {"day": 1, "start": "14:00", "end": "16:00", "location": "展馆"}
+                ]
+            }
+        },
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "schedule_rhythm",
+                "severity": "recoverable",
+                "description": "当天仅包含固定活动，上午安排较稀疏，与普通节奏不符。",
+                "evidence": ["itinerary.days[0].stops"],
+                "repair_target": "planner",
+                "repair_instruction": "增加可选活动。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
+def test_reviewer_downgrades_redundant_area_advisory_after_validation():
+    ctx = ReviewContext(
+        request_id="req_redundant_area_advisory",
+        plan={
+            "itinerary": {"days": [{"day_index": 1, "stops": []}]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+        },
+        profile_brief={"constraint_state": {"must_visit": ["历史街区"]}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "constraint_conflict",
+                "severity": "recoverable",
+                "description": (
+                    "同一历史街区被拆成两个相邻游览点，可能造成重复安排，"
+                    "但必去地点已经覆盖。"
+                ),
+                "evidence": ["itinerary.days[0].stops"],
+                "repair_target": "planner",
+                "repair_instruction": "合并相邻游览点。",
             }],
         },
     )

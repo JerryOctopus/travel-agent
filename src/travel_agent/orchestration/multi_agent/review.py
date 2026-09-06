@@ -870,7 +870,10 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             )
             and any(
                 marker in combined_lower
-                for marker in ("违反", "冲突", "禁止", "prohibit", "conflict")
+                for marker in (
+                    "违反", "冲突", "禁止", "明确要求",
+                    "prohibit", "conflict", "explicitly require",
+                )
             )
             and (plan.get("critic") or {}).get("passed") is True
             and (plan.get("validation_result") or {}).get("passed") is True
@@ -922,6 +925,32 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
                     )
                 )
             )
+        )
+        soft_schedule_rhythm_advisory = bool(
+            (
+                any(
+                    marker in str(issue.issue_type or "").casefold()
+                    for marker in (
+                        "schedule_rhythm", "activity_sparsity", "schedule_density",
+                    )
+                )
+                or any(
+                    marker in combined_lower
+                    for marker in (
+                        "仅包含", "仅安排", "安排较稀疏", "普通节奏不符",
+                        "under-filled", "underfilled", "schedule rhythm",
+                    )
+                )
+            )
+            and not any(
+                marker in combined_lower
+                for marker in (
+                    "冲突", "重叠", "来不及", "迟到", "超过截止",
+                    "conflict", "overlap", "miss the", "deadline violation",
+                )
+            )
+            and (plan.get("critic") or {}).get("passed") is True
+            and (plan.get("validation_result") or {}).get("passed") is True
         )
         false_missing_route_claim = bool(
             deterministic_route_bindings_pass
@@ -1018,6 +1047,7 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             or bounded_mobility_evidence_gap
             or nonrequired_internal_accessibility_claim
             or deterministic_schedule_advisory
+            or soft_schedule_rhythm_advisory
             or false_missing_route_claim
             or soft_interest_gap
             or soft_preference_gap
