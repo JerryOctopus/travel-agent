@@ -191,6 +191,7 @@ def _check_route_feasible(
     max_single = PACE_MAX_SINGLE_ROUTE_MIN.get(pace, PACE_MAX_SINGLE_ROUTE_MIN["standard"])
     max_daily = PACE_MAX_DAILY_ROUTE_MIN.get(pace, PACE_MAX_DAILY_ROUTE_MIN["standard"])
     state = profile.get("constraint_state") or {}
+    pace_is_explicit = state.get("pace") not in (None, "")
     try:
         walking_limit = (
             float(state.get("max_walking_km_per_day"))
@@ -217,12 +218,14 @@ def _check_route_feasible(
                 issues.append(
                     f"route_too_long:day{day.get('day_index')}:{duration}>{max_single}"
                 )
-                ok = False
+                if pace_is_explicit:
+                    ok = False
         if total > max_daily:
             issues.append(
                 f"daily_route_too_long:day{day.get('day_index')}:{total}>{max_daily}"
             )
-            ok = False
+            if pace_is_explicit:
+                ok = False
         if walking_limit is not None and walking_total > walking_limit:
             issues.append(
                 f"walking_distance_exceeded:day{day.get('day_index')}:"

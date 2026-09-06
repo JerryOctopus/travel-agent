@@ -160,3 +160,45 @@ def test_plan_eval_rejects_known_walking_distance_over_cap() -> None:
     assert result is not None
     assert result.route_feasible is False
     assert any(issue.startswith("walking_distance_exceeded") for issue in result.issues)
+
+
+def test_default_pace_route_limit_is_advisory_not_a_hard_constraint() -> None:
+    artifact = _artifact()
+    artifact["itinerary"]["days"][0]["stops"][1]["route_from_previous"] = {
+        "duration_min": 64,
+        "distance_km": 12.0,
+        "mode": "public_transport",
+    }
+
+    result = evaluate_plan_artifact(
+        artifact,
+        profile={
+            "pace": "standard",
+            "constraint_state": {"public_transport_required": True},
+        },
+    )
+
+    assert result is not None
+    assert result.route_feasible is True
+    assert "route_too_long:day1:64>60" in result.issues
+
+
+def test_explicit_pace_route_limit_remains_a_constraint() -> None:
+    artifact = _artifact()
+    artifact["itinerary"]["days"][0]["stops"][1]["route_from_previous"] = {
+        "duration_min": 64,
+        "distance_km": 12.0,
+        "mode": "public_transport",
+    }
+
+    result = evaluate_plan_artifact(
+        artifact,
+        profile={
+            "pace": "standard",
+            "constraint_state": {"pace": "standard"},
+        },
+    )
+
+    assert result is not None
+    assert result.route_feasible is False
+    assert "route_too_long:day1:64>60" in result.issues
