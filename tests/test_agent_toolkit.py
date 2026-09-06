@@ -704,6 +704,65 @@ def test_required_fixed_event_anchor_rebinds_to_verified_hotel_leg() -> None:
     assert leg["evidence_status"] == "provider_verified"
 
 
+def test_fixed_event_closure_reuses_unlabelled_exact_endpoint_route() -> None:
+    ctx = _session()
+    ctx.profile.destination = "测试城"
+    ctx.profile.days = 1
+    ctx.profile.constraint_state = {
+        "fixed_events": [{
+            "day": 1,
+            "start": "14:30",
+            "end": "16:30",
+            "location": "预约博物馆",
+        }],
+    }
+    origin = POI(
+        "origin", "上午景点", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, ["classic"], 90, "mid", source="amap",
+    )
+    event = POI(
+        "event", "预约博物馆", "测试城", "museum", 30.1, 120.1,
+        4.8, 0.9, ["history"], 120, "mid", source="amap",
+    )
+    ctx.remember_pois([origin, event])
+    itinerary = {"days": [{"day_index": 1, "stops": [
+        {"start_time": "09:00", "duration_min": 90, "poi": poi_to_dict(origin)},
+        {"start_time": "14:30", "duration_min": 120, "poi": poi_to_dict(event)},
+    ]}]}
+    domain_inputs = {"transport": [{
+        "artifact_id": "exact-route",
+        "payload": {
+            "origin_poi_id": "origin",
+            "destination_poi_id": "event",
+            "origin_name": "上午景点",
+            "destination_name": "预约博物馆",
+            "mode": "public_transport",
+            "duration_min": 20,
+            "distance_km": 4.0,
+            "source": "amap",
+            "evidence_status": "provider_verified",
+        },
+    }]}
+
+    class UnexpectedEstimator:
+        def estimate_route(self, *_args, **_kwargs):
+            raise AssertionError("exact endpoint evidence should be reused")
+
+    closed = toolkit._close_post_plan_fixed_event_routes(
+        ctx, itinerary, domain_inputs, UnexpectedEstimator()
+    )
+
+    assert len(closed) == 1
+    assert closed[0]["fixed_event_name"] == "预约博物馆"
+    assert closed[0]["required_buffer_min"] == 15
+    assert closed[0]["recommended_latest_departure"] == "13:55"
+    assert any(
+        entry.get("post_plan_fixed_event_closure") is True
+        and entry["payload"]["fixed_event_name"] == "预约博物馆"
+        for entry in domain_inputs["transport"]
+    )
+
+
 def test_amap_hotel_without_price_evidence_is_not_rejected_as_wrong_budget_tier(
     monkeypatch,
 ) -> None:

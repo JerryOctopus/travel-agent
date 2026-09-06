@@ -3273,14 +3273,37 @@ def _close_post_plan_fixed_event_routes(
             dict(route)
             for route in existing_routes
             if isinstance(route, dict)
-            and normalize_entity_name(route.get("fixed_event_name"))
-            == normalize_entity_name(location)
             and str(route.get("origin_poi_id") or "") == origin.poi_id
             and str(route.get("destination_poi_id") or "") == endpoint.poi_id
             and canonical_route_evidence_status(route) == "provider_verified"
         ), None)
         if existing is not None:
-            closed.append(existing)
+            labelled = {
+                **existing,
+                "fixed_event_name": location,
+                "required_buffer_min": int(
+                    existing.get("required_buffer_min") or TRANSFER_BUFFER_MIN
+                ),
+            }
+            labelled.setdefault(
+                "recommended_latest_departure",
+                _offset_clock(
+                    event.get("start"),
+                    -(
+                        int(labelled.get("duration_min") or 0)
+                        + int(labelled["required_buffer_min"])
+                    ),
+                ),
+            )
+            if labelled != existing:
+                artifact_id = ctx.store.put("routes", labelled)
+                domain_inputs.setdefault("transport", []).append({
+                    "artifact_id": artifact_id,
+                    "payload": labelled,
+                    "post_plan_fixed_event_closure": True,
+                })
+                existing_routes.append(labelled)
+            closed.append(labelled)
             continue
         route = _estimate_hard_route(
             route_estimator,
