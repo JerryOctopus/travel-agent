@@ -894,7 +894,7 @@ def _calibrate_review_result(review: ReviewResult, review_ctx: ReviewContext) ->
             and (plan.get("critic") or {}).get("passed") is True
             and (plan.get("validation_result") or {}).get("passed") is True
             and (
-                not hard_timed_route_state
+                not hard_timed_route_claim
                 or (
                     verified_return_anchor
                     and any(

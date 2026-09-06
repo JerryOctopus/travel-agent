@@ -1224,6 +1224,52 @@ def test_reviewer_defers_to_validated_route_bindings_for_schedule_gap_claim() ->
     assert review.issues[0].severity == "noncritical"
 
 
+def test_reviewer_scopes_hard_timing_to_the_day_named_by_schedule_issue() -> None:
+    ctx = ReviewContext(
+        request_id="req_cross_day_schedule_gap",
+        plan={
+            "itinerary": {"days": [
+                {"day_index": 1, "stops": [{
+                    "start_time": "09:00", "duration_min": 90,
+                    "poi": {"name": "第一天景点", "category": "scenic"},
+                }]},
+                {"day_index": 2, "stops": [{
+                    "start_time": "14:30", "duration_min": 150,
+                    "poi": {"name": "第二天景点", "category": "museum"},
+                }]},
+            ]},
+            "critic": {"passed": True, "issues": []},
+            "validation_result": {"passed": True, "issues": []},
+            "fixed_event_plan": {"events": [{
+                "day": 1,
+                "start": "18:00",
+                "location": "第一天会场",
+                "route_evidence_status": "provider_verified",
+            }]},
+        },
+        profile_brief={"constraint_state": {"fixed_events": [{
+            "day": 1, "start": "18:00", "location": "第一天会场",
+        }]}},
+    )
+    review = run_semantic_review(
+        ctx,
+        review_callable=lambda _ctx: {
+            "verdict": "rework",
+            "issues": [{
+                "issue_type": "schedule_gap",
+                "severity": "recoverable",
+                "description": "第2天下午行程结束较早，可以增加晚间活动。",
+                "evidence": ["itinerary.days[1].stops[0]"],
+                "repair_target": "planner",
+                "repair_instruction": "增加第二天晚间活动。",
+            }],
+        },
+    )
+
+    assert review.verdict == "pass"
+    assert review.issues[0].severity == "noncritical"
+
+
 def test_reviewer_does_not_turn_uncovered_soft_preference_into_rework():
     ctx = ReviewContext(
         request_id="req_soft_preference",
