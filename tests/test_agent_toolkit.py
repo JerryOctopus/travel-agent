@@ -1647,6 +1647,55 @@ def test_meal_reservation_leaves_transfer_buffer_before_and_after_activities() -
     assert dinner["end_time"] == "20:15"
 
 
+def test_dinner_starts_after_fixed_event_verified_return_arrival() -> None:
+    profile = TravelProfile(
+        destination="合成城",
+        days=2,
+        start_date="2027-05-01",
+        constraint_state={
+            "fixed_events": [{
+                "date": "2027-05-02",
+                "start": "15:00",
+                "end": "17:00",
+                "location": "远郊展馆",
+            }]
+        },
+    )
+    itinerary = {"days": [
+        {"day_index": 1, "stops": [{
+            "start_time": "09:00", "duration_min": 120,
+            "poi": {"category": "museum", "name": "市区博物馆"},
+        }]},
+        {"day_index": 2, "stops": [{
+            "start_time": "15:00", "duration_min": 120,
+            "poi": {"category": "museum", "name": "远郊展馆"},
+        }]},
+    ]}
+    fixed_event_plan = {
+        "status": "fixed_appointment_buffers",
+        "events": [{
+            "day_index": 2,
+            "date": "2027-05-02",
+            "start": "15:00",
+            "end": "17:00",
+            "location": "远郊展馆",
+            "recommended_return_arrival": "19:28",
+            "route_evidence_status": "provider_verified",
+        }],
+    }
+
+    strategy = toolkit._build_meal_strategy(
+        profile, itinerary, {}, fixed_event_plan=fixed_event_plan
+    )
+
+    dinner = next(
+        meal for meal in strategy["scheduled_meals"]
+        if meal["day_index"] == 2 and meal["period"] == "dinner"
+    )
+    assert dinner["start_time"] == "19:45"
+    assert dinner["end_time"] == "20:45"
+
+
 def test_last_day_meal_reservation_stays_before_return_activity_cutoff() -> None:
     profile = TravelProfile(
         destination="杭州",

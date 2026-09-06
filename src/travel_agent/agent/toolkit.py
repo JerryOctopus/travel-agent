@@ -1721,15 +1721,19 @@ def plan_and_critique(
                 issues=critic_issues,
             ),
         )
+    fixed_event_plan = _build_fixed_event_plan(
+        ctx.profile, domain_inputs, required_route_anchors, lodging_route_anchors
+    )
     budget_plan = _build_budget_plan(ctx.profile, domain_inputs, lodging_plan)
     meal_strategy = _build_meal_strategy(
-        ctx.profile, itinerary_dict, domain_inputs, return_plan
+        ctx.profile,
+        itinerary_dict,
+        domain_inputs,
+        return_plan,
+        fixed_event_plan=fixed_event_plan,
     )
     free_time_plan = _build_free_time_plan(
         ctx.profile, itinerary_dict, meal_strategy, return_plan
-    )
-    fixed_event_plan = _build_fixed_event_plan(
-        ctx.profile, domain_inputs, required_route_anchors, lodging_route_anchors
     )
     mobility_plan = _build_mobility_plan(ctx.profile, itinerary_dict)
     candidate_verification = _build_candidate_verification(ctx.profile, ranked, domain_inputs)
@@ -2030,6 +2034,8 @@ def _build_meal_strategy(
     itinerary: dict[str, Any],
     domain_inputs: dict[str, Any],
     return_plan: dict[str, Any] | None = None,
+    *,
+    fixed_event_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Expose dining semantics as a first-class Reviewer input."""
     state = profile.constraint_state or {}
@@ -2098,6 +2104,22 @@ def _build_meal_strategy(
 
     scheduled: list[dict[str, Any]] = []
     unscheduled_meal_days: list[dict[str, Any]] = []
+    fixed_event_return_by_day: dict[int, int] = {}
+    for event in (fixed_event_plan or {}).get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        try:
+            event_day = int(event.get("day_index"))
+        except (TypeError, ValueError):
+            continue
+        if event.get("route_evidence_status") != "provider_verified":
+            continue
+        return_arrival = _clock_to_minute(event.get("recommended_return_arrival"))
+        if return_arrival is None:
+            continue
+        fixed_event_return_by_day[event_day] = max(
+            fixed_event_return_by_day.get(event_day, 0), return_arrival
+        )
     for day in itinerary.get("days") or []:
         meal_periods: set[str] = set()
         for stop in day.get("stops") or []:
@@ -2193,7 +2215,16 @@ def _build_meal_strategy(
             or (is_multi_day_plan and latest_end_min is None)
         )
         if dinner_needed and "dinner" not in meal_periods:
-            dinner = _available_dinner_reservation(day, latest_end_min=latest_end_min)
+            dinner = _available_dinner_reservation(
+                day,
+                latest_end_min=latest_end_min,
+                earliest_start_min=(
+                    fixed_event_return_by_day.get(int(day.get("day_index") or 0), 0)
+                    + TRANSFER_BUFFER_MIN
+                    if int(day.get("day_index") or 0) in fixed_event_return_by_day
+                    else None
+                ),
+            )
             if dinner is not None:
                 meal_start, meal_end = dinner
                 scheduled.append(grounded_reservation(
@@ -2368,14 +2399,20 @@ def _available_meal_reservation(
 
 
 def _available_dinner_reservation(
-    day: dict[str, Any], *, latest_end_min: int | None = None
+    day: dict[str, Any],
+    *,
+    latest_end_min: int | None = None,
+    earliest_start_min: int | None = None,
 ) -> tuple[str, str] | None:
     """Choose a non-overlapping dinner window within the usable day."""
     occupied = _meal_occupied_intervals(day)
     latest_start = 20 * 60
     if latest_end_min is not None:
         latest_start = min(latest_start, latest_end_min - 60)
-    for candidate in range(16 * 60 + 30, latest_start + 1, 15):
+    first_start = 16 * 60 + 30
+    if earliest_start_min is not None:
+        first_start = max(first_start, ((earliest_start_min + 14) // 15) * 15)
+    for candidate in range(first_start, latest_start + 1, 15):
         if _meal_window_fits(candidate, occupied):
             return (
                 _offset_clock("00:00", candidate) or "18:00",
@@ -2385,6 +2422,8 @@ def _available_dinner_reservation(
     # normal dinner slots.  In that case offer an earlier meal, while keeping
     # 16:30 as the default whenever it is feasible.
     for candidate in range(15 * 60 + 30, 16 * 60 + 30, 15):
+        if earliest_start_min is not None and candidate < earliest_start_min:
+            continue
         if latest_end_min is not None and candidate + 60 > latest_end_min:
             continue
         if _meal_window_fits(candidate, occupied):
@@ -2528,6 +2567,7 @@ def _build_fixed_event_plan(
         )
         items.append({
             **event,
+            "day_index": day_index,
             "transfer_duration_min": duration,
             "recommended_departure": _offset_clock(event.get("start"), -(duration + buffer_min) if duration else None),
             "recommended_return_arrival": _offset_clock(event.get("end"), duration),
