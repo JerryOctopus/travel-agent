@@ -20,13 +20,17 @@ from travel_agent.route_evidence import (
     route_supports_endpoints,
 )
 from travel_agent.plan_invariants import validate_plan_artifact
-from travel_agent.planning import rebind_itinerary_routes
+from travel_agent.planning import (
+    apply_structured_schedule_constraints,
+    rebind_itinerary_routes,
+)
 from travel_agent.schemas import (
     Itinerary,
     ItineraryDay,
     ItineraryStop,
     POI,
     RouteInfo,
+    ScoredPOI,
     TravelProfile,
 )
 
@@ -522,6 +526,62 @@ def test_rebind_does_not_switch_to_taxi_when_public_transport_is_required() -> N
     assert estimator.calls == ["public_transport"]
     assert route is not None
     assert route.mode == "public_transport"
+
+
+def test_required_venues_keep_short_route_order_when_all_closing_times_fit() -> None:
+    early = replace(
+        _poi("early", "较早闭馆景点"),
+        lat=30.0,
+        lng=120.06,
+        opening_hours="09:00-17:00",
+        estimated_duration_min=90,
+    )
+    nearby = replace(
+        _poi("nearby", "全天景点"),
+        lat=30.0,
+        lng=120.01,
+        opening_hours="00:00-24:00",
+        estimated_duration_min=90,
+    )
+    later = replace(
+        _poi("later", "稍晚闭馆景点"),
+        lat=30.0,
+        lng=120.0,
+        opening_hours="08:30-18:00",
+        estimated_duration_min=90,
+    )
+    day = ItineraryDay(1, "", [
+        ItineraryStop(early, "09:30", 90, ""),
+        ItineraryStop(nearby, "14:30", 90, ""),
+        ItineraryStop(later, "16:30", 90, ""),
+    ])
+
+    class Estimator:
+        def estimate_route(self, origin, destination, mode):
+            return normalize_route_evidence(RouteInfo(
+                origin_poi_id=origin.poi_id,
+                destination_poi_id=destination.poi_id,
+                distance_km=2.0,
+                duration_min=20,
+                mode=mode,
+                source="amap",
+            ))
+
+    result = apply_structured_schedule_constraints(
+        [day],
+        [ScoredPOI(early, 1.0, []), ScoredPOI(nearby, 0.9, []), ScoredPOI(later, 0.8, [])],
+        TravelProfile(
+            destination="测试城",
+            days=1,
+            must_visit=[early.name, nearby.name, later.name],
+        ),
+        Estimator(),
+    )
+
+    assert [stop.poi.poi_id for stop in result[0].stops] == [
+        "early", "nearby", "later",
+    ]
+    assert result[0].stops[-1].start_time == "15:00"
 
 
 @pytest.mark.parametrize("context", ["fixed_appointment", "return_deadline", "accessibility", "intercity"])

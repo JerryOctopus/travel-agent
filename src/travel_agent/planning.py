@@ -557,14 +557,44 @@ def apply_structured_schedule_constraints(
             )
         ]
         if required_flexible:
-            required_flexible.sort(
-                key=lambda entry: (
-                    (_opening_window_for_trip_day(
-                        entry[2].poi, profile, day.day_index
-                    ) or (0, 24 * 60))[1],
-                    entry[0],
+            def required_order_fits_opening_hours() -> bool:
+                for index, entry in enumerate(required_flexible):
+                    stop = entry[2]
+                    proposed = max(
+                        _time_to_minutes(
+                            REQUIRED_ACTIVITY_TIMES[
+                                min(index, len(REQUIRED_ACTIVITY_TIMES) - 1)
+                            ]
+                        ),
+                        _preferred_activity_start_minutes(stop.poi, 0),
+                    )
+                    window = _opening_window_for_trip_day(
+                        stop.poi, profile, day.day_index
+                    )
+                    if window is not None:
+                        proposed = max(proposed, window[0])
+                        if proposed + stop.duration_min > window[1]:
+                            return False
+                    admission = _last_admission_for_trip_day(
+                        stop.poi, profile, day.day_index
+                    )
+                    if admission is not None and proposed > admission:
+                        return False
+                return True
+
+            # The incoming order is already the minimum-distance daily route.
+            # Preserve it when compact required slots satisfy every verified
+            # opening boundary; earliest-closing-first is only a fallback for
+            # an order that would actually miss admission or closing time.
+            if not required_order_fits_opening_hours():
+                required_flexible.sort(
+                    key=lambda entry: (
+                        (_opening_window_for_trip_day(
+                            entry[2].poi, profile, day.day_index
+                        ) or (0, 24 * 60))[1],
+                        entry[0],
+                    )
                 )
-            )
             retimed_required = {
                 entry[2].poi.poi_id: max(
                     _time_to_minutes(

@@ -1585,6 +1585,72 @@ def test_reviewer_sparse_day_directive_materializes_in_rebuilt_itinerary() -> No
     }
 
 
+def test_reviewer_meal_repair_reapplies_route_aware_schedule() -> None:
+    morning = POI(
+        "morning", "上午景点", "合成城", "scenic",
+        30.0, 120.0, 4.5, 0.8, [], 90, "mid",
+    )
+    afternoon = POI(
+        "afternoon", "下午景点", "合成城", "museum",
+        30.02, 120.02, 4.5, 0.8, [], 90, "mid",
+    )
+    meal = POI(
+        "meal", "清真午餐", "合成城", "food",
+        30.01, 120.01, 4.5, 0.8, ["halal", "清真"], 60, "mid",
+    )
+    itinerary = Itinerary(
+        city="合成城",
+        summary="test",
+        days=[ItineraryDay(1, "test", [
+            ItineraryStop(morning, "09:30", 90, ""),
+            ItineraryStop(afternoon, "14:30", 90, ""),
+        ])],
+    )
+    profile = TravelProfile(
+        destination="合成城",
+        days=1,
+        interests=["food"],
+        constraint_state={"dietary": ["仅清真餐厅"]},
+    )
+    result = PlanAndCritiqueResult(
+        itinerary=itinerary,
+        original_itinerary=itinerary,
+        critic_result=critique_itinerary(itinerary, profile),
+    )
+
+    class Estimator:
+        def estimate_route(self, origin, destination, mode):
+            return RouteInfo(
+                origin_poi_id=origin.poi_id,
+                destination_poi_id=destination.poi_id,
+                distance_km=5.0,
+                duration_min=45,
+                mode=mode,
+                source="amap",
+            )
+
+    ctx = _session()
+    ctx.profile = profile
+    ctx.provider = Estimator()
+
+    revised = toolkit._apply_revision_directives(
+        result,
+        [ScoredPOI(meal, 0.8, [])],
+        ctx,
+        {"reviewer_issue_types": ["daily_meal_missing"]},
+    )
+
+    assert any(stop.poi.category == "food" for stop in revised.itinerary.days[0].stops)
+    for previous, current in zip(
+        revised.itinerary.days[0].stops,
+        revised.itinerary.days[0].stops[1:],
+    ):
+        assert current.route_from_previous is not None
+        previous_end = toolkit._clock_to_minute(previous.start_time) + previous.duration_min
+        current_start = toolkit._clock_to_minute(current.start_time)
+        assert previous_end + current.route_from_previous.duration_min <= current_start
+
+
 def test_sparse_day_exposes_truthful_reserved_free_time_window() -> None:
     profile = TravelProfile(
         destination="合成城",

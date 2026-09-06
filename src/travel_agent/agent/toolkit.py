@@ -4747,6 +4747,23 @@ def _apply_revision_directives(
                 ctx.profile,
                 CriticResult(passed=False, issues=matching_issues),
             )
+            # ``revise_itinerary`` deliberately clears stale route bindings
+            # while it moves or inserts stops.  Reapply the same deterministic
+            # schedule stage used by the primary planning loop so the atomic
+            # Reviewer revision includes fresh routes and enough transfer
+            # time before it can be promoted.
+            from travel_agent.planning import apply_structured_schedule_constraints
+
+            itinerary = replace(
+                itinerary,
+                days=apply_structured_schedule_constraints(
+                    list(itinerary.days),
+                    ranked,
+                    ctx.profile,
+                    ctx.provider,
+                ),
+            )
+            critic_result = critique_itinerary(itinerary, ctx.profile)
     return replace(
         result,
         itinerary=itinerary,
