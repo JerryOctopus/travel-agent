@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
 
 from travel_agent.settings import get_settings
 from travel_agent.harness.preflight import preflight_amap, preflight_llm
+from travel_agent.evaluation.plan_quality_judge import preflight_judge
 
 
 def _check_llm(settings) -> dict:
@@ -27,16 +28,47 @@ def _check_amap(settings) -> dict:
     return preflight_amap(settings)
 
 
+def _check_judge(settings) -> dict:
+    return preflight_judge(settings.evaluation.judge)
+
+
+def validate_all(settings) -> dict:
+    """Preflight in spend-safe order and short-circuit every downstream API."""
+    amap = _check_amap(settings)
+    if not amap.get("ok") or amap.get("skipped"):
+        blocked = {
+            "ok": False,
+            "skipped": True,
+            "detail": "blocked because configured AMap preflight failed",
+        }
+        return {"amap_rest": amap, "llm": blocked, "judge": blocked}
+
+    llm = _check_llm(settings)
+    if not llm.get("ok") or llm.get("skipped"):
+        return {
+            "amap_rest": amap,
+            "llm": llm,
+            "judge": {
+                "ok": False,
+                "skipped": True,
+                "detail": "blocked because tested-model preflight failed",
+            },
+        }
+
+    return {
+        "amap_rest": amap,
+        "llm": llm,
+        "judge": _check_judge(settings),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate LLM and Amap API keys")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     settings = get_settings()
-    report = {
-        "llm": _check_llm(settings),
-        "amap_rest": _check_amap(settings),
-    }
+    report = validate_all(settings)
     ok = all(v.get("ok") for v in report.values())
 
     if args.json:

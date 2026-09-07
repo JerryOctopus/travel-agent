@@ -73,3 +73,98 @@ def test_amap_preflight_passes_only_when_weather_and_place_search_pass(monkeypat
     assert report["ok"] is True
     assert report["checks"]["weather"]["ok"] is True
     assert report["checks"]["place_search"]["ok"] is True
+
+
+def test_combined_preflight_stops_before_llm_when_amap_fails(monkeypatch) -> None:
+    calls: list[str] = []
+    settings = object()
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_amap",
+        lambda _settings: calls.append("amap") or {"ok": False},
+    )
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_llm",
+        lambda _settings: calls.append("llm") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_judge",
+        lambda _settings: calls.append("judge") or {"ok": True},
+    )
+
+    report = validate_api_keys.validate_all(settings)
+
+    assert calls == ["amap"]
+    assert report["llm"]["skipped"] is True
+    assert report["judge"]["skipped"] is True
+
+
+def test_combined_preflight_treats_local_fallback_as_not_release_ready(monkeypatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_amap",
+        lambda _settings: {"ok": True, "skipped": True},
+    )
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_llm",
+        lambda _settings: calls.append("llm") or {"ok": True},
+    )
+
+    report = validate_api_keys.validate_all(object())
+
+    assert calls == []
+    assert report["llm"]["ok"] is False
+
+
+def test_combined_preflight_stops_before_judge_when_llm_fails(monkeypatch) -> None:
+    calls: list[str] = []
+    settings = object()
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_amap",
+        lambda _settings: calls.append("amap") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_llm",
+        lambda _settings: calls.append("llm") or {"ok": False},
+    )
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_judge",
+        lambda _settings: calls.append("judge") or {"ok": True},
+    )
+
+    report = validate_api_keys.validate_all(settings)
+
+    assert calls == ["amap", "llm"]
+    assert report["judge"]["skipped"] is True
+
+
+def test_combined_preflight_calls_all_services_in_spend_safe_order(monkeypatch) -> None:
+    calls: list[str] = []
+    settings = object()
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_amap",
+        lambda _settings: calls.append("amap") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_llm",
+        lambda _settings: calls.append("llm") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        validate_api_keys,
+        "_check_judge",
+        lambda _settings: calls.append("judge") or {"ok": True},
+    )
+
+    report = validate_api_keys.validate_all(settings)
+
+    assert calls == ["amap", "llm", "judge"]
+    assert all(item["ok"] for item in report.values())

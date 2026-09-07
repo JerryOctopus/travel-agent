@@ -90,6 +90,13 @@ TRAVEL_AGENT_JUDGE_THINKING_ENABLED=false \
 PYTHONPATH=src .venv/bin/python scripts/eval_plan_quality.py preflight
 ```
 
+也可使用统一预检命令；它固定按 AMap → DeepSeek → SiliconFlow 执行。AMap 失败时不会
+调用 DeepSeek，DeepSeek 失败时不会调用 Judge：
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/validate_api_keys.py --json
+```
+
 完成两轮后由同一确定性合同验收，并核对两轮数据、代码、Prompt、评分器、工具、
 模型与 Judge 指纹完全一致：
 
