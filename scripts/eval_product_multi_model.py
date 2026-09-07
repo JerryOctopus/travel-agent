@@ -365,7 +365,12 @@ def provider_tool_quota_error(result) -> str | None:
     for turn in result.turns:
         messages.extend(
             str(item)
-            for item in (turn.error, turn.raw_failure)
+            for item in (
+                turn.error,
+                turn.raw_failure,
+                turn.failure_reason,
+                turn.reply_text,
+            )
             if item
         )
     markers = (

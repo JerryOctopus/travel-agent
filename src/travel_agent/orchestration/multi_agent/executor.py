@@ -1505,6 +1505,7 @@ def _enforce_planner_postcondition(
 
     from travel_agent.agent import toolkit
     from travel_agent.orchestration.meter import current_turn_meter
+    from travel_agent.providers import ProviderRateLimitError
 
     repaired: list[str] = []
     bound_ids = [str(item) for item in (task.inputs.get("artifact_ids") or []) if item]
@@ -1561,6 +1562,8 @@ def _enforce_planner_postcondition(
         )
         if planned.get("isError") or not task_ids("itinerary"):
             raise RuntimeError(str(planned.get("summary") or "itinerary artifact missing"))
+    except ProviderRateLimitError:
+        raise
     except Exception as exc:  # noqa: BLE001 - convert the postcondition to a result status
         result["status"] = STATUS_FAILED
         result["summary"] = f"planner postcondition failed: {type(exc).__name__}: {exc}"
@@ -1606,7 +1609,12 @@ def _planner_route_estimator(ctx: Any, artifact_ids: list[str]) -> Any:
                 continue
             cached[(route.origin_poi_id, route.destination_poi_id, route.mode)] = route
 
-    local = LocalToolProvider(list(getattr(ctx, "pois_by_id", {}).values()))
+    local_pois = (
+        ctx.poi_values()
+        if hasattr(ctx, "poi_values")
+        else list(getattr(ctx, "pois_by_id", {}).values())
+    )
+    local = LocalToolProvider(local_pois)
     live = getattr(ctx, "provider", None)
 
     class BoundRouteEstimator:

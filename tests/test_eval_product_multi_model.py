@@ -138,6 +138,24 @@ def test_provider_tool_quota_error_detects_amap_abort() -> None:
     assert "10044" in provider_tool_quota_error(result)
 
 
+def test_provider_tool_quota_error_detects_wrapped_incomplete_reply() -> None:
+    result = _result(["hotel", "transport"])
+    result = replace(
+        result,
+        turns=[
+            replace(
+                result.turns[0],
+                reply_text=(
+                    "当前方案尚不可交付。未解决：ProviderRateLimitError: "
+                    "AMap rate limit: USER_DAILY_QUERY_OVER_LIMIT (10044)。"
+                ),
+            )
+        ],
+    )
+
+    assert "10044" in provider_tool_quota_error(result)
+
+
 def test_provider_tool_quota_error_ignores_model_quota() -> None:
     result = _result(["attraction", "transport", "planner"])
     result.turns[0].model_calls.append(

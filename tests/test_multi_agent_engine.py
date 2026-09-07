@@ -2631,6 +2631,19 @@ def test_planner_route_estimator_never_hides_provider_quota() -> None:
     assert calls == 1
 
 
+def test_subagent_runner_propagates_provider_quota() -> None:
+    ctx = build_session(session_id="sess_runner_provider_quota", persist=False)
+    task = _task_for("attraction")
+
+    def executor(*_args, **_kwargs):
+        raise ProviderRateLimitError(
+            "AMap rate limit: USER_DAILY_QUERY_OVER_LIMIT (10044)"
+        )
+
+    with pytest.raises(ProviderRateLimitError, match="10044"):
+        SubagentRunner(ctx, executor).run_subagent(task)
+
+
 def test_transport_postcondition_builds_adjacent_chain_for_ordinary_full_plan() -> None:
     ctx = build_session(session_id="sess_transport_full_chain", persist=False)
     ctx.profile.destination = "测试城"

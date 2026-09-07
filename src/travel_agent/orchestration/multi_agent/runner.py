@@ -4,7 +4,8 @@
 
 - 按 ``SubagentDefinition.tool_names`` 白名单过滤工具，构建受限执行环境；
 - 执行单个 ``SubagentTask``，组装结构化 ``SubagentResult``；
-- **异常一律包装为 ``status="failed"`` 的结果，绝不向调用方上抛**；
+- 普通异常包装为 ``status="failed"``；配置工具配额异常保持类型并向上抛，
+  让正式评测立即停止后续模型调用；
 - 不在 Registry 中的 agent 名直接返回 failed（不抛异常）；
 - ``dispatch_subagent`` 永远不进入 Subagent 工具集（白名单物理隔离，
   ``assert_no_dispatch_leak`` 兜底校验）。
@@ -37,6 +38,7 @@ from travel_agent.orchestration.multi_agent.schemas import (
     SubagentResult,
     SubagentTask,
 )
+from travel_agent.providers import ProviderRateLimitError
 
 # Mock/真实执行器统一返回结构：至少包含 summary，其余字段可选。
 SubagentExecutor = Callable[[SubagentDefinition, SubagentTask, Any], dict[str, Any]]
@@ -262,6 +264,12 @@ class SubagentRunner:
                 warnings=["Subagent 执行达到 timeout_seconds 硬上限"],
                 duration_ms=_elapsed_ms(start),
             )
+        except ProviderRateLimitError:
+            # Configured-tool quota is a suite-level environment failure.
+            # Preserve its type so the turn lifecycle and eval runner can stop
+            # all later DeepSeek calls instead of treating it as one worker's
+            # recoverable failure.
+            raise
         except Exception as exc:  # noqa: BLE001 — 统一包装为 failed，不上抛
             return SubagentResult(
                 request_id=task.request_id,
