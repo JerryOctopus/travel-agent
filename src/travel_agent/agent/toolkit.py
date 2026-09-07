@@ -4287,13 +4287,29 @@ def _build_mobility_plan(
             )
         )
     ]
-    if cap is None and not terrain_avoidance:
+    mobility_text = " ".join(
+        str(value or "")
+        for value in [state.get("mobility"), *avoid_values]
+    ).casefold()
+    qualitative_low_walking = bool(
+        state.get("elderly")
+        or any(
+            marker in mobility_text
+            for marker in (
+                "low_walking", "少步行", "太多步行", "避免步行",
+                "行动不便", "mobility_limited",
+            )
+        )
+    )
+    qualitative_leg_limit_km = 1.0
+    if cap is None and not terrain_avoidance and not qualitative_low_walking:
         return None
     numeric_cap = float(cap) if cap is not None else None
     days: list[dict[str, Any]] = []
     venue_internal_access: list[dict[str, Any]] = []
     for day in itinerary.get("days") or []:
         known = 0.0
+        known_leg_distances: list[float] = []
         unknown_legs: list[str] = []
         for stop in day.get("stops") or []:
             route = stop.get("route_from_previous") or {}
@@ -4311,13 +4327,21 @@ def _build_mobility_plan(
                     f"{route.get('origin_name') or '上一站'}→{route.get('destination_name') or stop.get('name') or '下一站'}"
                 )
             else:
-                known += float(distance or 0)
+                numeric_distance = float(distance or 0)
+                known += numeric_distance
+                known_leg_distances.append(numeric_distance)
         days.append({
             "day_index": day.get("day_index"),
             "known_walking_km": round(known, 2),
             "unknown_walking_legs": unknown_legs,
             "taxi_fallback_required": bool(unknown_legs) or (
                 numeric_cap is not None and known > numeric_cap
+            ) or (
+                qualitative_low_walking
+                and any(
+                    distance > qualitative_leg_limit_km
+                    for distance in known_leg_distances
+                )
             ),
         })
         if terrain_avoidance:
@@ -4337,6 +4361,11 @@ def _build_mobility_plan(
         "已知步行距离计入每日上限；公交接驳步行距离未知或累计可能超限的区段，"
         "必须改用点到点出租车/网约车，并在出发前用地图复核。"
     )
+    if qualitative_low_walking:
+        route_policy += (
+            "定性少步行需求按单段公交接驳步行不超过1公里执行；超出时改用"
+            "点到点出租车/网约车。"
+        )
     internal_access_policy = (
         "景区内部无坡度、台阶或无障碍证据时不承诺可达，必须先核验无台阶入口/电梯；"
         "不能确认时替换候选，禁止走连续爬坡或长楼梯。"
@@ -4347,6 +4376,10 @@ def _build_mobility_plan(
         "required": True,
         "status": "bounded_with_taxi_fallback",
         "max_walking_km_per_day": numeric_cap,
+        "qualitative_low_walking": qualitative_low_walking,
+        "max_single_transit_walk_km": (
+            qualitative_leg_limit_km if qualitative_low_walking else None
+        ),
         "avoidance_requirements": terrain_avoidance,
         "days": days,
         "venue_internal_access": venue_internal_access,

@@ -8,6 +8,7 @@ from travel_agent.planning import (
     _opening_window_for_trip_day,
     apply_structured_schedule_constraints,
     build_simple_itinerary,
+    poi_open_on_trip_day,
 )
 from travel_agent.schemas import ItineraryDay, ItineraryStop, POI, ScoredPOI
 from travel_agent.planning_subgraph import plan_and_critique
@@ -166,6 +167,39 @@ def test_trip_day_opening_window_uses_matching_weekday_segment() -> None:
 
     assert _opening_window_for_trip_day(cafe, profile, 1) == (18 * 60, 22 * 60)
     assert _opening_window_for_trip_day(cafe, profile, 2) == (18 * 60, 22 * 60)
+
+
+def test_trip_day_is_closed_when_open_weekday_range_excludes_visit_date() -> None:
+    museum = POI(
+        "weekday-range", "合成博物馆", "测试城", "museum", 30.0, 120.0,
+        4.5, 0.8, [], 90, "mid",
+        opening_hours="周二至周日 09:00-17:00，节假日以官方通知为准",
+    )
+    monday = TravelProfile(destination="测试城", days=1, start_date="2026-10-12")
+    tuesday = TravelProfile(destination="测试城", days=1, start_date="2026-10-13")
+
+    assert poi_open_on_trip_day(museum, monday, 1) is False
+    assert poi_open_on_trip_day(museum, tuesday, 1) is True
+
+
+def test_structured_schedule_drops_venue_closed_by_weekday_range() -> None:
+    closed_monday = POI(
+        "closed-monday", "仅周二开放场馆", "测试城", "museum", 30.0, 120.0,
+        4.5, 0.8, [], 90, "mid", opening_hours="周二至周日 09:00-17:00",
+    )
+    always_open = POI(
+        "always-open", "全天公园", "测试城", "scenic", 30.01, 120.01,
+        4.5, 0.8, [], 90, "mid", opening_hours="周一至周日 08:00-20:00",
+    )
+    profile = TravelProfile(destination="测试城", days=1, start_date="2026-10-12")
+    days = [ItineraryDay(1, "test", [
+        ItineraryStop(closed_monday, "09:30", 90, ""),
+        ItineraryStop(always_open, "14:00", 90, ""),
+    ])]
+
+    scheduled = apply_structured_schedule_constraints(days, [], profile, None)
+
+    assert [stop.poi.poi_id for stop in scheduled[0].stops] == ["always-open"]
 
 
 def test_structured_schedule_never_uses_another_weekdays_opening_window() -> None:

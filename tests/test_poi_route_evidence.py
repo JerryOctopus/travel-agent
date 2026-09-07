@@ -441,6 +441,46 @@ def test_walking_cap_rebinds_transit_with_unknown_walk_to_verified_taxi() -> Non
     assert route.evidence_status == "provider_verified"
 
 
+def test_qualitative_low_walking_rebinds_long_transit_walk_to_verified_taxi() -> None:
+    a, b = _poi("a", "甲馆"), _poi("b", "乙馆")
+    itinerary = Itinerary("测试城", [ItineraryDay(1, "", [
+        ItineraryStop(a, "09:30", 60, ""),
+        ItineraryStop(b, "11:30", 60, ""),
+    ])], "")
+
+    class Estimator:
+        calls: list[str] = []
+
+        def estimate_route(self, origin, destination, mode):
+            self.calls.append(mode)
+            return normalize_route_evidence(RouteInfo(
+                origin_poi_id=origin.poi_id,
+                destination_poi_id=destination.poi_id,
+                distance_km=6.0,
+                duration_min=18 if mode == "taxi" else 55,
+                mode=mode,
+                source="amap",
+                walking_distance_km=None if mode == "taxi" else 1.4,
+            ))
+
+    estimator = Estimator()
+    rebound = rebind_itinerary_routes(
+        itinerary,
+        TravelProfile(
+            destination="测试城",
+            days=1,
+            constraint_state={"elderly": True, "mobility": "low_walking"},
+        ),
+        estimator,
+    )
+
+    route = rebound.days[0].stops[1].route_from_previous
+    assert estimator.calls == ["public_transport", "taxi"]
+    assert route is not None
+    assert route.mode == "taxi"
+    assert route.evidence_status == "provider_verified"
+
+
 def test_rebind_uses_verified_taxi_when_transit_exceeds_pace_limit() -> None:
     a, b = _poi("a", "甲馆"), _poi("b", "乙馆")
     itinerary = Itinerary("测试城", [ItineraryDay(1, "", [

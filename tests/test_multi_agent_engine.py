@@ -1143,6 +1143,50 @@ def test_full_plan_readiness_does_not_request_restaurant_evidence_without_concre
     assert soft == ["住宿证据", "预算证据"]
 
 
+def test_multiday_full_plan_readiness_requires_lodging_evidence() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile.days = 3
+    ctx.profile.constraint_state = {"duration_days": 3}
+    candidate_id = ctx.store.put("candidates", {"pois": [{"poi_id": "sight-1"}]})
+    route_id = ctx.store.put("routes", {"routes": []})
+
+    hard, soft = _required_evidence(
+        ctx,
+        TaskType.FULL_TRIP_PLAN,
+        [],
+        {
+            "profile": {"days": 3, "constraint_state": {"duration_days": 3}},
+            "artifact_ids": [candidate_id, route_id],
+            "task_brief": "规划三日完整行程",
+        },
+    )
+
+    assert hard == ["住宿证据"]
+    assert soft == ["预算证据"]
+
+
+def test_multiday_full_plan_does_not_require_hotel_search_when_lodging_is_self_arranged() -> None:
+    ctx = build_session(persist=False)
+    ctx.profile.days = 3
+    ctx.profile.constraint_state = {"duration_days": 3}
+    candidate_id = ctx.store.put("candidates", {"pois": [{"poi_id": "sight-1"}]})
+    route_id = ctx.store.put("routes", {"routes": []})
+
+    hard, soft = _required_evidence(
+        ctx,
+        TaskType.FULL_TRIP_PLAN,
+        [],
+        {
+            "profile": {"days": 3, "constraint_state": {"duration_days": 3}},
+            "artifact_ids": [candidate_id, route_id],
+            "task_brief": "酒店已经订好，请规划三日完整行程",
+        },
+    )
+
+    assert hard == []
+    assert soft == ["住宿证据", "预算证据"]
+
+
 def test_full_plan_readiness_treats_lodging_downgrade_as_explicit_hotel_evidence() -> None:
     ctx = build_session(persist=False)
     ctx.profile.constraint_state = {"lodging_flexibility": "can_downgrade"}
@@ -1230,12 +1274,16 @@ def test_full_plan_readiness_accepts_grounded_restaurant_without_one_per_day_rul
         "restaurants",
         {"restaurants": [{"poi_id": "meal-1", "name": "餐厅一"}]},
     )
+    hotel_id = ctx.store.put(
+        "hotels",
+        {"hotels": [{"hotel_id": "hotel-1", "name": "住宿一"}]},
+    )
 
     hard, _soft = _required_evidence(
         ctx,
         TaskType.FULL_TRIP_PLAN,
         [],
-        {"artifact_ids": [candidate_id, route_id, restaurant_id]},
+        {"artifact_ids": [candidate_id, route_id, restaurant_id, hotel_id]},
     )
 
     assert hard == []

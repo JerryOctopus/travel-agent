@@ -1427,6 +1427,36 @@ def test_mobility_plan_counts_verified_taxi_as_zero_route_walking() -> None:
     assert mobility["days"][0]["taxi_fallback_required"] is False
 
 
+def test_mobility_plan_represents_qualitative_low_walking_requirement() -> None:
+    profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        constraint_state={
+            "elderly": True,
+            "mobility": "low_walking",
+            "avoid": ["太多步行"],
+        },
+    )
+    mobility = toolkit._build_mobility_plan(
+        profile,
+        {"days": [{"day_index": 1, "stops": [{
+            "name": "乙馆",
+            "route_from_previous": {
+                "origin_name": "甲馆",
+                "destination_name": "乙馆",
+                "mode": "public_transport",
+                "walking_distance_km": 1.4,
+                "evidence_status": "provider_verified",
+            },
+        }]}]},
+    )
+
+    assert mobility is not None
+    assert mobility["qualitative_low_walking"] is True
+    assert mobility["max_single_transit_walk_km"] == 1.0
+    assert mobility["days"][0]["taxi_fallback_required"] is True
+
+
 def test_mobility_plan_addresses_hill_and_stair_avoidance_without_numeric_cap() -> None:
     profile = TravelProfile(
         destination="重庆",

@@ -50,6 +50,7 @@ REQUIRED_ACTIVITY_TIMES = ["09:00", "12:00", "15:00", "17:00"]
 MEAL_TIMES = ["11:30", "18:00"]
 MEAL_TIME_WINDOWS = ["11:30", "12:00", "12:30", "12:45", "17:30", "18:00", "19:00"]
 TRANSFER_BUFFER_MIN = 15
+QUALITATIVE_LOW_WALKING_LEG_KM = 1.0
 
 
 def build_simple_itinerary(
@@ -1069,12 +1070,31 @@ def _is_suitable_for_requested_weekday(poi: POI, weekday: object) -> bool:
     hours = str(poi.opening_hours or "").replace(" ", "")
     if not requested or not hours:
         return True
-    return not (
+    explicitly_closed = (
         f"{requested}全天不开放" in hours
         or f"{requested}全天关闭" in hours
         or f"{requested}闭馆" in hours
         or (requested == "周一" and "周一闭馆" in hours)
     )
+    if explicitly_closed:
+        return False
+    weekday_name = requested.removeprefix("周")
+    weekday_index = _WEEKDAY_INDEX.get(weekday_name)
+    if weekday_index is None:
+        return True
+    recurring_open_clauses = [
+        clause
+        for clause in re.split(r"[；;，,]", hours)
+        if _has_weekday_selector(clause)
+        and _daily_opening_window(clause) is not None
+        and not re.search(r"不开放|关闭|闭馆|休息|暂停营业|停止开放", clause)
+    ]
+    if recurring_open_clauses:
+        return any(
+            _weekday_clause_applies(clause, weekday_index)
+            for clause in recurring_open_clauses
+        )
+    return True
 
 
 def poi_open_on_trip_day(poi: POI, profile: TravelProfile, day_index: int) -> bool:
@@ -1084,7 +1104,58 @@ def poi_open_on_trip_day(poi: POI, profile: TravelProfile, day_index: int) -> bo
         current = date.fromisoformat(str(profile.start_date)) + timedelta(days=day_index - 1)
     except (TypeError, ValueError):
         return True
-    weekday = "周" + "一二三四五六日"[current.weekday()]
+    opening = str(poi.opening_hours or "").strip()
+    if not opening:
+        return True
+    weekday_index = current.weekday()
+    clauses = [
+        clause.strip()
+        for clause in re.split(r"[；;，,]", opening)
+        if clause.strip()
+    ]
+    relevant_clauses = [
+        clause
+        for clause in clauses
+        if not _calendar_ranges(clause, current.year)
+        or _date_clause_applies(clause, current)
+    ]
+    closure_pattern = re.compile(
+        r"(?:不开放|关闭|闭馆|休息|暂停营业|停止开放)"
+    )
+    for clause in relevant_clauses:
+        if (
+            _has_weekday_selector(clause)
+            and _weekday_clause_applies(clause, weekday_index)
+            and closure_pattern.search(clause)
+        ):
+            return False
+
+    scoped_open = [
+        clause
+        for clause in relevant_clauses
+        if _has_weekday_selector(clause)
+        and _daily_opening_window(clause) is not None
+        and not closure_pattern.search(clause)
+    ]
+    if any(
+        _weekday_clause_applies(clause, weekday_index)
+        for clause in scoped_open
+    ):
+        return True
+    general_open = any(
+        not _has_weekday_selector(clause)
+        and _daily_opening_window(clause) is not None
+        and not closure_pattern.search(clause)
+        for clause in relevant_clauses
+    )
+    if general_open:
+        return True
+    # A provider-supplied open weekday range is positive evidence only for the
+    # included days.  Treat excluded days as closed instead of silently
+    # borrowing that range's hours.
+    if scoped_open:
+        return False
+    weekday = "周" + "一二三四五六日"[weekday_index]
     return _is_suitable_for_requested_weekday(poi, weekday)
 
 
@@ -1112,11 +1183,34 @@ def _estimate_stop_route(
         state.get(key) is not None
         for key in ("max_walking_km_per_day", "max_single_walk_km")
     )
+    raw_avoid = state.get("avoid") or []
+    avoid_values = [raw_avoid] if isinstance(raw_avoid, str) else list(raw_avoid)
+    mobility_text = " ".join(
+        str(value or "")
+        for value in [state.get("mobility"), *avoid_values]
+    ).casefold()
+    qualitative_low_walking = bool(
+        state.get("elderly")
+        or any(
+            marker in mobility_text
+            for marker in (
+                "low_walking", "少步行", "太多步行", "避免步行",
+                "行动不便", "mobility_limited",
+            )
+        )
+    )
     transit_walk_is_unknown = bool(
         route_is_bound
         and route is not None
         and route.mode == "public_transport"
         and route.walking_distance_km is None
+    )
+    transit_walk_exceeds_qualitative_limit = bool(
+        route_is_bound
+        and route is not None
+        and route.mode == "public_transport"
+        and route.walking_distance_km is not None
+        and route.walking_distance_km > QUALITATIVE_LOW_WALKING_LEG_KM
     )
     pace_limit = {
         "relaxed": 45,
@@ -1148,11 +1242,15 @@ def _estimate_stop_route(
         and taxi_fallback_allowed
         and (
             (
-                has_walking_cap
+                (has_walking_cap or qualitative_low_walking)
                 and (
                     not route_is_bound
                     or canonical_route_evidence_status(route) != "provider_verified"
                     or transit_walk_is_unknown
+                    or (
+                        qualitative_low_walking
+                        and transit_walk_exceeds_qualitative_limit
+                    )
                 )
             )
             or transit_exceeds_pace

@@ -216,6 +216,20 @@ def test_fixed_dispatch_adds_hotel_and_restaurant_only_when_explicit() -> None:
     }
 
 
+def test_fixed_dispatch_adds_hotel_evidence_for_multiday_full_itinerary() -> None:
+    tasks = build_fixed_tasks(
+        "req_multiday",
+        TaskType.FULL_ITINERARY,
+        task_brief="规划三日完整行程",
+        inputs={"profile": {"days": 3, "constraint_state": {"duration_days": 3}}},
+    )
+
+    assert isinstance(tasks, list)
+    assert {task.agent for task in tasks} == {
+        "attraction", "hotel", "transport", "planner"
+    }
+
+
 def test_fixed_dispatch_respects_self_arranged_and_excluded_domains() -> None:
     tasks = build_fixed_tasks(
         "req_arranged",

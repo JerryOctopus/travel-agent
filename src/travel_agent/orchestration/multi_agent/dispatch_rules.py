@@ -79,7 +79,7 @@ def agents_required_for_turn(
     task_brief: str = "",
     inputs: dict | None = None,
 ) -> tuple[str, ...]:
-    """Return only agents justified by explicit needs or hard constraints."""
+    """Return agents justified by explicit needs or structural trip requirements."""
     if task_type in {None, TaskType.CLARIFICATION, TaskType.CONSTRAINT_NEGOTIATION, TaskType.SAFE_DECLINE}:
         return ()
     text = task_brief.lower()
@@ -96,6 +96,19 @@ def agents_required_for_turn(
         or state.get("lodging_area")
         or profile.get("hotel_area")
     ) and not self_arranged_hotel and "酒店推荐" not in exclusions
+    duration_value = state.get("duration_days") or profile.get("days")
+    try:
+        multiday_lodging_required = (
+            task_type == TaskType.FULL_ITINERARY
+            and int(duration_value) > 1
+        )
+    except (TypeError, ValueError):
+        multiday_lodging_required = False
+    hotel_required = (
+        (hotel_explicit or multiday_lodging_required)
+        and not self_arranged_hotel
+        and "酒店推荐" not in exclusions
+    )
     restaurant_explicit = specific_restaurant_recommendation_requested(
         task_brief, profile, state
     )
@@ -116,13 +129,13 @@ def agents_required_for_turn(
             for key in ("target_anchor", "location_anchor", "origin")
         ):
             base.append("transport")
-        if hotel_explicit:
+        if hotel_required:
             base.append("hotel")
         if restaurant_explicit:
             base.append("restaurant")
         return tuple(base)
     agents = ["attraction", "transport", "planner"]
-    if hotel_explicit:
+    if hotel_required:
         agents.insert(1, "hotel")
     if restaurant_explicit:
         agents.insert(1, "restaurant")

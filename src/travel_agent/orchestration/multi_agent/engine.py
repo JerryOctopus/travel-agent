@@ -2301,10 +2301,30 @@ def _required_evidence(
     if task_type == TaskType.FULL_ITINERARY:
         require("candidates", "景点候选")
         require("routes", "路线可行性")
+        task_brief = str(base_inputs.get("task_brief") or "")
+        profile_payload = dict(base_inputs.get("profile") or {})
+        duration_value = (
+            state.get("duration_days")
+            or profile_payload.get("days")
+            or getattr(getattr(ctx, "profile", None), "days", None)
+        )
+        try:
+            multiday = int(duration_value) > 1
+        except (TypeError, ValueError):
+            multiday = False
+        self_arranged_hotel = bool(
+            re.search(
+                r"(?:酒店|住宿).{0,8}(?:已订|订好|自己安排|自行安排)",
+                task_brief,
+            )
+        )
+        hotel_recommendation_excluded = "酒店推荐" in " ".join(
+            str(item) for item in (state.get("exclude") or [])
+        )
         hotel_explicit = bool(
             re.search(
                 r"(?:酒店|住宿).{0,8}(?:降档|经济|便宜|省预算)",
-                str(base_inputs.get("task_brief") or "").lower(),
+                task_brief.lower(),
             )
             or
             any(
@@ -2316,7 +2336,16 @@ def _required_evidence(
                 )
             )
         )
-        require("hotels", "住宿证据", hard_required=hotel_explicit)
+        lodging_evidence_required = (
+            (hotel_explicit or multiday)
+            and not self_arranged_hotel
+            and not hotel_recommendation_excluded
+        )
+        require(
+            "hotels",
+            "住宿证据",
+            hard_required=lodging_evidence_required,
+        )
         budget_explicit = bool(
             getattr(getattr(ctx, "profile", None), "budget_limit", None)
             or any(
@@ -2335,7 +2364,6 @@ def _required_evidence(
             specific_restaurant_recommendation_requested,
         )
 
-        profile_payload = dict(base_inputs.get("profile") or {})
         food_explicit = specific_restaurant_recommendation_requested(
             str(base_inputs.get("task_brief") or ""), profile_payload, state
         )
