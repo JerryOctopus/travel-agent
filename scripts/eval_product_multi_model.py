@@ -20,7 +20,7 @@ if str(SRC) not in sys.path:
 
 from travel_agent.harness import AgentHarness, HarnessEnvironment
 from travel_agent.harness.cases import load_cases_json
-from travel_agent.harness.preflight import preflight_llm
+from travel_agent.harness.preflight import preflight_amap, preflight_llm
 from travel_agent.harness.product import (
     DEFAULT_PRODUCT_DEV_CASES,
     PRODUCTION_DATASET_VERSION,
@@ -307,10 +307,22 @@ def build_state_template(
             for provider, model in model_specs
         },
         "model_unavailable": [],
+        "tool_preflight": None,
         "model_preflight": [],
         "model_switch_log": [],
         "rows": [],
     }
+
+
+def run_tool_preflight(settings: Any, tool_provider: str) -> dict[str, Any]:
+    """Probe the configured live tool before any LLM request is made."""
+    if tool_provider != "configured":
+        return {
+            "ok": True,
+            "skipped": True,
+            "detail": f"tool provider {tool_provider!r} does not use configured AMap",
+        }
+    return preflight_amap(settings)
 
 
 def multi_agent_fields(result) -> dict[str, Any]:
@@ -594,6 +606,16 @@ def main() -> None:
             raise RuntimeError("run already exists. Use --resume or choose different --run-id.")
 
     if args.preflight and not args.resume:
+        print("Preflighting configured tool provider...")
+        state["tool_preflight"] = run_tool_preflight(
+            settings, args.tool_provider
+        )
+        if not state["tool_preflight"].get("ok"):
+            save_state(state_path, state)
+            raise RuntimeError(
+                "configured AMap preflight failed before model preflight: "
+                + json.dumps(state["tool_preflight"], ensure_ascii=False)
+            )
         print("Preflighting model list...")
         usable: list[tuple[str, str, str]] = []
         state["model_preflight"] = []
@@ -705,6 +727,7 @@ def main() -> None:
         payload = {
             "run_id": run_id,
             "real_multi_agent": True,
+            "tool_preflight": state.get("tool_preflight"),
             "usable_models": state["models"],
             "unavailable_models": state["model_unavailable"],
         }
@@ -1018,6 +1041,7 @@ def main() -> None:
                 )
             }),
             "model_preflight": list(state.get("model_preflight") or []),
+            "tool_preflight": state.get("tool_preflight"),
             "real_multi_agent": True,
             "tool_provider_mode": args.tool_provider,
             "required_agents": sorted({

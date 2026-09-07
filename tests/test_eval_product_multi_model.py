@@ -20,11 +20,33 @@ from scripts.eval_product_multi_model import (
     pick_api_key,
     provider_tool_quota_error,
     provider_reported_models,
+    run_tool_preflight,
     relay_mode_enabled,
     recorded_model_identity,
     save_pending_case_output,
     save_state,
 )
+
+
+def test_tool_preflight_reports_failure_without_any_model_probe(monkeypatch) -> None:
+    calls: list[str] = []
+    settings = type("Settings", (), {"amap": object()})()
+
+    def fail_amap(_settings):
+        calls.append("amap")
+        return {
+            "ok": False,
+            "checks": {"place_search": {"ok": False, "infocode": "10044"}},
+        }
+
+    monkeypatch.setattr(
+        "scripts.eval_product_multi_model.preflight_amap", fail_amap
+    )
+
+    result = run_tool_preflight(settings, "configured")
+
+    assert calls == ["amap"]
+    assert result["ok"] is False
 
 
 def test_run_lock_rejects_concurrent_writer(tmp_path) -> None:

@@ -180,6 +180,13 @@ def _stage_run(root: Path, split: str, manifest: dict, *, judge: bool = True) ->
             }
         ],
         "tool_provider_mode": "configured",
+        "tool_preflight": {
+            "ok": True,
+            "checks": {
+                "weather": {"ok": True},
+                "place_search": {"ok": True},
+            },
+        },
         "hybrid_flags": {"a": False, "b": False},
         "model_execution_mode": "fixed_single_model",
         "judge_provider": JUDGE["provider"],
@@ -316,6 +323,26 @@ def test_stage_rejects_provider_reported_model_drift(tmp_path: Path) -> None:
 
     assert result["passed"] is False
     assert any("provider-reported model identity" in item for item in result["failures"])
+
+
+def test_stage_rejects_missing_or_failed_amap_preflight(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    run = tmp_path / "core-run"
+    _stage_run(run, "core_frozen", manifest)
+    summary_path = run / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["artifacts"]["tool_preflight"]["checks"]["place_search"] = {
+        "ok": False,
+        "detail": "USER_DAILY_QUERY_OVER_LIMIT",
+        "infocode": "10044",
+    }
+    summary["artifacts"]["tool_preflight"]["ok"] = False
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = evaluate_frozen_stage(run, manifest, "core_frozen")
+
+    assert result["passed"] is False
+    assert any("AMap preflight" in item for item in result["failures"])
 
 
 def test_stage_rejects_summary_case_field_disagreement(tmp_path: Path) -> None:

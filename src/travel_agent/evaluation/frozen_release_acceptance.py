@@ -569,6 +569,16 @@ def _check_identity(
     )
     _require(_same_number(artifacts.get("model_temperature"), 0.2) and artifacts.get("model_thinking_enabled") is False, failures, "run tested model settings mismatch")
     _require(artifacts.get("tool_provider_mode") == "configured", failures, "run tool provider must be configured")
+    tool_preflight = artifacts.get("tool_preflight") or {}
+    tool_checks = tool_preflight.get("checks") or {}
+    _require(
+        tool_preflight.get("ok") is True
+        and tool_preflight.get("skipped") is not True
+        and (tool_checks.get("weather") or {}).get("ok") is True
+        and (tool_checks.get("place_search") or {}).get("ok") is True,
+        failures,
+        "run configured AMap preflight is missing, skipped, or failed",
+    )
     _require(not any(bool(value) for value in (artifacts.get("hybrid_flags") or {}).values()), failures, "run Hybrid flags must all be disabled")
     _require(artifacts.get("model_execution_mode") == "fixed_single_model", failures, "run must use one fixed model")
     if require_judge:

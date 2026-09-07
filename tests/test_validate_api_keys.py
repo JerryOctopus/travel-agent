@@ -2,6 +2,7 @@ import json
 from types import SimpleNamespace
 
 from scripts import validate_api_keys
+from travel_agent.harness import preflight
 
 
 class _Response:
@@ -47,7 +48,7 @@ def test_amap_preflight_requires_place_search_quota(monkeypatch) -> None:
             })
         return _Response({"status": "1", "lives": [{"weather": "晴"}]})
 
-    monkeypatch.setattr(validate_api_keys, "urlopen", fake_urlopen)
+    monkeypatch.setattr(preflight, "urlopen", fake_urlopen)
 
     report = validate_api_keys._check_amap(_settings())
 
@@ -62,7 +63,7 @@ def test_amap_preflight_requires_place_search_quota(monkeypatch) -> None:
 
 def test_amap_preflight_passes_only_when_weather_and_place_search_pass(monkeypatch) -> None:
     monkeypatch.setattr(
-        validate_api_keys,
+        preflight,
         "urlopen",
         lambda *_args, **_kwargs: _Response({"status": "1", "pois": []}),
     )
