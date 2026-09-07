@@ -866,6 +866,42 @@ def test_hotel_search_without_requested_area_starts_with_central_area_evidence(
     assert result["hotels"][0]["area"] == "核心商圈"
 
 
+def test_hotel_search_filters_prefecture_outliers_against_city_center_anchor(
+    monkeypatch,
+) -> None:
+    ctx = _session()
+    toolkit.update_travel_profile(ctx, destination="合成城", days=3)
+    center_hotel = POI(
+        "center-hotel", "主城区酒店", "合成城市", "hotel", 30.01, 120.01,
+        4.6, 0.8, ["hotel"], 0, "unknown", source="amap",
+        entity_type="hotel", address="中心区主路1号",
+    )
+    remote_hotel = POI(
+        "remote-hotel", "下辖远端市酒店", "合成城市", "hotel", 30.8, 120.8,
+        4.8, 0.9, ["hotel"], 0, "unknown", source="amap",
+        entity_type="hotel", address="远端市新区2号",
+    )
+    government = POI(
+        "government", "合成城市人民政府", "合成城市", "scenic", 30.0, 120.0,
+        0.0, 0.0, [], 0, "unknown", source="amap",
+        entity_type="unknown",
+    )
+    calls = []
+
+    def search_pois(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("query_tags") == ["合成城人民政府"]:
+            return [government]
+        return [remote_hotel, center_hotel]
+
+    monkeypatch.setattr(ctx.provider, "search_pois", search_pois)
+
+    result = toolkit.search_hotel(ctx)
+
+    assert [item["name"] for item in result["hotels"]] == ["主城区酒店"]
+    assert any(call.get("query_tags") == ["合成城人民政府"] for call in calls)
+
+
 def test_hotel_search_applies_explicit_nightly_budget_to_estimated_candidates(
     monkeypatch,
 ) -> None:

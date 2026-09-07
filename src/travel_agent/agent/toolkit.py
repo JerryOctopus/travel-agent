@@ -33,7 +33,11 @@ from travel_agent.agent.session import SessionContext, current_task_meta
 from travel_agent.agent.tool_contract import contracted_tool
 from travel_agent.constraints import ConstraintSet
 from travel_agent.planning_subgraph import plan_and_critique as run_plan_and_critique
-from travel_agent.planning import TRANSFER_BUFFER_MIN, rebind_itinerary_routes
+from travel_agent.planning import (
+    TRANSFER_BUFFER_MIN,
+    poi_open_on_trip_day,
+    rebind_itinerary_routes,
+)
 from travel_agent.providers import ProviderRateLimitError
 from travel_agent.poi_evidence import (
     canonical_entity_match_evidence,
@@ -131,6 +135,69 @@ def _filter_directional_area_pois(
         "北侧": lambda poi: poi.lat >= anchor.lat + tolerance,
     }
     return [poi for poi in hotels if predicates[direction](poi)]
+
+
+def _coordinate_distance_km(left: POI, right: POI) -> float:
+    radius_km = 6371.0088
+    lat1, lat2 = math.radians(left.lat), math.radians(right.lat)
+    delta_lat = lat2 - lat1
+    delta_lng = math.radians(right.lng - left.lng)
+    value = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lng / 2) ** 2
+    )
+    return 2 * radius_km * math.asin(min(1.0, math.sqrt(value)))
+
+
+def _filter_prefecture_hotel_outliers(
+    provider: Any,
+    city: str,
+    hotels: list[POI],
+) -> list[POI]:
+    """Anchor dispersed default hotel results to the requested city center.
+
+    A provider city filter can include distant county-level cities within the
+    same prefecture.  Only pay for a city-center lookup when the returned hotel
+    set is already geographically dispersed; compact result sets retain their
+    original evidence and incur no extra provider request.
+    """
+    if len(hotels) < 2:
+        return hotels
+    max_span = max(
+        _coordinate_distance_km(left, right)
+        for index, left in enumerate(hotels)
+        for right in hotels[index + 1 :]
+    )
+    if max_span <= 2 * LODGING_ACTIVITY_AREA_CONFLICT_KM:
+        return hotels
+    try:
+        anchors = provider.search_pois(
+            city=city,
+            query_tags=[f"{city}人民政府"],
+            category=None,
+            max_results=5,
+        )
+    except ProviderRateLimitError:
+        raise
+    except Exception:
+        return hotels
+    anchors = [
+        poi
+        for poi in anchors
+        if isinstance(poi, POI)
+        and poi.lat
+        and poi.lng
+        and any(marker in str(poi.name or "") for marker in ("人民政府", "市政府"))
+    ]
+    if not anchors:
+        return hotels
+    anchor = anchors[0]
+    return [
+        hotel
+        for hotel in hotels
+        if _coordinate_distance_km(anchor, hotel)
+        <= LODGING_ACTIVITY_AREA_CONFLICT_KM
+    ]
 
 
 def _ok(summary: str, **data: Any) -> dict[str, Any]:
@@ -1159,6 +1226,10 @@ def search_hotel(
                 max_results=max_results * 2,
             )
             area_evidenced = False
+    else:
+        poi_hotels = _filter_prefecture_hotel_outliers(
+            ctx.provider, target_city, poi_hotels
+        )
     ctx.remember_pois(poi_hotels)
     effective_area = target_area if area_evidenced else None
     hotels = _hotels_from_pois(poi_hotels, effective_area, target_budget)
@@ -5487,6 +5558,28 @@ def _is_unavailable_or_infrastructure_poi(
         or any(name.endswith(suffix) for suffix in _NON_VISITABLE_NAME_SUFFIXES)
         or _is_closed_on_requested_weekday(poi, profile)
         or _is_outside_explicit_opening_season(poi, profile)
+        or _is_closed_on_every_trip_day(poi, profile)
+    )
+
+
+def _is_closed_on_every_trip_day(
+    poi: POI,
+    profile: TravelProfile | None,
+) -> bool:
+    """Reject dated candidates that cannot be visited anywhere in the trip.
+
+    This check intentionally runs before semantic venue deduplication.  An
+    exact-name provider record can carry a narrow holiday schedule while a
+    verified parent/alias record remains open on the requested dates.  If the
+    closed exact record wins deduplication first, the usable alternative is
+    lost before Planner's later opening-hours gate can see it.
+    """
+    if profile is None or not profile.start_date:
+        return False
+    trip_days = max(1, int(profile.days or 1))
+    return not any(
+        poi_open_on_trip_day(poi, profile, day_index)
+        for day_index in range(1, trip_days + 1)
     )
 
 

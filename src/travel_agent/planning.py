@@ -51,6 +51,7 @@ MEAL_TIMES = ["11:30", "18:00"]
 MEAL_TIME_WINDOWS = ["11:30", "12:00", "12:30", "12:45", "17:30", "18:00", "19:00"]
 TRANSFER_BUFFER_MIN = 15
 QUALITATIVE_LOW_WALKING_LEG_KM = 1.0
+MEAL_AREA_DIVERSITY_KM = 5.0
 
 
 def build_simple_itinerary(
@@ -149,6 +150,10 @@ def _select_plan_candidates(
         for item in ranked_pois
         if item.poi.category != "food" or poi_complies_with_dietary(item.poi, profile)
         if _is_suitable_for_requested_weekday(item.poi, state.get("weekday"))
+        if not profile.start_date or any(
+            poi_open_on_trip_day(item.poi, profile, day_index)
+            for day_index in range(1, max(1, int(profile.days or 1)) + 1)
+        )
     ]
     eligible = _dedupe_semantic_venues(
         eligible,
@@ -248,6 +253,7 @@ def _select_plan_candidates(
     # supplied a dietary hard constraint. Generic itineraries reserve meal time
     # in prose/rendering instead of inventing a restaurant recommendation.
     selected_food_brands: set[str] = set()
+    selected_food_pois: list[POI] = []
     food_candidates = [entry for entry in eligible if entry.poi.category == "food"]
     meal_anchors = [entry.poi for entry in selected if entry.poi.category != "food"]
     if meal_anchors:
@@ -280,8 +286,19 @@ def _select_plan_candidates(
         brand = _food_brand_key(item.poi.name)
         if brand in selected_food_brands:
             continue
+        if any(
+            _haversine_km(
+                item.poi.lng,
+                item.poi.lat,
+                selected_food.lng,
+                selected_food.lat,
+            ) < MEAL_AREA_DIVERSITY_KM
+            for selected_food in selected_food_pois
+        ):
+            continue
         add(item)
         selected_food_brands.add(brand)
+        selected_food_pois.append(item.poi)
         if sum(entry.poi.category == "food" for entry in selected) >= profile.days:
             break
 
@@ -292,7 +309,14 @@ def _select_plan_candidates(
             entry.poi.category == "food" for entry in selected
         ) >= profile.days:
             break
+        brand = _food_brand_key(item.poi.name)
+        if brand in selected_food_brands:
+            continue
+        before = len(selected)
         add(item)
+        if len(selected) > before:
+            selected_food_brands.add(brand)
+            selected_food_pois.append(item.poi)
 
     # Sparse offline/local catalogs may contain fewer distinct restaurants
     # than trip days. Reusing a grounded restaurant on another day is truthful
@@ -1035,9 +1059,9 @@ def _has_weekday_selector(clause: str) -> bool:
 def _calendar_ranges(clause: str, year: int) -> list[tuple[date, date]]:
     ranges: list[tuple[date, date]] = []
     pattern = re.compile(
-        r"(?<!\d)(\d{1,2})(?:/|-|月)(\d{1,2})(?:日)?\s*"
+        r"(?<!\d)(\d{1,2})(?:[./-]|月)(\d{1,2})(?:日)?\s*"
         r"(?:至|到|[-—–~])\s*"
-        r"(\d{1,2})(?:/|-|月)(\d{1,2})(?:日)?"
+        r"(\d{1,2})(?:[./-]|月)(\d{1,2})(?:日)?"
     )
     for start_month, start_day, end_month, end_day in pattern.findall(clause):
         try:
@@ -1119,6 +1143,17 @@ def poi_open_on_trip_day(poi: POI, profile: TravelProfile, day_index: int) -> bo
         if not _calendar_ranges(clause, current.year)
         or _date_clause_applies(clause, current)
     ]
+    timed_clauses = [
+        clause for clause in clauses if _daily_opening_window(clause) is not None
+    ]
+    if (
+        timed_clauses
+        and all(_calendar_ranges(clause, current.year) for clause in timed_clauses)
+        and not any(
+            _date_clause_applies(clause, current) for clause in timed_clauses
+        )
+    ):
+        return False
     closure_pattern = re.compile(
         r"(?:不开放|关闭|闭馆|休息|暂停营业|停止开放)"
     )
@@ -1570,12 +1605,29 @@ def _cluster_scored_pois_by_day(
                 if not donors:
                     break
                 target_center = _centroid(groups[target_index]) if groups[target_index] else None
+                rebalance_radius_km = {
+                    "relaxed": 20.0,
+                    "standard": 30.0,
+                    "intensive": 40.0,
+                }[profile.pace]
+                movable = [
+                    (source_index, item)
+                    for source_index in donors
+                    for item in groups[source_index]
+                    if target_center is None
+                    or _haversine_km(
+                        item.poi.lng,
+                        item.poi.lat,
+                        target_center[0],
+                        target_center[1],
+                    ) <= rebalance_radius_km
+                ]
+                if not movable:
+                    # A sparse but coherent remote day is preferable to
+                    # manufacturing completeness with a cross-city detour.
+                    break
                 donor_index, moved = min(
-                    (
-                        (source_index, item)
-                        for source_index in donors
-                        for item in groups[source_index]
-                    ),
+                    movable,
                     key=lambda pair: (
                         hard_required(pair[1]),
                         _haversine_km(
@@ -1595,29 +1647,58 @@ def _cluster_scored_pois_by_day(
         # otherwise fill one cluster to capacity and force two restaurants
         # onto another day even though the overall plan has enough room.
         activity_limit = max(0, max_per_day - 1)
+        meal_rebalance_radius_km = {
+            "relaxed": 20.0,
+            "standard": 30.0,
+            "intensive": 40.0,
+        }[profile.pace]
         for source_index in range(days):
             while len(groups[source_index]) > activity_limit:
                 targets = [
                     index
                     for index in range(days)
-                    if index != source_index and len(groups[index]) < activity_limit
+                    if index != source_index
+                    and len(groups[index]) < activity_limit
                 ]
-                if not targets:
-                    break
-                moved = groups[source_index].pop()
-                target_index = min(
-                    targets,
-                    key=lambda index: (
-                        _haversine_km(
-                            moved.poi.lng,
-                            moved.poi.lat,
-                            *_centroid(groups[index]),
+                movable = next(
+                    (
+                        item for item in reversed(groups[source_index])
+                        if not any(
+                            poi_matches_must_visit(item.poi, term)
+                            for term in profile.must_visit
                         )
-                        if groups[index]
-                        else 0.0
                     ),
+                    None,
                 )
-                groups[target_index].append(moved)
+                if movable is None:
+                    break
+                coherent_targets = [
+                    index for index in targets
+                    if not groups[index]
+                    or _haversine_km(
+                        movable.poi.lng,
+                        movable.poi.lat,
+                        *_centroid(groups[index]),
+                    ) <= meal_rebalance_radius_km
+                ]
+                groups[source_index].remove(movable)
+                if coherent_targets:
+                    target_index = min(
+                        coherent_targets,
+                        key=lambda index: (
+                            _haversine_km(
+                                movable.poi.lng,
+                                movable.poi.lat,
+                                *_centroid(groups[index]),
+                            )
+                            if groups[index]
+                            else 0.0
+                        ),
+                    )
+                    groups[target_index].append(movable)
+                # When every under-filled day belongs to a remote area, leave
+                # the optional activity out so each day can still receive a
+                # nearby meal without cross-city backtracking.
     for index in sorted(range(days), key=lambda value: len(groups[value])):
         if not remaining_food or len(groups[index]) >= max_per_day:
             continue

@@ -68,6 +68,51 @@ def test_geo_cluster_balances_two_activities_per_day_when_supply_allows() -> Non
     assert [len(day.stops) for day in itinerary.days] == [2, 2, 2]
 
 
+def test_geo_cluster_keeps_remote_hard_anchor_day_geographically_coherent() -> None:
+    profile = TravelProfile(
+        destination="测试城",
+        days=3,
+        pace="standard",
+        interests=["food"],
+        must_visit=["city-anchor", "remote-anchor"],
+    )
+    ranked = [
+        _poi("remote-anchor", 120.50, 30.20),
+        _poi("city-anchor", 120.00, 30.20),
+        _poi("city-1", 120.01, 30.20),
+        _poi("city-2", 120.02, 30.20),
+        _poi("city-3", 120.03, 30.20),
+        _poi("city-4", 120.04, 30.20),
+        _poi("remote-meal-1", 120.501, 30.20, category="food", tags=["food"]),
+        _poi("remote-meal-2", 120.502, 30.20, category="food", tags=["food"]),
+        _poi("city-meal-1", 120.005, 30.20, category="food", tags=["food"]),
+        _poi("city-meal-2", 120.075, 30.20, category="food", tags=["food"]),
+    ]
+
+    itinerary = build_simple_itinerary(
+        ranked,
+        profile,
+        preserve_must_visit_capacity=True,
+    )
+
+    remote_day = next(
+        day for day in itinerary.days
+        if any(stop.poi.poi_id == "remote-anchor" for stop in day.stops)
+    )
+    assert all(
+        stop.poi.lng >= 120.40
+        for stop in remote_day.stops
+        if stop.poi.category != "food"
+    )
+    assert all(
+        not (
+            any(stop.poi.lng < 120.20 and stop.poi.category != "food" for stop in day.stops)
+            and any(stop.poi.lng >= 120.40 and stop.poi.category == "food" for stop in day.stops)
+        )
+        for day in itinerary.days
+    )
+
+
 def test_food_pois_are_scheduled_at_meal_times() -> None:
     profile = TravelProfile(destination="杭州", days=1, pace="standard", interests=["food"])
     ranked = [

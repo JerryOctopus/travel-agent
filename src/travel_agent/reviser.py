@@ -54,7 +54,12 @@ def revise_itinerary(
             notes.extend(changed)
 
     if any(
-        issue.code in {"route_too_long", "daily_route_too_long", "walking_distance_exceeded"}
+        issue.code in {
+            "route_too_long",
+            "daily_route_too_long",
+            "route_backtracking",
+            "walking_distance_exceeded",
+        }
         for issue in critic_result.issues
     ):
         revised, changed = _repair_long_routes(revised, ranked_pois, profile)
@@ -185,7 +190,29 @@ def _repair_long_routes(
             for _index, route in routes
         )
         walking_exceeded = walking_limit is not None and walking_total > walking_limit
-        bad = [(index, route) for index, route in routes if route.duration_min > single_limit]
+        bad = [
+            (index, route)
+            for index, route in routes
+            if route.duration_min > single_limit
+        ]
+        backtracking_indices: set[int] = set()
+        for index in range(1, len(stops) - 1):
+            inbound = stops[index].route_from_previous
+            outbound = stops[index + 1].route_from_previous
+            if (
+                inbound is not None
+                and outbound is not None
+                and inbound.distance_km >= 20.0
+                and outbound.distance_km >= 20.0
+                and _haversine_km(stops[index - 1].poi, stops[index + 1].poi) <= 8.0
+            ):
+                backtracking_indices.update((index, index + 1))
+        if backtracking_indices:
+            bad.extend(
+                (index, route)
+                for index, route in routes
+                if index in backtracking_indices and (index, route) not in bad
+            )
         if not bad and total <= daily_limit and not walking_exceeded:
             days.append(day)
             continue
@@ -269,12 +296,26 @@ def _repair_long_routes(
             if culprit.poi.category == "food"
             else [item for item in pool if item.poi.category != "food"]
         )
-        replacement = min(
-            replacement_pool,
-            key=lambda item: max(
+        replacement_radius_km = {
+            "relaxed": 10.0,
+            "standard": 15.0,
+            "intensive": 25.0,
+        }[profile.pace]
+
+        def replacement_priority(item: ScoredPOI) -> tuple[bool, bool, float]:
+            distance = max(
                 (_haversine_km(item.poi, anchor) for anchor in anchors),
                 default=0.0,
-            ),
+            )
+            return (
+                distance > replacement_radius_km,
+                item.poi.poi_id in used_ids,
+                distance,
+            )
+
+        replacement = min(
+            replacement_pool,
+            key=replacement_priority,
             default=None,
         )
         if replacement is not None and anchors:

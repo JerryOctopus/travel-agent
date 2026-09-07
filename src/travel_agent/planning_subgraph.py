@@ -46,6 +46,7 @@ _ACTIONABLE_REVISER_ISSUES = {
     "interest_not_covered",
     "route_too_long",
     "daily_route_too_long",
+    "route_backtracking",
     "walking_distance_exceeded",
     "daily_activity_sparse",
     "daily_meal_missing",

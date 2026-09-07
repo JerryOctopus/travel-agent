@@ -129,6 +129,36 @@ def test_multiple_opening_seasons_are_alternatives() -> None:
     assert not toolkit._is_unavailable_or_infrastructure_poi(all_year_ranges, november)
 
 
+def test_dated_closed_exact_record_does_not_displace_open_venue_alias() -> None:
+    closed_exact = POI(
+        **{
+            **_poi("古城墙", "scenic").__dict__,
+            "opening_hours": "2.15日-2.23日 08:00-23:00；2.24日-3.4日 08:00-22:00",
+        }
+    )
+    open_alias = POI(
+        **{
+            **_poi("古城墙历史文化景区", "scenic").__dict__,
+            "poi_id": "open-alias",
+            "opening_hours": "周一至周日 08:00-22:00",
+        }
+    )
+    winter = TravelProfile(
+        destination="测试城",
+        days=3,
+        start_date="2026-12-02",
+        must_visit=["古城墙"],
+    )
+
+    eligible = [
+        poi for poi in (closed_exact, open_alias)
+        if not toolkit._is_unavailable_or_infrastructure_poi(poi, winter)
+    ]
+    deduped = toolkit._dedupe_plannable_entities(eligible, winter)
+
+    assert [poi.poi_id for poi in deduped] == ["open-alias"]
+
+
 def test_cross_city_candidate_requires_explicit_venue_constraint() -> None:
     required = POI(
         poi_id="sxd",

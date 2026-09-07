@@ -210,6 +210,38 @@ def test_gross_route_violation_is_error() -> None:
     assert any(issue.severity == "error" for issue in result.issues)
 
 
+def test_critic_flags_fast_cross_city_backtracking() -> None:
+    profile = TravelProfile(destination="测试城", days=1, pace="standard")
+    first = POI("remote", "远郊必去点", "测试城", "scenic", 30.0, 120.50, 4.8, 0.9, [], 90, "mid")
+    middle = POI("city", "市区可选点", "测试城", "museum", 30.0, 120.10, 4.5, 0.8, [], 90, "mid")
+    last = POI("remote-meal", "远郊餐厅", "测试城", "food", 30.0, 120.51, 4.5, 0.8, ["food"], 60, "mid")
+    itinerary = Itinerary(
+        city="测试城",
+        days=[ItineraryDay(1, "test", [
+            ItineraryStop(first, "09:00", 90, ""),
+            ItineraryStop(
+                middle,
+                "13:00",
+                90,
+                "",
+                RouteInfo("remote", "city", 38.0, 39, "taxi", source="test"),
+            ),
+            ItineraryStop(
+                last,
+                "17:30",
+                60,
+                "",
+                RouteInfo("city", "remote-meal", 39.0, 42, "taxi", source="test"),
+            ),
+        ])],
+        summary="test",
+    )
+
+    result = critique_itinerary(itinerary, profile)
+
+    assert "route_backtracking" in {issue.code for issue in result.issues}
+
+
 def test_critic_reports_route_too_long() -> None:
     profile = TravelProfile(
         destination="北京",

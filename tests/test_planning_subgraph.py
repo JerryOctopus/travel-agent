@@ -182,6 +182,19 @@ def test_trip_day_is_closed_when_open_weekday_range_excludes_visit_date() -> Non
     assert poi_open_on_trip_day(museum, tuesday, 1) is True
 
 
+def test_trip_day_is_unavailable_when_all_dated_hours_are_out_of_season() -> None:
+    venue = POI(
+        "dated-season", "季节场馆", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, [], 90, "mid",
+        opening_hours="2.15日-2.23日 08:00-23:00；2.24日-3.4日 08:00-22:00",
+    )
+    winter = TravelProfile(destination="测试城", days=1, start_date="2026-12-03")
+    spring = TravelProfile(destination="测试城", days=1, start_date="2026-02-25")
+
+    assert poi_open_on_trip_day(venue, winter, 1) is False
+    assert poi_open_on_trip_day(venue, spring, 1) is True
+
+
 def test_structured_schedule_drops_venue_closed_by_weekday_range() -> None:
     closed_monday = POI(
         "closed-monday", "仅周二开放场馆", "测试城", "museum", 30.0, 120.0,

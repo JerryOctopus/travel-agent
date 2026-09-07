@@ -198,6 +198,50 @@ def test_explicit_relaxed_pace_drops_unverified_replacement_and_keeps_free_time(
     assert any("显式轻松节奏" in note for note in notes)
 
 
+def test_long_route_repair_handles_fast_cross_city_backtracking() -> None:
+    required = POI("required", "远郊必去点", "测试城", "scenic", 30.0, 120.50, 4.8, 0.9, [], 90, "mid")
+    city_optional = POI("city", "市区可选点", "测试城", "museum", 30.0, 120.10, 4.5, 0.8, [], 90, "mid")
+    remote_meal = POI("meal", "远郊餐厅", "测试城", "food", 30.0, 120.51, 4.5, 0.8, ["food"], 60, "mid")
+    nearby = POI("nearby", "远郊附近景点", "测试城", "museum", 30.0, 120.52, 4.5, 0.8, [], 90, "mid")
+    itinerary = Itinerary(
+        city="测试城",
+        summary="test",
+        days=[ItineraryDay(1, "test", [
+            ItineraryStop(required, "09:00", 90, ""),
+            ItineraryStop(
+                city_optional,
+                "13:00",
+                90,
+                "",
+                RouteInfo("required", "city", 38.0, 39, "taxi"),
+            ),
+            ItineraryStop(
+                remote_meal,
+                "17:30",
+                60,
+                "",
+                RouteInfo("city", "meal", 39.0, 42, "taxi"),
+            ),
+        ])],
+    )
+    profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        pace="standard",
+        must_visit=["远郊必去点"],
+    )
+
+    revised, _result, notes = revise_itinerary(
+        itinerary,
+        [ScoredPOI(nearby, 0.8, [])],
+        profile,
+        critique_itinerary(itinerary, profile),
+    )
+
+    assert [stop.poi.poi_id for stop in revised.days[0].stops] == ["required", "meal", "nearby"]
+    assert any("超长通勤" in note for note in notes)
+
+
 def test_long_route_repair_prefers_reusing_nearby_meal_over_dropping_activity() -> None:
     activity = POI("activity", "城内博物馆", "测试城", "museum", 30.0, 120.0, 4.5, 0.8, ["history"], 90, "mid")
     remote_meal = POI("remote-meal", "远郊合规餐厅", "测试城", "food", 30.0, 120.8, 4.5, 0.8, ["food", "halal"], 60, "mid")
@@ -227,6 +271,50 @@ def test_long_route_repair_prefers_reusing_nearby_meal_over_dropping_activity() 
 
     assert [stop.poi.poi_id for stop in repaired.days[1].stops] == ["activity", "near-meal"]
     assert any("替换" in note for note in notes)
+
+
+def test_long_route_meal_repair_prefers_unused_nearby_brand() -> None:
+    first_activity = POI("a1", "第一天景点", "测试城", "scenic", 30.0, 120.0, 4.5, 0.8, [], 90, "mid")
+    second_activity = POI("a2", "第二天景点", "测试城", "scenic", 30.0, 120.0, 4.5, 0.8, [], 90, "mid")
+    used_meal = POI("used", "已用餐厅", "测试城", "food", 30.0, 120.01, 4.5, 0.8, ["food", "halal"], 60, "mid")
+    unused_meal = POI("unused", "另一餐厅", "测试城", "food", 30.0, 120.02, 4.5, 0.8, ["food", "halal"], 60, "mid")
+    remote_meal = POI("remote", "远端餐厅", "测试城", "food", 30.0, 120.8, 4.5, 0.8, ["food", "halal"], 60, "mid")
+    itinerary = Itinerary(
+        city="测试城",
+        summary="test",
+        days=[
+            ItineraryDay(1, "test", [
+                ItineraryStop(first_activity, "09:30", 90, ""),
+                ItineraryStop(used_meal, "11:30", 60, ""),
+            ]),
+            ItineraryDay(2, "test", [
+                ItineraryStop(second_activity, "09:30", 90, ""),
+                ItineraryStop(
+                    remote_meal,
+                    "17:30",
+                    60,
+                    "",
+                    RouteInfo("a2", "remote", 80, 180, "public_transport"),
+                ),
+            ]),
+        ],
+    )
+    profile = TravelProfile(destination="测试城", days=2, interests=["food"])
+
+    repaired, _notes = _repair_long_routes(
+        itinerary,
+        [
+            ScoredPOI(used_meal, 0.9, []),
+            ScoredPOI(unused_meal, 0.8, []),
+        ],
+        profile,
+    )
+
+    day_two_food = [
+        stop.poi.poi_id for stop in repaired.days[1].stops
+        if stop.poi.category == "food"
+    ]
+    assert day_two_food == ["unused"]
 
 
 def test_feasibility_shortlist_drops_optional_stop_when_no_lunch_window() -> None:

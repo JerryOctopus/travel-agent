@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import date
+import math
 import re
 from typing import Any
 
@@ -279,6 +280,26 @@ def _check_route_feasibility(
                         ),
                     )
                 )
+        for index in range(1, len(day.stops) - 1):
+            inbound = day.stops[index].route_from_previous
+            outbound = day.stops[index + 1].route_from_previous
+            if (
+                inbound is not None
+                and outbound is not None
+                and inbound.distance_km >= 20.0
+                and outbound.distance_km >= 20.0
+                and _poi_distance_km(day.stops[index - 1].poi, day.stops[index + 1].poi) <= 8.0
+            ):
+                issues.append(
+                    CriticIssue(
+                        code="route_backtracking",
+                        message=(
+                            f"第{day.day_index}天经由 `{day.stops[index].poi.name}` "
+                            "形成两段跨区域往返，应替换或删减中间可选地点。"
+                        ),
+                        severity="warning",
+                    )
+                )
         total_route_min = sum(route.duration_min for route in routes)
         if total_route_min > max_daily_route_min:
             issues.append(
@@ -297,6 +318,18 @@ def _check_route_feasibility(
                 )
             )
     return issues
+
+
+def _poi_distance_km(left: POI, right: POI) -> float:
+    radius = 6371.0
+    lat1, lat2 = math.radians(left.lat), math.radians(right.lat)
+    dlat = lat2 - lat1
+    dlng = math.radians(right.lng - left.lng)
+    value = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlng / 2) ** 2
+    )
+    return radius * 2 * math.asin(min(1.0, math.sqrt(value)))
 
 
 def _check_interest_coverage(
