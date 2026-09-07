@@ -36,7 +36,18 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
     attempts = {}
     for case_id in ALL_CASES:
         expected = _expected_type(case_id)
-        evaluation = {"actual_artifact_type": expected}
+        evaluation = {
+            "actual_artifact_type": expected,
+            "rule_metrics": {
+                "actual_artifact_type": expected,
+                "strict_task_success": True,
+                "constraint_pass": True,
+                "grounding_ok": True,
+                "authorization_ok": True,
+                "tool_schema_valid": True,
+                "architecture_policy_ok": True,
+            },
+        }
         if with_judge and expected == "full_itinerary":
             evaluation["independent_judge"] = {
                 "status": "ok",
@@ -45,7 +56,7 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
                 "rubric": "full_itinerary",
                 "diagnostic_only": False,
                 "rubric_version": "travel-plan-quality-v1",
-                "prompt_version": "travel-plan-judge-v2",
+                "prompt_version": "travel-plan-judge-v4",
                 "schema_version": "travel-plan-judge-output-v1",
                 "independence_warning": False,
                 "total_score": 80,
@@ -54,7 +65,15 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
             }
         case = {
             "case": {"case_id": case_id, "expected_artifact_type": expected},
-            "execution": {"errors": [], "repeat": 1},
+            "execution": {
+                "errors": [],
+                "repeat": 1,
+                "requested_model": "deepseek-v4-flash",
+                "runtime_model": "deepseek-v4-flash",
+                "runtime_model_provider": "deepseek",
+                "runtime_model_index": 0,
+                "runtime_model_switches": 0,
+            },
             "turns": [],
             "evaluation": evaluation,
         }
@@ -65,6 +84,7 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
             {
                 "case_id": case_id,
                 "expected_artifact_type": expected,
+                "actual_artifact_type": expected,
                 "strict_task_success": True,
                 "hard_constraints_ok": True,
                 "grounding_ok": True,
@@ -104,6 +124,7 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
         "configuration_fingerprint": "configuration",
         "tool_snapshot_fingerprint": "tool-snapshot",
         "artifact_contract_fingerprint": "7478fe592648c408fad4b4600e0619c2298120bb1f82a221fbd097ba3a4b180c",
+        "artifact_contract_implementation_fingerprint": "artifact-contract-code",
         "model_execution_mode": "fixed_single_model",
         "model_provider": "deepseek",
         "model": "deepseek-v4-flash",
@@ -122,6 +143,13 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
             }
         ],
         "tool_provider_mode": "configured",
+        "tool_preflight": {
+            "ok": True,
+            "checks": {
+                "weather": {"ok": True},
+                "place_search": {"ok": True},
+            },
+        },
         "hybrid_flags": {"enabled": False},
         "relay_summary": {"attempts_total": 34, "current_model_index": 0},
     }
@@ -131,7 +159,7 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
                 "judge_provider": "siliconflow",
                 "judge_model": "Qwen/Qwen3.5-397B-A17B",
                 "judge_rubric_version": "travel-plan-quality-v1",
-                "judge_prompt_version": "travel-plan-judge-v2",
+                "judge_prompt_version": "travel-plan-judge-v4",
                 "judge_schema_version": "travel-plan-judge-output-v1",
                 "judge_preflight": {
                     "ok": True,
@@ -225,6 +253,41 @@ def test_dev34_consecutive_contract_rejects_provider_model_drift(tmp_path) -> No
     assert "run fingerprints differ; candidate was not unchanged" in result["failures"]
 
 
+def test_dev34_acceptance_requires_successful_amap_preflight(tmp_path) -> None:
+    run_dir = tmp_path / "amap-preflight"
+    _write_passing_deterministic_run(run_dir)
+    summary_path = run_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["artifacts"]["tool_preflight"]["checks"]["place_search"] = {
+        "ok": False,
+        "detail": "USER_DAILY_QUERY_OVER_LIMIT",
+        "infocode": "10044",
+    }
+    summary["artifacts"]["tool_preflight"]["ok"] = False
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = evaluate_dev34_run(run_dir, require_judge=False)
+
+    assert result["passed"] is False
+    assert any("AMap" in item for item in result["failures"])
+
+
+def test_dev34_consecutive_contract_freezes_artifact_implementation(tmp_path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_passing_deterministic_run(first, with_judge=True)
+    _write_passing_deterministic_run(second, with_judge=True)
+    summary_path = second / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["artifacts"]["artifact_contract_implementation_fingerprint"] = "changed"
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = evaluate_consecutive_dev34_runs(first, second)
+
+    assert result["passed"] is False
+    assert "run fingerprints differ; candidate was not unchanged" in result["failures"]
+
+
 def test_dev34_acceptance_requires_exact_case_to_artifact_mapping(tmp_path) -> None:
     run_dir = tmp_path / "mapping"
     _write_passing_deterministic_run(run_dir)
@@ -255,6 +318,54 @@ def test_dev34_acceptance_requires_each_case_exactly_once(tmp_path) -> None:
 
     assert result["passed"] is False
     assert any("exactly once" in item for item in result["failures"])
+
+
+def test_dev34_acceptance_rejects_summary_case_metric_disagreement(tmp_path) -> None:
+    run_dir = tmp_path / "summary-case-disagreement"
+    _write_passing_deterministic_run(run_dir)
+    summary_path = run_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["rows"][0]["hard_constraints_ok"] = False
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = evaluate_dev34_run(run_dir, require_judge=False)
+
+    assert result["passed"] is False
+    assert any("summary/case disagreement" in item for item in result["failures"])
+
+
+def test_dev34_acceptance_rejects_old_judge_prompt(tmp_path) -> None:
+    run_dir = tmp_path / "old-judge-prompt"
+    _write_passing_deterministic_run(run_dir, with_judge=True)
+    summary_path = run_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["artifacts"]["judge_prompt_version"] = "travel-plan-judge-v2"
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = evaluate_dev34_run(run_dir, require_judge=True)
+
+    assert result["passed"] is False
+    assert any("Judge summary" in item for item in result["failures"])
+
+
+def test_dev34_judge_service_error_marks_run_invalid(tmp_path) -> None:
+    run_dir = tmp_path / "judge-error"
+    _write_passing_deterministic_run(run_dir, with_judge=True)
+    case_path = run_dir / "cases" / "dev_001__repeat-1.json"
+    case = json.loads(case_path.read_text(encoding="utf-8"))
+    case["evaluation"]["independent_judge"] = {
+        "status": "error",
+        "provider": "siliconflow",
+        "model": "Qwen/Qwen3.5-397B-A17B",
+        "errors": ["HTTPError: 429 quota exhausted"],
+    }
+    case_path.write_text(json.dumps(case), encoding="utf-8")
+
+    result = evaluate_dev34_run(run_dir, require_judge=True)
+
+    assert result["passed"] is False
+    assert result["status"] == "invalid"
+    assert result["counts"]["judge_errors"] == 1
 
 
 def test_dev34_acceptance_distinguishes_empty_lookup_from_tool_failure(tmp_path) -> None:

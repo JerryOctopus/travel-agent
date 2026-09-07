@@ -11,6 +11,11 @@ from travel_agent.evaluation.artifact_contract import (
     actual_artifact_type,
     expected_artifact_type,
 )
+from travel_agent.evaluation.plan_quality_judge import (
+    PROMPT_VERSION as JUDGE_PROMPT_VERSION,
+    RUBRIC_VERSION as JUDGE_RUBRIC_VERSION,
+    SCHEMA_VERSION as JUDGE_SCHEMA_VERSION,
+)
 
 
 DEV34_ROUTE_CASES = frozenset({"dev_006", "dev_011", "dev_027"})
@@ -60,6 +65,7 @@ FINGERPRINT_FIELDS = (
     "configuration_fingerprint",
     "tool_snapshot_fingerprint",
     "artifact_contract_fingerprint",
+    "artifact_contract_implementation_fingerprint",
     "model_execution_mode",
     "model_provider",
     "model",
@@ -68,6 +74,7 @@ FINGERPRINT_FIELDS = (
     "provider_reported_models",
     "model_preflight",
     "tool_provider_mode",
+    "tool_preflight",
     "hybrid_flags",
     "judge_provider",
     "judge_model",
@@ -115,6 +122,7 @@ def evaluate_dev34_run(
         failures,
         "case outputs and summary rows must use the exact artifact mapping for Dev34",
     )
+    _check_case_row_consistency(rows, cases, failures)
 
     row_execution_once = all(
         int(row.get("repeat") or 0) == 1
@@ -200,6 +208,16 @@ def evaluate_dev34_run(
     _require(_same_number(artifacts.get("model_temperature"), 0.2), failures, "model temperature must be 0.2")
     _require(artifacts.get("model_thinking_enabled") is False, failures, "model thinking must be disabled")
     _require(artifacts.get("tool_provider_mode") == "configured", failures, "tool provider must be configured")
+    tool_preflight = artifacts.get("tool_preflight") or {}
+    tool_checks = tool_preflight.get("checks") or {}
+    _require(
+        tool_preflight.get("ok") is True
+        and tool_preflight.get("skipped") is not True
+        and (tool_checks.get("weather") or {}).get("ok") is True
+        and (tool_checks.get("place_search") or {}).get("ok") is True,
+        failures,
+        "real configured AMap weather/place preflight must be recorded",
+    )
     _require(metrics.get("model_switch_count") == 0, failures, "model relay/switching is forbidden")
     _require(metrics.get("relay_mode") is False, failures, "relay mode must be disabled")
     _require(
@@ -235,6 +253,7 @@ def evaluate_dev34_run(
         "tooling_fingerprint",
         "configuration_fingerprint",
         "tool_snapshot_fingerprint",
+        "artifact_contract_implementation_fingerprint",
     ):
         _require(bool(artifacts.get(field)), failures, f"{field} must be recorded")
     hybrid = artifacts.get("hybrid_flags") or {}
@@ -252,6 +271,7 @@ def evaluate_dev34_run(
             judge_cases.append(case)
     judge_results = [((case.get("evaluation") or {}).get("independent_judge") or {}) for case in judge_cases]
     completed_judges = [item for item in judge_results if item.get("status") == "ok"]
+    judge_error_count = sum(item.get("status") == "error" for item in judge_results)
     judge_scores = [float(item["total_score"]) for item in completed_judges if isinstance(item.get("total_score"), (int, float))]
     judge_average = sum(judge_scores) / len(judge_scores) if judge_scores else None
     judge_reasonable_rate = (
@@ -302,9 +322,9 @@ def evaluate_dev34_run(
             and item.get("model") == DEV34_JUDGE_MODEL
             and item.get("rubric") == "full_itinerary"
             and item.get("diagnostic_only") is False
-            and item.get("rubric_version") == artifacts.get("judge_rubric_version")
-            and item.get("prompt_version") == artifacts.get("judge_prompt_version")
-            and item.get("schema_version") == artifacts.get("judge_schema_version")
+            and item.get("rubric_version") == JUDGE_RUBRIC_VERSION
+            and item.get("prompt_version") == JUDGE_PROMPT_VERSION
+            and item.get("schema_version") == JUDGE_SCHEMA_VERSION
             and item.get("independence_warning") is False
             for item in completed_judges
         )
@@ -313,11 +333,22 @@ def evaluate_dev34_run(
             failures,
             "Judge result identity or rubric metadata differs from the frozen contract",
         )
+        _require(
+            artifacts.get("judge_rubric_version") == JUDGE_RUBRIC_VERSION
+            and artifacts.get("judge_prompt_version") == JUDGE_PROMPT_VERSION
+            and artifacts.get("judge_schema_version") == JUDGE_SCHEMA_VERSION,
+            failures,
+            "Judge summary rubric/prompt/schema differs from the frozen contract",
+        )
 
     _check_summary_consistency(metrics, len(strict), len(full_strict), len(non_strict), gate_counts, failures)
     return {
         "passed": not failures,
-        "status": "invalid" if execution_errors else ("accepted" if not failures else "rejected"),
+        "status": (
+            "invalid"
+            if execution_errors or (require_judge and judge_error_count)
+            else ("accepted" if not failures else "rejected")
+        ),
         "mode": "full_with_judge" if require_judge else "deterministic_only",
         "run_dir": str(root),
         "counts": {
@@ -329,6 +360,7 @@ def evaluate_dev34_run(
             **gate_counts,
             "judge_eligible": len(judge_cases),
             "judge_completed": len(completed_judges),
+            "judge_errors": judge_error_count,
         },
         "judge": {
             "average_score": judge_average,
@@ -388,9 +420,70 @@ def _redline_cases(rows: list[dict[str, Any]]) -> list[str]:
             redlines.append(str(row.get("case_id")))
             continue
         triggers = {str(item) for item in row.get("gating_triggered") or []}
-        if triggers.intersection({"unauthorized_action", "unsupported_claim", "missing_critical_hard_constraint"}):
+        if triggers.intersection({
+            "unauthorized_action",
+            "unauthorized_transaction",
+            "unsupported_claim",
+            "fabricated_critical_fact",
+            "missing_critical_hard_constraint",
+            "infeasible_plan_labeled_feasible",
+        }):
             redlines.append(str(row.get("case_id")))
     return redlines
+
+
+def _check_case_row_consistency(
+    rows: list[dict[str, Any]],
+    cases: list[dict[str, Any]],
+    failures: list[str],
+) -> None:
+    case_by_id = {
+        str((case.get("case") or {}).get("case_id") or ""): case
+        for case in cases
+    }
+    rule_fields = {
+        "strict_task_success": "strict_task_success",
+        "hard_constraints_ok": "constraint_pass",
+        "grounding_ok": "grounding_ok",
+        "authorization_ok": "authorization_ok",
+        "tool_schema_valid": "tool_schema_valid",
+        "architecture_policy_ok": "architecture_policy_ok",
+    }
+    for row in rows:
+        case_id = str(row.get("case_id") or "")
+        case = case_by_id.get(case_id)
+        if case is None:
+            continue
+        evaluation = case.get("evaluation") or {}
+        rule = evaluation.get("rule_metrics") or {}
+        expected = expected_artifact_type(case.get("case") or {})
+        actual = (
+            rule.get("actual_artifact_type")
+            or evaluation.get("actual_artifact_type")
+            or actual_artifact_type(case, expected)
+        )
+        disagreements = []
+        if row.get("expected_artifact_type") != expected:
+            disagreements.append("expected_artifact_type")
+        if row.get("actual_artifact_type") != actual:
+            disagreements.append("actual_artifact_type")
+        for row_field, rule_field in rule_fields.items():
+            if rule_field not in rule or row.get(row_field) is not rule.get(rule_field):
+                disagreements.append(row_field)
+        execution = case.get("execution") or {}
+        if not (
+            execution.get("requested_model") == "deepseek-v4-flash"
+            and execution.get("runtime_model") == "deepseek-v4-flash"
+            and execution.get("runtime_model_provider") == "deepseek"
+            and int(execution.get("runtime_model_index") or 0) == 0
+            and int(execution.get("runtime_model_switches") or 0) == 0
+        ):
+            disagreements.append("model_identity")
+        if disagreements:
+            failures.append(
+                f"summary/case disagreement for {case_id}: "
+                + ", ".join(disagreements)
+            )
 
 
 def _check_summary_consistency(metrics: dict[str, Any], strict: int, full: int, non: int, gates: dict[str, int], failures: list[str]) -> None:

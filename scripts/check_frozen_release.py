@@ -82,8 +82,7 @@ def main() -> None:
         recorded = readiness["second"].get("fingerprints") or {}
         mismatches = [
             field for field, value in fingerprints.items()
-            if field != "artifact_contract_implementation_fingerprint"
-            and recorded.get(field) != value
+            if recorded.get(field) != value
         ]
         if mismatches:
             raise SystemExit("current runtime differs from Dev34 candidate: " + ", ".join(mismatches))

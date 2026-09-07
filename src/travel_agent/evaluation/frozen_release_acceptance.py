@@ -488,10 +488,15 @@ def evaluate_frozen_stage(
     ) if require_judge else None
     if judge:
         failures.extend(judge["failures"])
+    judge_environment_error = bool(judge and judge.get("error_count"))
     result = {
         "schema_version": FROZEN_ACCEPTANCE_VERSION,
         "passed": not failures,
-        "status": "invalid" if row_execution_errors or case_execution_errors else ("accepted" if not failures else "rejected"),
+        "status": (
+            "invalid"
+            if row_execution_errors or case_execution_errors or judge_environment_error
+            else ("accepted" if not failures else "rejected")
+        ),
         "split": split,
         "run_dir": str(root),
         "candidate_id": manifest.get("candidate_id"),
@@ -615,6 +620,7 @@ def _judge_metrics(
             )
             eligible.append(result)
     completed = [item for item in eligible if item.get("status") == "ok"]
+    error_count = sum(item.get("status") == "error" for item in eligible)
     scores = [float(item["total_score"]) for item in completed if isinstance(item.get("total_score"), (int, float))]
     average = sum(scores) / len(scores) if scores else None
     reasonable = sum(item.get("reasonable") is True for item in completed) / len(completed) if completed else None
@@ -651,7 +657,15 @@ def _judge_metrics(
         _require(_same_optional_number(reported.get("judge_reasonable_rate"), reasonable), failures, "Judge reasonable rate disagrees with summary")
         _require(_same_optional_number(reported.get("critical_issue_rate"), critical), failures, "Judge critical issue rate disagrees with summary")
         _require(reported.get("provider") == JUDGE_MODEL["provider"] and reported.get("model") == JUDGE_MODEL["model"], failures, "Judge summary identity mismatch")
-    return {"eligible": len(eligible), "completed": len(completed), "average_score": average, "reasonable_rate": reasonable, "critical_issue_rate": critical, "failures": failures}
+    return {
+        "eligible": len(eligible),
+        "completed": len(completed),
+        "error_count": error_count,
+        "average_score": average,
+        "reasonable_rate": reasonable,
+        "critical_issue_rate": critical,
+        "failures": failures,
+    }
 
 
 def _check_case_row_consistency(
@@ -750,10 +764,16 @@ def _case_execution_errors(cases: list[dict[str, Any]]) -> list[str]:
     benign = {"NOT_FOUND", "EMPTY_RESULT", "NO_RESULTS"}
     for output in cases:
         case_id = str((output.get("case") or {}).get("case_id") or "unknown")
-        if (output.get("execution") or {}).get("errors"):
+        if (output.get("execution") or {}).get("errors") or output.get("errors"):
             failures.append(case_id)
             continue
         for turn in output.get("turns") or []:
+            if turn.get("error") or any(
+                call.get("status") == "error"
+                for call in turn.get("model_calls") or []
+            ):
+                failures.append(case_id)
+                break
             for call in turn.get("tool_calls") or []:
                 if call.get("status") == "error" and str(call.get("error_code") or "").upper() not in benign:
                     failures.append(case_id)

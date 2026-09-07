@@ -463,6 +463,55 @@ def test_environment_failure_is_quarantined_as_invalid(tmp_path: Path) -> None:
     assert any("environment errors" in item for item in result["failures"])
 
 
+def test_hidden_model_call_error_is_quarantined_as_invalid(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    run = tmp_path / "core-run"
+    _stage_run(run, "core_frozen", manifest)
+    case_path = run / "cases" / "core_frozen_001__repeat-1.json"
+    case = json.loads(case_path.read_text(encoding="utf-8"))
+    case["turns"] = [{
+        "error": None,
+        "model_calls": [{"status": "error", "error": "provider timeout"}],
+        "tool_calls": [],
+    }]
+    case_path.write_text(json.dumps(case), encoding="utf-8")
+
+    result = evaluate_frozen_stage(run, manifest, "core_frozen")
+
+    assert result["passed"] is False
+    assert result["status"] == "invalid"
+    assert any("case/tool environment errors" in item for item in result["failures"])
+
+
+def test_judge_service_error_is_quarantined_as_invalid(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    run = tmp_path / "core-run"
+    _stage_run(run, "core_frozen", manifest)
+    case_path = run / "cases" / "core_frozen_001__repeat-1.json"
+    case = json.loads(case_path.read_text(encoding="utf-8"))
+    case["evaluation"]["independent_judge"] = {
+        "status": "error",
+        "provider": JUDGE["provider"],
+        "model": JUDGE["model"],
+        "errors": ["HTTPError: 429 quota exhausted"],
+    }
+    case_path.write_text(json.dumps(case), encoding="utf-8")
+    summary_path = run / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["metrics"]["plan_quality_judge"].update({
+        "completed_count": 93,
+        "completion_rate": 93 / 94,
+        "error_count": 1,
+    })
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    result = evaluate_frozen_stage(run, manifest, "core_frozen")
+
+    assert result["passed"] is False
+    assert result["status"] == "invalid"
+    assert result["judge"]["error_count"] == 1
+
+
 def test_judge_completion_rubric_and_critical_rate_are_enforced(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path)
     run = tmp_path / "challenge-run"

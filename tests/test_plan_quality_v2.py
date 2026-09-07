@@ -66,6 +66,29 @@ def test_judge_preflight_fails_closed_without_credential() -> None:
     assert "not configured" in result["detail"]
 
 
+def test_siliconflow_qwen_judge_explicitly_disables_thinking(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    settings = JudgeSettings(
+        provider="siliconflow",
+        api_key="judge-key",
+        base_url="https://api.siliconflow.cn/v1",
+        model="Qwen/Qwen3.5-397B-A17B",
+        temperature=0.0,
+        thinking_enabled=False,
+    )
+
+    PlanQualityJudge(settings, Path("."))
+
+    assert captured["temperature"] == 0.0
+    assert captured["extra_body"] == {"enable_thinking": False}
+
+
 def test_deterministic_plan_quality_accepts_grounded_feasible_plan() -> None:
     result = evaluate_plan_quality(
         {

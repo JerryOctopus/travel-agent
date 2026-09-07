@@ -248,7 +248,10 @@ class PlanQualityJudge:
             import httpx
 
             client_options["http_client"] = httpx.Client(trust_env=False)
-        if self.settings.model.startswith("glm-"):
+        model_name = self.settings.model.lower()
+        if model_name.startswith(("qwen3", "qwen/qwen3")):
+            extra_body["enable_thinking"] = self.settings.thinking_enabled
+        elif model_name.startswith("glm-"):
             extra_body["thinking"] = {
                 "type": "enabled" if self.settings.thinking_enabled else "disabled"
             }
