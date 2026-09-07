@@ -387,6 +387,7 @@ def evaluate_release_readiness_dev34(
             "long_horizon_strict": _true_count(long_rows, "strict_task_success"),
         },
         "judge": judge,
+        "operations": legacy.get("operations") or {},
         "fingerprints": legacy.get("fingerprints") or {},
         "failures": list(dict.fromkeys(failures)),
     }
@@ -403,7 +404,13 @@ def evaluate_consecutive_release_dev34(
     _require(second["passed"], failures, "second Dev34 release-readiness run failed")
     _require(Path(first_run_dir).resolve() != Path(second_run_dir).resolve(), failures, "two distinct Dev34 run directories are required")
     _require(first.get("fingerprints") == second.get("fingerprints"), failures, "Dev34 run fingerprints differ")
-    return {"passed": not failures, "first": first, "second": second, "failures": failures}
+    return {
+        "passed": not failures,
+        "first": first,
+        "second": second,
+        "operations": _release_operations({"first": first, "second": second}),
+        "failures": failures,
+    }
 
 
 def evaluate_frozen_stage(
@@ -489,6 +496,7 @@ def evaluate_frozen_stage(
     if judge:
         failures.extend(judge["failures"])
     judge_environment_error = bool(judge and judge.get("error_count"))
+    operations = _stage_operations(rows, metrics, judge)
     result = {
         "schema_version": FROZEN_ACCEPTANCE_VERSION,
         "passed": not failures,
@@ -503,6 +511,7 @@ def evaluate_frozen_stage(
         "manifest_fingerprint": manifest.get("manifest_fingerprint"),
         "counts": {"cases": len(cases), "strict": strict, "hard": hard, "expected_artifacts": artifact_counts},
         "judge": judge,
+        "operations": operations,
         "fingerprints": {field: artifacts.get(field) for field in FINGERPRINT_FIELDS},
         "failures": failures,
     }
@@ -531,6 +540,7 @@ def evaluate_frozen_release(
         "candidate_id": manifest.get("candidate_id"),
         "manifest_fingerprint": manifest.get("manifest_fingerprint"),
         "stages": stages,
+        "operations": _release_operations(stages),
         "failures": failures,
     }
 
@@ -621,6 +631,7 @@ def _judge_metrics(
             eligible.append(result)
     completed = [item for item in eligible if item.get("status") == "ok"]
     error_count = sum(item.get("status") == "error" for item in eligible)
+    judge_operations = _judge_operations(eligible)
     scores = [float(item["total_score"]) for item in completed if isinstance(item.get("total_score"), (int, float))]
     average = sum(scores) / len(scores) if scores else None
     reasonable = sum(item.get("reasonable") is True for item in completed) / len(completed) if completed else None
@@ -664,8 +675,136 @@ def _judge_metrics(
         "average_score": average,
         "reasonable_rate": reasonable,
         "critical_issue_rate": critical,
+        "operations": judge_operations,
         "failures": failures,
     }
+
+
+def _stage_operations(
+    rows: list[dict[str, Any]],
+    metrics: Mapping[str, Any],
+    judge: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    input_tokens = _sum_present(rows, "input_tokens")
+    output_tokens = _sum_present(rows, "output_tokens")
+    total_tokens = _sum_present(rows, "total_tokens")
+    duration_ms = _sum_present(rows, "duration_ms")
+    costs = [
+        float(row["estimated_cost_usd"])
+        for row in rows
+        if _is_number(row.get("estimated_cost_usd"))
+    ]
+    agent_cost = (
+        round(sum(costs), 8)
+        if costs
+        else metrics.get("total_estimated_cost_usd")
+        if _is_number(metrics.get("total_estimated_cost_usd"))
+        else None
+    )
+    return {
+        "agent": {
+            "case_count": len(rows),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "duration_ms": duration_ms,
+            "latency_p50_ms": metrics.get("latency_p50_ms"),
+            "latency_p95_ms": metrics.get("latency_p95_ms"),
+            "estimated_cost_usd": agent_cost,
+        },
+        "judge": dict((judge or {}).get("operations") or {}),
+    }
+
+
+def _judge_operations(results: list[dict[str, Any]]) -> dict[str, Any]:
+    usages = [item.get("usage") or {} for item in results]
+    input_tokens = _sum_usage(usages, ("input_tokens", "prompt_tokens"))
+    output_tokens = _sum_usage(usages, ("output_tokens", "completion_tokens"))
+    total_tokens = _sum_usage(usages, ("total_tokens",))
+    costs = [
+        value
+        for usage in usages
+        for value in [_first_number(usage, ("cost_usd", "estimated_cost_usd", "total_cost_usd"))]
+        if value is not None
+    ]
+    durations = [
+        float(item["duration_ms"])
+        for item in results
+        if _is_number(item.get("duration_ms"))
+    ]
+    return {
+        "eligible_count": len(results),
+        "request_attempt_count": sum(
+            int(item.get("attempt_count") or 0) for item in results
+        ),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "duration_ms": round(sum(durations), 2) if durations else None,
+        "reported_cost_usd": round(sum(costs), 8) if costs else None,
+        "cost_report_count": len(costs),
+    }
+
+
+def _release_operations(stages: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    agent_items = [
+        (stage.get("operations") or {}).get("agent") or {}
+        for stage in stages.values()
+    ]
+    judge_items = [
+        (stage.get("operations") or {}).get("judge") or {}
+        for stage in stages.values()
+    ]
+    return {
+        "agent": _sum_operation_groups(
+            agent_items,
+            ("case_count", "input_tokens", "output_tokens", "total_tokens", "duration_ms", "estimated_cost_usd"),
+        ),
+        "judge": _sum_operation_groups(
+            judge_items,
+            ("eligible_count", "request_attempt_count", "input_tokens", "output_tokens", "total_tokens", "duration_ms", "reported_cost_usd", "cost_report_count"),
+        ),
+    }
+
+
+def _sum_operation_groups(
+    groups: list[Mapping[str, Any]], fields: tuple[str, ...]
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for field in fields:
+        values = [float(group[field]) for group in groups if _is_number(group.get(field))]
+        if not values:
+            result[field] = None
+        elif field.endswith("_count") or field.endswith("_tokens"):
+            result[field] = int(sum(values))
+        else:
+            result[field] = round(sum(values), 8)
+    return result
+
+
+def _sum_present(items: list[dict[str, Any]], field: str) -> int | float | None:
+    values = [float(item[field]) for item in items if _is_number(item.get(field))]
+    if not values:
+        return None
+    total = sum(values)
+    return int(total) if total.is_integer() else total
+
+
+def _sum_usage(usages: list[Mapping[str, Any]], fields: tuple[str, ...]) -> int | None:
+    values = [value for usage in usages for value in [_first_number(usage, fields)] if value is not None]
+    return int(sum(values)) if values else None
+
+
+def _first_number(item: Mapping[str, Any], fields: tuple[str, ...]) -> float | None:
+    for field in fields:
+        value = item.get(field)
+        if _is_number(value):
+            return float(value)
+    return None
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
 
 
 def _check_case_row_consistency(

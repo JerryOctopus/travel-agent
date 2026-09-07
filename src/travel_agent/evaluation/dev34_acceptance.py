@@ -342,6 +342,7 @@ def evaluate_dev34_run(
         )
 
     _check_summary_consistency(metrics, len(strict), len(full_strict), len(non_strict), gate_counts, failures)
+    operations = _operational_metrics(rows, judge_results, metrics)
     return {
         "passed": not failures,
         "status": (
@@ -367,6 +368,7 @@ def evaluate_dev34_run(
             "reasonable_rate": judge_reasonable_rate,
             "critical_issue_rate": critical_issue_rate,
         },
+        "operations": operations,
         "fingerprints": {field: artifacts.get(field) for field in FINGERPRINT_FIELDS},
         "failures": failures,
     }
@@ -502,6 +504,78 @@ def _check_summary_consistency(metrics: dict[str, Any], strict: int, full: int, 
     for field, value in expected.items():
         if not _same_number(metrics.get(field), value):
             failures.append(f"summary metric {field} disagrees with case rows")
+
+
+def _operational_metrics(
+    rows: list[dict[str, Any]],
+    judge_results: list[dict[str, Any]],
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    def sum_rows(field: str) -> int | float | None:
+        values = [
+            float(row[field])
+            for row in rows
+            if _finite_number(row.get(field))
+        ]
+        if not values:
+            return None
+        total = sum(values)
+        return int(total) if total.is_integer() else total
+
+    def sum_usage(*fields: str) -> int | None:
+        values = []
+        for result in judge_results:
+            usage = result.get("usage") or {}
+            for field in fields:
+                if _finite_number(usage.get(field)):
+                    values.append(float(usage[field]))
+                    break
+        return int(sum(values)) if values else None
+
+    judge_durations = [
+        float(item["duration_ms"])
+        for item in judge_results
+        if _finite_number(item.get("duration_ms"))
+    ]
+    costs = [
+        float(row["estimated_cost_usd"])
+        for row in rows
+        if _finite_number(row.get("estimated_cost_usd"))
+    ]
+    return {
+        "agent": {
+            "case_count": len(rows),
+            "input_tokens": sum_rows("input_tokens"),
+            "output_tokens": sum_rows("output_tokens"),
+            "total_tokens": sum_rows("total_tokens"),
+            "duration_ms": sum_rows("duration_ms"),
+            "latency_p50_ms": metrics.get("latency_p50_ms"),
+            "latency_p95_ms": metrics.get("latency_p95_ms"),
+            "estimated_cost_usd": (
+                round(sum(costs), 8)
+                if costs
+                else metrics.get("total_estimated_cost_usd")
+            ),
+        },
+        "judge": {
+            "eligible_count": len(judge_results),
+            "request_attempt_count": sum(
+                int(item.get("attempt_count") or 0) for item in judge_results
+            ),
+            "input_tokens": sum_usage("input_tokens", "prompt_tokens"),
+            "output_tokens": sum_usage("output_tokens", "completion_tokens"),
+            "total_tokens": sum_usage("total_tokens"),
+            "duration_ms": round(sum(judge_durations), 2) if judge_durations else None,
+        },
+    }
+
+
+def _finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def _same_number(left: Any, right: Any) -> bool:

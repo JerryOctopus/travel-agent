@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from scripts.check_frozen_release import _markdown
 from travel_agent.evaluation.frozen_release_acceptance import (
     FROZEN_RELEASE_SCHEMA_VERSION,
     build_release_manifest,
@@ -114,6 +115,13 @@ def _stage_run(root: Path, split: str, manifest: dict, *, judge: bool = True) ->
                     "prompt_version": "travel-plan-judge-v4",
                     "schema_version": "travel-plan-judge-output-v1",
                     "independence_warning": False,
+                    "attempt_count": 1,
+                    "duration_ms": 20,
+                    "usage": {
+                        "prompt_tokens": 30,
+                        "completion_tokens": 10,
+                        "total_tokens": 40,
+                    },
                 }
             case = {
                 "case": {
@@ -153,6 +161,11 @@ def _stage_run(root: Path, split: str, manifest: dict, *, judge: bool = True) ->
                 "model_error_call_count": 0,
                 "execution_total": 1,
                 "repeat": 1,
+                "duration_ms": 100,
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15,
+                "estimated_cost_usd": 0.001,
             })
             attempts[case_id] = 1
     artifacts = {
@@ -210,6 +223,9 @@ def _stage_run(root: Path, split: str, manifest: dict, *, judge: bool = True) ->
         "authorization_pass_rate": 1.0,
         "tool_schema_valid_rate": 1.0,
         "architecture_policy_pass_rate": 1.0,
+        "latency_p50_ms": 100.0,
+        "latency_p95_ms": 100.0,
+        "total_estimated_cost_usd": total * 0.001,
         "plan_quality_judge": {
             "applicable_count": (total if split != "challenge_frozen" else 14),
             "completed_count": (total if split != "challenge_frozen" else 14),
@@ -300,6 +316,18 @@ def test_core_stage_accepts_complete_formal_run_and_rejects_duplicate_attempt(tm
 
     passed = evaluate_frozen_stage(run, manifest, "core_frozen", require_judge=True)
     assert passed["passed"] is True, passed["failures"]
+    assert passed["operations"]["agent"] == {
+        "case_count": 94,
+        "input_tokens": 940,
+        "output_tokens": 470,
+        "total_tokens": 1410,
+        "duration_ms": 9400,
+        "latency_p50_ms": 100.0,
+        "latency_p95_ms": 100.0,
+        "estimated_cost_usd": 0.094,
+    }
+    assert passed["operations"]["judge"]["total_tokens"] == 3760
+    assert passed["operations"]["judge"]["duration_ms"] == 1880.0
 
     summary_path = run / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -308,6 +336,34 @@ def test_core_stage_accepts_complete_formal_run_and_rejects_duplicate_attempt(tm
     failed = evaluate_frozen_stage(run, manifest, "core_frozen", require_judge=True)
     assert failed["passed"] is False
     assert any("exactly once" in item for item in failed["failures"])
+
+
+def test_joint_release_aggregates_cost_tokens_and_latency(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    runs = {}
+    for split in ("core_frozen", "challenge_frozen", "shadow_frozen"):
+        run = tmp_path / split
+        _stage_run(run, split, manifest)
+        runs[split] = run
+
+    result = evaluate_frozen_release(
+        manifest,
+        runs["core_frozen"],
+        runs["challenge_frozen"],
+        runs["shadow_frozen"],
+    )
+
+    assert result["passed"] is True, result["failures"]
+    assert result["operations"]["agent"]["case_count"] == 158
+    assert result["operations"]["agent"]["total_tokens"] == 2370
+    assert result["operations"]["agent"]["estimated_cost_usd"] == 0.158
+    assert result["operations"]["judge"]["eligible_count"] == 138
+    assert result["operations"]["judge"]["total_tokens"] == 5520
+
+    report = _markdown(result)
+    assert "## Cost, tokens and latency" in report
+    assert '"total_tokens": 2370' in report
+    assert "core_frozen: passed=`True`" in report
 
 
 def test_stage_rejects_provider_reported_model_drift(tmp_path: Path) -> None:

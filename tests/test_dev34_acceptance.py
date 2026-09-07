@@ -62,6 +62,13 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
                 "total_score": 80,
                 "reasonable": True,
                 "critical_issues": [],
+                "attempt_count": 1,
+                "duration_ms": 20,
+                "usage": {
+                    "prompt_tokens": 30,
+                    "completion_tokens": 10,
+                    "total_tokens": 40,
+                },
             }
         case = {
             "case": {"case_id": case_id, "expected_artifact_type": expected},
@@ -95,6 +102,11 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
                 "model_error_call_count": 0,
                 "repeat": 1,
                 "execution_total": 1,
+                "duration_ms": 100,
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15,
+                "estimated_cost_usd": 0.001,
             }
         )
         attempts[case_id] = 1
@@ -112,6 +124,9 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
         "model_switch_count": 0,
         "relay_mode": False,
         "model_attempts_by_case": attempts,
+        "latency_p50_ms": 100.0,
+        "latency_p95_ms": 100.0,
+        "total_estimated_cost_usd": 0.034,
     }
     artifacts = {
         "dataset_version": "travel-agent-eval-production-v1.1",
@@ -428,6 +443,10 @@ def test_dev34_acceptance_requires_independent_fixed_judge_per_complete_itinerar
     passing = evaluate_dev34_run(run_dir, require_judge=True)
 
     assert passing["passed"] is True, passing["failures"]
+    assert passing["operations"]["agent"]["total_tokens"] == 510
+    assert passing["operations"]["agent"]["estimated_cost_usd"] == 0.034
+    assert passing["operations"]["judge"]["eligible_count"] == 22
+    assert passing["operations"]["judge"]["total_tokens"] == 880
 
     case_path = run_dir / "cases" / "dev_001__repeat-1.json"
     case = json.loads(case_path.read_text(encoding="utf-8"))

@@ -153,6 +153,11 @@ Shadow 还必须传入同一 manifest 下 Core、Challenge 的 proof。最后用
 环境、配额或服务错误把整轮标为 `invalid`，保持候选不变并用全新 run-id 重跑；真实质量
 失败必须封存，不得从冻结 case 逐条调参。
 
+`check-dev`、`check-stage` 和 `check-release` 生成的 JSON/Markdown 会从 case rows 与 Judge
+结果重新汇总 Agent/Judge 的 token、请求尝试数、累计时延和可获得的费用字段。Agent 费用为
+runner 的 `estimated_cost_usd` 汇总；Judge 仅在服务端 usage 返回费用时记录 reported cost，
+不得将缺失费用静默当作 0。联合报告同时保留三个阶段的 strict、hard 与 Judge 指标。
+
 ## 稳定性五项指标（同一条案例 3 次运行的聚合口径）
 
 不比较最终文案是否相同，而是五项统计：

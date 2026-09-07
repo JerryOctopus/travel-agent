@@ -145,6 +145,41 @@ def _markdown(payload: dict[str, Any]) -> str:
         lines.append(f"- candidate: `{payload['candidate_id']}`")
     if payload.get("split"):
         lines.append(f"- split: `{payload['split']}`")
+    if payload.get("counts"):
+        lines.extend([
+            "",
+            "## Counts",
+            "",
+            "```json",
+            json.dumps(payload["counts"], ensure_ascii=False, indent=2),
+            "```",
+        ])
+    if payload.get("judge"):
+        lines.extend([
+            "",
+            "## Judge",
+            "",
+            "```json",
+            json.dumps(payload["judge"], ensure_ascii=False, indent=2),
+            "```",
+        ])
+    if payload.get("operations"):
+        lines.extend([
+            "",
+            "## Cost, tokens and latency",
+            "",
+            "```json",
+            json.dumps(payload["operations"], ensure_ascii=False, indent=2),
+            "```",
+        ])
+    if payload.get("stages"):
+        lines.extend(["", "## Stages", ""])
+        for name, stage in payload["stages"].items():
+            lines.append(
+                f"- {name}: passed=`{stage.get('passed')}`, "
+                f"strict=`{(stage.get('counts') or {}).get('strict')}`, "
+                f"hard=`{(stage.get('counts') or {}).get('hard')}`"
+            )
     lines.extend(["", "## Failures", ""])
     failures = payload.get("failures") or []
     lines.extend(f"- {item}" for item in failures)
