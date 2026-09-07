@@ -3171,7 +3171,7 @@ def _close_post_plan_origin_route(
     )
     if endpoint is None:
         endpoint = next((
-            poi for poi in ctx.pois_by_id.values()
+            poi for poi in ctx.poi_values()
             if poi.poi_id != first_poi.poi_id
             and _is_grounded_route_endpoint(poi)
             and _endpoint_name_matches(poi, origin_name)
@@ -3325,7 +3325,7 @@ def _close_post_plan_return_route(
         endpoint = ctx.poi(str(exact_existing.get("destination_poi_id") or ""))
     if endpoint is None:
         endpoint = next((
-            poi for poi in ctx.pois_by_id.values()
+            poi for poi in ctx.poi_values()
             if poi.poi_id != final_poi.poi_id
             and _is_grounded_route_endpoint(poi)
             and _endpoint_name_matches(poi, endpoint_query)
@@ -3626,7 +3626,7 @@ def _close_post_plan_fixed_event_routes(
                 endpoint = min(repaired_endpoints, key=lambda item: item[0])[1]
         if endpoint is None:
             endpoint = next((
-                poi for poi in ctx.pois_by_id.values()
+                poi for poi in ctx.poi_values()
                 if poi.poi_id != origin.poi_id
                 and _is_grounded_route_endpoint(poi)
                 and _endpoint_name_matches(poi, location)
@@ -3635,7 +3635,7 @@ def _close_post_plan_fixed_event_routes(
             target = normalize_entity_name(location)
             session_candidates = sorted(
                 (
-                    poi for poi in ctx.pois_by_id.values()
+                    poi for poi in ctx.poi_values()
                     if poi.poi_id != origin.poi_id
                     and _is_grounded_route_endpoint(poi)
                     and poi.category not in {"food", "hotel", "lodging"}

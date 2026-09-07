@@ -16,6 +16,7 @@ import time
 
 from travel_agent.agent.session import (
     ArtifactStore,
+    build_session,
     holds_session_lock,
     session_tool_lock,
     should_serialize_tool,
@@ -40,6 +41,29 @@ def _run_threads(target, n: int = THREADS) -> list[threading.Thread]:
 
 
 # --- ArtifactStore 并发 ------------------------------------------------------ #
+
+
+def test_session_clone_waits_for_atomic_state_snapshot() -> None:
+    """A worker clone must not copy POIs while another worker is merging them."""
+    ctx = build_session(session_id="sess_clone_snapshot", persist=False)
+    started = threading.Event()
+    completed = threading.Event()
+
+    def clone_worker() -> None:
+        started.set()
+        ctx.clone_isolated()
+        completed.set()
+
+    ctx._state_lock.acquire()
+    try:
+        thread = threading.Thread(target=clone_worker)
+        thread.start()
+        assert started.wait(timeout=1)
+        assert completed.wait(timeout=0.05) is False
+    finally:
+        ctx._state_lock.release()
+    thread.join(timeout=1)
+    assert completed.is_set()
 
 
 def test_artifact_store_concurrent_put_loses_nothing():

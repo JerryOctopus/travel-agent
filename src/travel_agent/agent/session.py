@@ -614,9 +614,24 @@ class SessionContext:
         with self._state_lock:
             return self.pois_by_id.get(poi_id)
 
+    def poi_values(self) -> list[POI]:
+        """Return a stable POI snapshot for concurrent worker reads."""
+        with self._state_lock:
+            return list(self.pois_by_id.values())
+
     def clone_isolated(self, control: RequestControl | None = None) -> "SessionContext":
         """Copy mutable request state while sharing only the provider implementation."""
         active_control = control or self.request_control
+        # Worker completions merge POIs and trace entries concurrently with
+        # new worker dispatches.  Copy every state-owned field under the same
+        # lock used by those merges, otherwise deepcopy can observe a dict
+        # changing size and abort the whole multi-agent turn.
+        with self._state_lock:
+            profile = copy.deepcopy(self.profile)
+            pois_by_id = copy.deepcopy(self.pois_by_id)
+            pending_preferences = copy.deepcopy(self.pending_preference_observations)
+            evaluation_trace_enabled = self.evaluation_trace_enabled
+            evaluation_trace = copy.deepcopy(self.evaluation_trace)
         return SessionContext(
             session_id=self.session_id,
             provider=self.provider,
@@ -626,13 +641,11 @@ class SessionContext:
                 _items=self.store.snapshot_records(),
                 request_control=active_control,
             ),
-            profile=copy.deepcopy(self.profile),
-            pois_by_id=copy.deepcopy(self.pois_by_id),
-            pending_preference_observations=copy.deepcopy(
-                self.pending_preference_observations
-            ),
-            evaluation_trace_enabled=self.evaluation_trace_enabled,
-            evaluation_trace=copy.deepcopy(self.evaluation_trace),
+            profile=profile,
+            pois_by_id=pois_by_id,
+            pending_preference_observations=pending_preferences,
+            evaluation_trace_enabled=evaluation_trace_enabled,
+            evaluation_trace=evaluation_trace,
             reference_datetime=self.reference_datetime,
             runtime_settings=self.runtime_settings,
             hybrid_llm_client=self.hybrid_llm_client,
