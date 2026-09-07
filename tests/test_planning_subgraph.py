@@ -153,8 +153,24 @@ def test_daily_opening_window_parses_explicit_hours_only():
     assert _daily_opening_window("周一至周日 09:00-16:30") == (540, 990)
     assert _daily_opening_window("3–10月:06:45–17:30(17:00停止入园)") == (405, 1050)
     assert _daily_opening_window("周一至周日 16:00-04:00") == (960, 1680)
+    assert _daily_opening_window("周一至周日 18:00-24:00") == (1080, 1440)
     assert _daily_opening_window("00:00-24:00") is None
+    assert _daily_opening_window("周一至周日 00:00-24:00") is None
     assert _daily_opening_window("all_day") is None
+
+
+def test_structured_schedule_keeps_closing_buffer_for_optional_activity() -> None:
+    venue = POI(
+        "closing-edge", "临近闭馆景点", "测试城", "scenic", 30.0, 120.0,
+        4.5, 0.8, [], 105, "mid",
+        opening_hours="周一至周日 07:30-18:00",
+    )
+    profile = TravelProfile(destination="测试城", days=1, start_date="2026-10-18")
+    days = [ItineraryDay(1, "test", [ItineraryStop(venue, "16:15", 105, "")])]
+
+    scheduled = apply_structured_schedule_constraints(days, [], profile, None)
+
+    assert scheduled[0].stops == []
 
 
 def test_trip_day_opening_window_uses_matching_weekday_segment() -> None:

@@ -1931,6 +1931,77 @@ def test_attraction_executor_searches_lossless_structured_interest(offline_setti
     )
 
 
+def test_attraction_postcondition_retries_semantic_interest_aliases() -> None:
+    crowded_waterfront = POI(
+        poi_id="crowded-waterfront",
+        name="城市海湾公园",
+        city="测试城",
+        category="scenic",
+        lat=30.0,
+        lng=120.0,
+        rating=4.9,
+        popularity=1.0,
+        tags=["海湾", "nature"],
+        estimated_duration_min=90,
+        price_level="low",
+        entity_type="attraction",
+    )
+    beach = POI(
+        poi_id="synthetic-beach",
+        name="城市公共沙滩",
+        city="测试城",
+        category="scenic",
+        lat=30.0,
+        lng=120.0,
+        rating=4.6,
+        popularity=0.8,
+        tags=["沙滩", "nature"],
+        estimated_duration_min=90,
+        price_level="low",
+        entity_type="attraction",
+    )
+
+    class Provider:
+        queries: list[str] = []
+
+        def search_pois(self, city, query_tags=None, category=None, max_results=20):
+            query = str((query_tags or [""])[0])
+            self.queries.append(query)
+            if query == "海边":
+                return [crowded_waterfront]
+            return [beach] if query == "沙滩" else []
+
+    ctx = build_session(session_id="sess_interest_alias_retry", persist=False)
+    ctx.profile = TravelProfile(
+        destination="测试城",
+        days=1,
+        interests=["nature"],
+        avoid=["网红排队特别久的地方"],
+        constraint_state={"interests": ["海边"]},
+    )
+    provider = Provider()
+    ctx.provider = provider
+    task = _task_for("attraction")
+    task.inputs["task_type"] = "local_adjustment"
+    token = set_current_task_meta(
+        {"request_id": task.request_id, "task_id": task.task_id, "agent": "attraction"}
+    )
+    try:
+        result = _enforce_required_poi_postcondition(
+            task, ctx, {"status": STATUS_COMPLETED, "tool_trace": []}
+        )
+    finally:
+        reset_task_meta(token)
+
+    assert [query for query in provider.queries if query][:2] == ["海边", "沙滩"]
+    assert result["status"] == STATUS_COMPLETED
+    assert any(
+        item["name"] == beach.name
+        for artifact_id in ctx.store.artifact_ids()
+        for item in ((ctx.store.get(artifact_id) or {}).get("pois") or [])
+    )
+
+
 def test_executor_rejects_unsatisfiable_whitelist(offline_settings):
     ctx = build_session(session_id="sess_exec2", persist=False)
     model = ScriptedChatModel(messages=[AIMessage(content="x")])

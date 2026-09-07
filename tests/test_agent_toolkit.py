@@ -574,6 +574,45 @@ def test_directional_hotel_area_broadens_then_rechecks_coordinates(monkeypatch) 
     assert result["hotels"][0]["area"] == "中心湖东侧"
 
 
+def test_directional_hotel_uses_landmark_family_median_not_provider_pin(monkeypatch) -> None:
+    ctx = _session()
+    toolkit.update_travel_profile(
+        ctx, destination="测试城", days=3, hotel_area="中心湖东侧"
+    )
+    misleading = POI(
+        "hotel-address-east", "地址含东侧的西岸酒店", "测试城", "hotel",
+        30.0, 120.03, 4.8, 0.9, ["hotel"], 0, "low",
+        source="amap", entity_type="hotel",
+    )
+    actual_east = POI(
+        "hotel-actual-east", "实际东岸酒店", "测试城", "hotel",
+        30.0, 120.06, 4.5, 0.8, ["hotel"], 0, "low",
+        source="amap", entity_type="hotel",
+    )
+    landmarks = [
+        POI(
+            f"lake-{index}",
+            "测试城中心湖风景区" if index == 0 else f"测试城中心湖风景区-入口{index}",
+            "测试城", "scenic", 30.0, lng, 4.8, 0.9, ["classic"], 120,
+            "unknown", source="amap", entity_type="attraction",
+        )
+        for index, lng in enumerate((120.0, 120.04, 120.05))
+    ]
+
+    def search_pois(**kwargs):
+        if kwargs.get("query_tags") == ["中心湖东侧"]:
+            return [misleading, actual_east]
+        if kwargs.get("query_tags") == ["中心湖"]:
+            return landmarks
+        return []
+
+    monkeypatch.setattr(ctx.provider, "search_pois", search_pois)
+
+    result = toolkit.search_hotel(ctx, budget_level="low")
+
+    assert [item["name"] for item in result["hotels"]] == ["实际东岸酒店"]
+
+
 def test_mobility_ranking_expands_locally_to_fill_multi_day_plan() -> None:
     profile = TravelProfile(
         destination="测试城",

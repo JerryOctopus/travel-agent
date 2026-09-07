@@ -738,13 +738,26 @@ def apply_structured_schedule_constraints(
             if opening_window is not None:
                 opens, closes = opening_window
                 actual_start = max(actual_start, opens)
-                if actual_start + duration > closes:
-                    # A verified named candidate should displace an unrelated
-                    # earlier optional stop instead of silently disappearing.
-                    is_named_candidate = any(
-                        _matches_candidate_attraction(stop.poi, str(term))
-                        for term in candidate_terms
-                    )
+                # A verified named candidate should displace an unrelated
+                # earlier optional stop instead of silently disappearing.
+                is_named_candidate = any(
+                    _matches_candidate_attraction(stop.poi, str(term))
+                    for term in candidate_terms
+                )
+                # Exact-closing schedules are brittle: a small queue or
+                # provider rounding error makes an optional visit infeasible.
+                # Reserve the same conservative buffer used between stops,
+                # while preserving user-fixed, hard-required and explicitly
+                # named candidate commitments at their evidenced boundary.
+                closing_deadline = closes
+                if (
+                    not is_fixed
+                    and not is_hard_required
+                    and not is_named_candidate
+                    and stop.poi.category not in {"food", "hotel", "transport"}
+                ):
+                    closing_deadline -= TRANSFER_BUFFER_MIN
+                if actual_start + duration > closing_deadline:
                     if is_named_candidate and not is_fixed:
                         actual_start = opens
                         while scheduled and actual_start < (
@@ -758,7 +771,7 @@ def apply_structured_schedule_constraints(
                             profile,
                             route_estimator,
                         )
-                    if actual_start + duration > closes:
+                    if actual_start + duration > closing_deadline:
                         continue
             last_admission = _last_admission_for_trip_day(
                 stop.poi, profile, day.day_index
@@ -900,13 +913,15 @@ def _named_venue_priority(poi: POI, required_name: str) -> tuple[int, int]:
 def _daily_opening_window(value: str | None) -> tuple[int, int] | None:
     """Return a simple same-day opening window when the evidence is explicit."""
     text = str(value or "").strip()
-    if not text or text.lower() in {"all_day", "24h"} or "24:00" in text:
+    if not text or text.lower() in {"all_day", "24h"}:
         return None
     match = re.search(r"(\d{1,2}):(\d{2})\s*[-—–至到]\s*(\d{1,2}):(\d{2})", text)
     if match is None:
         return None
     opens = int(match.group(1)) * 60 + int(match.group(2))
     closes = int(match.group(3)) * 60 + int(match.group(4))
+    if opens == 0 and closes == 24 * 60:
+        return None
     # Overnight businesses (for example 16:00-04:00) are usable from their
     # opening time through midnight on the itinerary day.  Preserve the next-
     # day close as >24h so daytime scheduling can honor the opening boundary.

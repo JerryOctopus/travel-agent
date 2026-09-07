@@ -127,12 +127,52 @@ def _filter_directional_area_pois(
             -float(poi.rating or 0),
         ),
     )
+    anchor_name = normalize_entity_name(anchor.canonical_name or anchor.name)
+    landmark_family = [
+        poi
+        for poi in landmarks
+        if isinstance(poi, POI)
+        and poi.verification_status == "verified"
+        and (
+            poi in matching
+            or (
+                anchor_name
+                and normalize_entity_name(poi.canonical_name or poi.name).startswith(
+                    anchor_name
+                )
+            )
+            or (
+                anchor.poi_id
+                and poi.parent_poi_id == anchor.poi_id
+            )
+        )
+    ]
+    # Large landmarks are often represented by a provider pin near an edge,
+    # plus entrances and child facilities spread across the actual feature.
+    # A single arbitrary pin therefore cannot serve as a directional divider.
+    # Use the median of the verified landmark family, retaining the primary
+    # anchor when the provider exposes only one point.
+    if len(landmark_family) > 1:
+        sorted_lats = sorted(float(poi.lat) for poi in landmark_family)
+        sorted_lngs = sorted(float(poi.lng) for poi in landmark_family)
+
+        def median(values: list[float]) -> float:
+            middle = len(values) // 2
+            if len(values) % 2:
+                return values[middle]
+            return (values[middle - 1] + values[middle]) / 2
+
+        anchor_lat = median(sorted_lats)
+        anchor_lng = median(sorted_lngs)
+    else:
+        anchor_lat = float(anchor.lat)
+        anchor_lng = float(anchor.lng)
     tolerance = 0.001
     predicates = {
-        "东侧": lambda poi: poi.lng >= anchor.lng + tolerance,
-        "西侧": lambda poi: poi.lng <= anchor.lng - tolerance,
-        "南侧": lambda poi: poi.lat <= anchor.lat - tolerance,
-        "北侧": lambda poi: poi.lat >= anchor.lat + tolerance,
+        "东侧": lambda poi: poi.lng >= anchor_lng + tolerance,
+        "西侧": lambda poi: poi.lng <= anchor_lng - tolerance,
+        "南侧": lambda poi: poi.lat <= anchor_lat - tolerance,
+        "北侧": lambda poi: poi.lat >= anchor_lat + tolerance,
     }
     return [poi for poi in hotels if predicates[direction](poi)]
 

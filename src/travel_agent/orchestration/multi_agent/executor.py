@@ -586,6 +586,7 @@ def _enforce_required_poi_postcondition(
     from travel_agent.agent import toolkit
     from travel_agent.agent.serde import poi_from_dict
     from travel_agent.critic import poi_matches_interest, poi_matches_must_visit
+    from travel_agent.poi_evidence import poi_avoid_match
 
     task_state = dict((task.inputs.get("profile") or {}).get("constraint_state") or {})
     profile_state = dict(getattr(ctx.profile, "constraint_state", {}) or {})
@@ -670,20 +671,38 @@ def _enforce_required_poi_postcondition(
             if any(poi_matches_must_visit(poi, term) for poi in task_pois()):
                 break
 
-    for interest in structured_interests:
-        if any(poi_matches_interest(poi, interest) for poi in task_pois()):
-            continue
-        search = toolkit.search_poi(
-            ctx,
-            city=getattr(ctx.profile, "destination", None),
-            interests=[interest],
-            max_results=10,
+    interest_search_aliases = {
+        "海边": ("沙滩", "海滩", "海滨"),
+        "咖啡店": ("咖啡馆",),
+        "园林": ("园林景区",),
+        "历史景点": ("历史遗址", "历史文化景区"),
+        "主要历史景点": ("历史遗址", "历史文化景区"),
+    }
+
+    def has_usable_interest_candidate(interest: str) -> bool:
+        return any(
+            poi_matches_interest(poi, interest)
+            and poi_avoid_match(poi, ctx.profile) is None
+            for poi in task_pois()
         )
-        repaired.append("search_poi")
-        if search.get("isError"):
-            result.setdefault("warnings", []).append(
-                f"structured interest search failed: {interest}"
+
+    for interest in structured_interests:
+        if has_usable_interest_candidate(interest):
+            continue
+        for query in (interest, *interest_search_aliases.get(interest, ())):
+            search = toolkit.search_poi(
+                ctx,
+                city=getattr(ctx.profile, "destination", None),
+                interests=[query],
+                max_results=10,
             )
+            repaired.append("search_poi")
+            if search.get("isError"):
+                result.setdefault("warnings", []).append(
+                    f"structured interest search failed: {query}"
+                )
+            if has_usable_interest_candidate(interest):
+                break
 
     declared_type = getattr(task.inputs.get("task_type"), "value", task.inputs.get("task_type"))
     if declared_type == "full_itinerary":
