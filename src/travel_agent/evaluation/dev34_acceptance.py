@@ -81,6 +81,7 @@ FINGERPRINT_FIELDS = (
     "judge_rubric_version",
     "judge_prompt_version",
     "judge_schema_version",
+    "judge_resume",
 )
 
 
@@ -326,6 +327,7 @@ def evaluate_dev34_run(
             and item.get("prompt_version") == JUDGE_PROMPT_VERSION
             and item.get("schema_version") == JUDGE_SCHEMA_VERSION
             and item.get("independence_warning") is False
+            and item.get("cache_hit") is False
             for item in completed_judges
         )
         _require(
@@ -339,6 +341,11 @@ def evaluate_dev34_run(
             and artifacts.get("judge_schema_version") == JUDGE_SCHEMA_VERSION,
             failures,
             "Judge summary rubric/prompt/schema differs from the frozen contract",
+        )
+        _require(
+            artifacts.get("judge_resume") is False,
+            failures,
+            "formal Judge must run without --resume",
         )
 
     _check_summary_consistency(metrics, len(strict), len(full_strict), len(non_strict), gate_counts, failures)

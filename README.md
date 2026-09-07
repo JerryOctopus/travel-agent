@@ -330,9 +330,14 @@ PYTHONPATH=src python scripts/eval_product_multi_model.py --official-frozen \
 
 # 对已保存 Product run 做质量后处理，不重新调用被测 Agent
 PYTHONPATH=src .venv/bin/python scripts/eval_plan_quality.py rules --run-dir data/eval/product/runs/<run_id>
-# 独立 Judge 默认使用 Google / gemini-3.6-flash；也可通过 FreeLLMAPI 运行：
-# TRAVEL_AGENT_JUDGE_PROVIDER=freellmapi FREELLMAPI_API_KEY=<unified-key>
-PYTHONPATH=src .venv/bin/python scripts/eval_plan_quality.py judge --run-dir data/eval/product/runs/<run_id> --resume
+# 正式发布 Judge 固定 SiliconFlow Qwen3.5，且禁止 --resume/cache reuse：
+TRAVEL_AGENT_JUDGE_PROVIDER=siliconflow \
+TRAVEL_AGENT_JUDGE_MODEL=Qwen/Qwen3.5-397B-A17B \
+TRAVEL_AGENT_JUDGE_TEMPERATURE=0 \
+TRAVEL_AGENT_JUDGE_THINKING_ENABLED=false \
+SILICONFLOW_API_KEY=<judge-key> \
+PYTHONPATH=src .venv/bin/python scripts/eval_plan_quality.py judge \
+  --run-dir data/eval/product/runs/<run_id> --official-release
 PYTHONPATH=src .venv/bin/python scripts/eval_plan_quality.py sample --run-dir data/eval/product/runs/<run_id> --size 30
 PYTHONPATH=src .venv/bin/python scripts/eval_plan_quality.py calibrate --run-dir data/eval/product/runs/<run_id> --reviews data/eval/product/runs/<run_id>/human_review.csv
 

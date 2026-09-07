@@ -14,7 +14,7 @@ api_key = ""
 #   freellmapi-docker -> http://localhost:3001/v1, auto
 #   qwen     -> https://dashscope.aliyuncs.com/compatible-mode/v1
 # model 在 DashScope 控制台查看有额度的型号，例如 qwen3.7-plus、qwen-turbo（qwen-plus 免费包易用尽）
-#   deepseek -> https://api.deepseek.com/v1, deepseek-chat
+#   deepseek -> https://api.deepseek.com/v1, deepseek-v4-flash
 #   zhipu   -> https://open.bigmodel.cn/api/paas/v4, glm-4.7-flash
 #   google  -> https://generativelanguage.googleapis.com/v1beta/openai, gemini-2.5-flash
 #              `gemini` 和 `google-gemini` 也可作为 provider 别名
@@ -35,19 +35,20 @@ requests_per_second = 0
 
 [evaluation.judge]
 # 独立行程质量 Judge；可直接通过本机 FreeLLMAPI 路由，与被测 Agent 的配置分开。
+# 正式发布验收固定使用下列 SiliconFlow/Qwen 配置；探索性评测可另行覆盖。
 # Desktop 示例：provider = "freellmapi", base_url/model 留空，api_key 填 unified key；
 # 默认得到 http://localhost:31415/v1 + auto。Docker/server 用 freellmapi-docker。
 # 也可将 key 放在 TRAVEL_AGENT_JUDGE_API_KEY 或 FREELLMAPI_API_KEY 环境变量中。
-# 如需固定 Gemini，则改回 google / Gemini endpoint / gemini-3.6-flash。
-provider = "google"
+# 如需探索 Gemini，可改为 google / Gemini endpoint / gemini-3.6-flash；该结果不能充当正式发布证明。
+provider = "siliconflow"
 api_key = ""
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
-model = "gemini-3.6-flash"
-timeout_seconds = 60
+base_url = "https://api.siliconflow.cn/v1"
+model = "Qwen/Qwen3.5-397B-A17B"
+timeout_seconds = 180
 temperature = 0
 thinking_enabled = false
-# AI Studio 当前显示 20 RPM；按 18 RPM 运行，预留 10% 窗口余量。
-requests_per_second = 0.3
+# 按当前 SiliconFlow 账户限速配置；0 表示客户端不额外限速。
+requests_per_second = 0
 
 [amap]
 # 高德「Web 服务」key：用于后端 REST（POI / 天气 / 驾车路线）。

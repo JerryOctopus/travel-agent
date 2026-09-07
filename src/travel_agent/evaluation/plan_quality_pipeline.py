@@ -143,6 +143,7 @@ def apply_independent_judge(
             "judge_prompt_version": PROMPT_VERSION,
             "judge_schema_version": SCHEMA_VERSION,
             "judge_cache_dir": str(root / "judge_cache"),
+            "judge_resume": resume,
             "judge_preflight": (
                 preflight if judge is None else {"ok": True, "injected": True}
             ),

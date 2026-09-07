@@ -1,5 +1,8 @@
 # Dev34 Exploration Log
 
+> 历史记录：本日志中的 `deepseek-chat` 运行属于旧候选探索，不得用于当前 DeepSeek V4
+> Flash 的 Dev 双轮或冻结发布证明。
+
 ## Active protocol
 
 - Evaluate development cases in batches of 10.

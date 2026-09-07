@@ -598,6 +598,7 @@ def _check_identity(
     _require(artifacts.get("model_execution_mode") == "fixed_single_model", failures, "run must use one fixed model")
     if require_judge:
         _require(artifacts.get("judge_provider") == JUDGE_MODEL["provider"] and artifacts.get("judge_model") == JUDGE_MODEL["model"], failures, "run Judge identity mismatch")
+        _require(artifacts.get("judge_resume") is False, failures, "formal Judge must run without --resume")
         preflight = artifacts.get("judge_preflight") or {}
         _require(preflight.get("ok") is True and preflight.get("injected") is not True, failures, "real Judge preflight is required")
 
@@ -652,6 +653,7 @@ def _judge_metrics(
         and item.get("prompt_version") == JUDGE_MODEL["prompt_version"]
         and item.get("schema_version") == JUDGE_MODEL["schema_version"]
         and item.get("independence_warning") is False
+        and item.get("cache_hit") is False
         for item in completed
     )
     _require(identity_ok, failures, "Judge result identity mismatch")

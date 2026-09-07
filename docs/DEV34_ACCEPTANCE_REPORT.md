@@ -1,5 +1,8 @@
 # Dev34 闭环验收与基线对比
 
+> 历史记录：本文对应旧 `deepseek-chat` 与旧 Dev34 门槛，只保留作基线，不能作为当前
+> DeepSeek V4 Flash 发布候选的准入证明。当前合同与命令见 `EVALUATION_PRODUCT.md`。
+
 ## 结论
 
 Dev34 指标提升闭环于 2026-09-05 完成。正式检查器对两次连续完整运行 `dev34_acceptance_r13_20260905cz` 和 `dev34_acceptance_r14_20260905da` 均返回 `passed=true`；双轮联合检查也返回 `passed=true`，没有剩余验收失败项。

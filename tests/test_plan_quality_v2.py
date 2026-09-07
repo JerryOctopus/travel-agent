@@ -7,6 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.eval_plan_quality import (
+    _require_deterministic_release_gate,
+    _require_formal_judge_configuration,
+    build_parser as build_quality_cli_parser,
+)
 from travel_agent.evaluation.plan_quality import (
     aggregate_rule_quality,
     evaluate_plan_quality,
@@ -87,6 +92,58 @@ def test_siliconflow_qwen_judge_explicitly_disables_thinking(monkeypatch) -> Non
 
     assert captured["temperature"] == 0.0
     assert captured["extra_body"] == {"enable_thinking": False}
+
+
+def test_formal_judge_cli_rejects_resume_or_identity_drift_before_preflight() -> None:
+    settings = JudgeSettings(
+        provider="google",
+        api_key="judge-key",
+        model="other",
+        temperature=0.2,
+        thinking_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="before API preflight") as exc:
+        _require_formal_judge_configuration(settings, resume=True)
+
+    message = str(exc.value)
+    assert "--resume" in message
+    assert "provider" in message
+    assert "model" in message
+    assert "temperature" in message
+    assert "thinking" in message
+
+
+def test_formal_judge_cli_accepts_fixed_siliconflow_configuration() -> None:
+    settings = JudgeSettings(
+        provider="siliconflow",
+        api_key="judge-key",
+        model="Qwen/Qwen3.5-397B-A17B",
+        temperature=0.0,
+        thinking_enabled=False,
+    )
+
+    _require_formal_judge_configuration(settings, resume=False)
+    args = build_quality_cli_parser().parse_args([
+        "judge",
+        "--run-dir",
+        "run",
+        "--official-release",
+    ])
+    assert args.official_release is True
+    assert args.resume is False
+
+
+def test_formal_frozen_judge_requires_manifest_before_preflight(tmp_path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "summary.json").write_text(
+        json.dumps({"artifacts": {"frozen_split": "core_frozen"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="requires --release-manifest"):
+        _require_deterministic_release_gate(run, None)
 
 
 def test_deterministic_plan_quality_accepts_grounded_feasible_plan() -> None:

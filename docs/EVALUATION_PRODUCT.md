@@ -66,13 +66,19 @@ Judge 输入不包含 Agent 内部 critic、初稿或 deterministic rule 结论�
 配置与执行：
 
 ```bash
-# FreeLLMAPI Desktop（默认 http://localhost:31415/v1，model=auto）
-export TRAVEL_AGENT_JUDGE_PROVIDER=freellmapi
-export FREELLMAPI_API_KEY=<unified-key>
-# 可选：export TRAVEL_AGENT_JUDGE_MODEL=auto:smart
+export TRAVEL_AGENT_JUDGE_PROVIDER=siliconflow
+export TRAVEL_AGENT_JUDGE_MODEL=Qwen/Qwen3.5-397B-A17B
+export TRAVEL_AGENT_JUDGE_TEMPERATURE=0
+export TRAVEL_AGENT_JUDGE_THINKING_ENABLED=false
+export SILICONFLOW_API_KEY=<judge-key>
 PYTHONPATH=src .venv/bin/python scripts/eval_plan_quality.py judge \
-  --run-dir data/eval/product/runs/<run_id> --resume
+  --run-dir data/eval/product/runs/<run_id> --official-release
 ```
+
+正式 Dev/冻结验收必须使用 `--official-release`，禁止 `--resume`，并拒绝任何
+`cache_hit=true` 的 Judge 结果；冻结 split 还需传 `--release-manifest <manifest.json>`。
+正式模式在首个 Judge API 请求前验证确定性门槛与固定 Judge 配置。`--resume` 只允许用于
+不充当发布证据的探索性运行。
 
 正式 Dev34 在 Judge 前先执行独立预检；预检只发送最小 ping，不包含 case 数据：
 

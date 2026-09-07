@@ -115,6 +115,7 @@ def _stage_run(root: Path, split: str, manifest: dict, *, judge: bool = True) ->
                     "prompt_version": "travel-plan-judge-v4",
                     "schema_version": "travel-plan-judge-output-v1",
                     "independence_warning": False,
+                    "cache_hit": False,
                     "attempt_count": 1,
                     "duration_ms": 20,
                     "usage": {
@@ -208,6 +209,7 @@ def _stage_run(root: Path, split: str, manifest: dict, *, judge: bool = True) ->
         "judge_rubric_version": "travel-plan-quality-v1",
         "judge_prompt_version": "travel-plan-judge-v4",
         "judge_schema_version": "travel-plan-judge-output-v1",
+        "judge_resume": False,
         "relay_summary": {"attempts_total": total, "current_model_index": 0},
     }
     metrics = {
@@ -399,6 +401,26 @@ def test_stage_rejects_missing_or_failed_amap_preflight(tmp_path: Path) -> None:
 
     assert result["passed"] is False
     assert any("AMap preflight" in item for item in result["failures"])
+
+
+def test_stage_rejects_resumed_or_cached_judge(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path)
+    run = tmp_path / "core-run"
+    _stage_run(run, "core_frozen", manifest)
+    summary_path = run / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["artifacts"]["judge_resume"] = True
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    case_path = run / "cases" / "core_frozen_001__repeat-1.json"
+    case = json.loads(case_path.read_text(encoding="utf-8"))
+    case["evaluation"]["independent_judge"]["cache_hit"] = True
+    case_path.write_text(json.dumps(case), encoding="utf-8")
+
+    result = evaluate_frozen_stage(run, manifest, "core_frozen")
+
+    assert result["passed"] is False
+    assert "formal Judge must run without --resume" in result["failures"]
+    assert any("Judge result identity" in item for item in result["failures"])
 
 
 def test_stage_rejects_summary_case_field_disagreement(tmp_path: Path) -> None:

@@ -59,6 +59,7 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
                 "prompt_version": "travel-plan-judge-v4",
                 "schema_version": "travel-plan-judge-output-v1",
                 "independence_warning": False,
+                "cache_hit": False,
                 "total_score": 80,
                 "reasonable": True,
                 "critical_issues": [],
@@ -176,6 +177,7 @@ def _write_passing_deterministic_run(root: Path, *, with_judge: bool = False) ->
                 "judge_rubric_version": "travel-plan-quality-v1",
                 "judge_prompt_version": "travel-plan-judge-v4",
                 "judge_schema_version": "travel-plan-judge-output-v1",
+                "judge_resume": False,
                 "judge_preflight": {
                     "ok": True,
                     "injected": False,
@@ -361,6 +363,25 @@ def test_dev34_acceptance_rejects_old_judge_prompt(tmp_path) -> None:
 
     assert result["passed"] is False
     assert any("Judge summary" in item for item in result["failures"])
+
+
+def test_dev34_acceptance_rejects_resumed_or_cached_judge(tmp_path) -> None:
+    run_dir = tmp_path / "resumed-judge"
+    _write_passing_deterministic_run(run_dir, with_judge=True)
+    summary_path = run_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["artifacts"]["judge_resume"] = True
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    case_path = run_dir / "cases" / "dev_001__repeat-1.json"
+    case = json.loads(case_path.read_text(encoding="utf-8"))
+    case["evaluation"]["independent_judge"]["cache_hit"] = True
+    case_path.write_text(json.dumps(case), encoding="utf-8")
+
+    result = evaluate_dev34_run(run_dir, require_judge=True)
+
+    assert result["passed"] is False
+    assert "formal Judge must run without --resume" in result["failures"]
+    assert any("Judge result identity" in item for item in result["failures"])
 
 
 def test_dev34_judge_service_error_marks_run_invalid(tmp_path) -> None:
